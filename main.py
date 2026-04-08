@@ -20,9 +20,10 @@ RAW_FRAME_SKIP = 3      # process 1 in every N raw frames
 GADGET_EVERY   = 6      # YOLO  every Nth processed frame
 ABSENCE_EVERY  = 4      # absence every Nth processed frame
 DROOP_EVERY    = 15     # droop every Nth processed frame
+ # allowed duration in seconds before logging violation
 
 
-from config.settings import OUTPUT_PATH, WINDOW_NAME, DISPLAY_SCALE
+from config.settings import OUTPUT_PATH, WINDOW_NAME, DISPLAY_SCALE,GADGET_ALLOWED_DURATION,ABSENCE_ALLOWED_DURATION,HEAD_DROP_DURATION
 from utils.logger import setup_logger, log_distraction, finalize_report
 from utils.violation_store import ViolationStore
 from utils.draw import (
@@ -465,28 +466,30 @@ class GadgetDetectionPipeline:
             r_ref = next((r for r in results if r.distracted), None)
             conf  = r_ref.gadgets[0].confidence if (r_ref and r_ref.gadgets) else 0.9
             dur   = r_ref.timer_value if r_ref else 0.0
+            event_time = max(0, video_time - GADGET_ALLOWED_DURATION)
             self.vstore.record_violation(
                 annotated_frame=annotated, original_frame=frame,
-                video_time=video_time, frame_index=raw_frame_no,
+                video_time=event_time, frame_index=raw_frame_no,
                 event_type="phone_use", severity="CRITICAL",
                 confidence=conf, risk_score=80, risk_level="CRITICAL",
                 factors=["phone_use", "distraction"], duration=dur,
             )
-            log_distraction(self.logger, video_time,
+            log_distraction(self.logger, event_time,
                             event="One of the pilots is using a mobile phone",
                             severity="CRITICAL", frame=annotated)
 
         if absence_log_events:
             ar_ref  = next((ar for ar in absence_results if ar.absent), None)
             dur_abs = ar_ref.timer_value if ar_ref else 0.0
+            event_time = max(0, video_time - ABSENCE_ALLOWED_DURATION)
             self.vstore.record_violation(
                 annotated_frame=annotated, original_frame=frame,
-                video_time=video_time, frame_index=raw_frame_no,
+                video_time=event_time, frame_index=raw_frame_no,
                 event_type="seat_absence", severity="CRITICAL",
                 confidence=1.0, risk_score=70, risk_level="CRITICAL",
                 factors=["seat_absence"], duration=dur_abs,
             )
-            log_distraction(self.logger, video_time,
+            log_distraction(self.logger, event_time,
                             event="One of the pilots is away from the seat",
                             severity="CRITICAL", frame=annotated)
 
@@ -509,14 +512,15 @@ class GadgetDetectionPipeline:
 
             dr_ref  = next((dr for dr in droop_results if dr.drooping), None)
             dur_drp = dr_ref.timer_value if dr_ref else 0.0
+            event_time = max(0, video_time - HEAD_DROP_DURATION)
             self.vstore.record_violation(
                 annotated_frame=annotated, original_frame=frame,
-                video_time=video_time, frame_index=raw_frame_no,
+                video_time=event_time, frame_index=raw_frame_no,
                 event_type=etype, severity="CRITICAL",
                 confidence=0.9, risk_score=75, risk_level="HIGH",
                 factors=["drowsy", "head_droop"], duration=dur_drp,
             )
-            log_distraction(self.logger, video_time, event=event_msg,
+            log_distraction(self.logger, event_time, event=event_msg,
                             severity="CRITICAL", frame=annotated)
 
         return annotated
