@@ -1,0 +1,32 @@
+# 🔹 Virtual environments (VERY IMPORTANT)
+venv/
+railways/
+
+# 🔹 Python cache
+__pycache__/
+*.pyc
+
+# 🔹 Environment variables (secrets)
+.env
+*.env
+config/credentials.env
+
+# 🔹 Logs & outputs
+logs/
+outputs/
+
+# 🔹 Data (videos)
+data/
+*.mp4
+
+# 🔹 Model weights
+*.pth
+*.ckpt
+
+# 🔹 IDE
+.vscode/
+.idea/
+
+# 🔹 OS
+.DS_Store
+Thumbs.db
