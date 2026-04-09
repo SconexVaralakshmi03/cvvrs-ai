@@ -15,9 +15,7 @@ config/credentials.env
 logs/
 outputs/
 
-# 🔹 Data (videos)
-data/
-*.mp4
+
 
 # 🔹 Model weights
 *.pth
