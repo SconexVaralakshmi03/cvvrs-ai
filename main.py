@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import warnings
 import cv2
 import numpy as np
-
+from concurrent.futures import as_completed
 
 DRAW           = False  # set True only for visual debug
 RAW_FRAME_SKIP = 3      # process 1 in every N raw frames
@@ -38,8 +38,8 @@ from detector.head_drop_detector import HeadDroopDetector
 
 _STOP = object()
 
-READ_QUEUE_MAXSIZE  = 8
-WRITE_QUEUE_MAXSIZE = 8
+READ_QUEUE_MAXSIZE  = 32
+WRITE_QUEUE_MAXSIZE = 32
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -332,24 +332,28 @@ class GadgetDetectionPipeline:
         results,         log_events         = [], []
         absence_results, absence_log_events = [], []
         droop_results,   droop_log_events   = [], []
-
-        try:
-            if future_gadget is not None:
-                results, log_events = future_gadget.result()
-        except Exception as exc:
-            self.logger.error(f"Gadget error frame {raw_frame_no}: {exc}", exc_info=True)
-
-        try:
-            if future_absence is not None:
-                absence_results, absence_log_events = future_absence.result()
-        except Exception as exc:
-            self.logger.error(f"Absence error frame {raw_frame_no}: {exc}", exc_info=True)
-
-        try:
-            if future_droop is not None:
-                droop_results, droop_log_events = future_droop.result()
-        except Exception as exc:
-            self.logger.error(f"Droop error frame {raw_frame_no}: {exc}", exc_info=True)
+        futures_map={}
+        if future_gadget:
+            futures_map[future_gadget] = "gadget"
+        if future_absence:
+            futures_map[future_absence] = "absence"
+        if future_droop:
+            futures_map[future_droop] = "droop"
+        for future in as_completed(futures_map):
+            try:
+                result = future.result()
+                if futures_map[future] == "gadget":
+                    results, log_events = result
+                elif futures_map[future] == "absence":
+                    absence_results, absence_log_events = result
+                elif futures_map[future] == "droop":
+                    droop_results, droop_log_events = result
+            except Exception as exc:
+                self.logger.error(f"{futures_map[future]} error frame {raw_frame_no}: {exc}", exc_info=True)
+                
+                
+                
+            
 
         if run_gadget:
             self._prev_pilot_boxes      = [(r.pilot_id, r.bbox) for r in results]

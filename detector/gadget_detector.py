@@ -25,14 +25,40 @@ from config.settings import (
     GADGET_EAR_PROXIMITY_MARGIN,
 )
 
+# detector/gadget_detector.py
+
+import torch
+
+import threading
+
 _model = None
+_model_lock = threading.Lock()
 
 def _get_model():
     global _model
+
     if _model is None:
-        from ultralytics import YOLO
-        _model = YOLO(YOLO_MODEL)
+        with _model_lock:   # ✅ prevents multiple threads loading model
+            if _model is None:
+                from ultralytics import YOLO
+                import torch
+
+                print("🚀 Loading YOLO model on GPU...")
+
+                _model = YOLO(YOLO_MODEL, task="detect")
+
+                _model.to("cuda")
+                
+                _model.fuse()
+                _model.model.half()
+
+                dummy = torch.zeros((1, 3, 640, 640)).cuda().half()
+                _model.model(dummy)
+
+                print("✅ YOLO Loaded")
+
     return _model
+
 
 def get_shared_yolo_model():
     return _get_model()
@@ -177,6 +203,7 @@ class GadgetDetector:
         self._last_gadgets_by_pilot: Dict[int, List[GadgetHit]] = {1: [], 2: []}
         self.last_frame_detections:  Optional[FrameDetections] = None
         self.phone_frame_counter = {1: 0, 2: 0}
+        self._enhance_counter = 0
     def process(
         self,
         frame:      np.ndarray,
@@ -343,46 +370,74 @@ class GadgetDetector:
         return result
 
     def _smart_enhance(self, frame: np.ndarray) -> np.ndarray:
+        self._enhance_counter += 1
+
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if np.mean(gray) < 100:
-            clahe    = cv2.createCLAHE(2.5, (8, 8))
+
+    # ✅ Run CLAHE only occasionally
+        if np.mean(gray) < 100 and self._enhance_counter % 5 == 0:
+            clahe = cv2.createCLAHE(2.5, (8, 8))
             enhanced = clahe.apply(gray)
             return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
         return frame
 
-    def _run_yolo(
-        self,
-        frame: np.ndarray,
-    ) -> Tuple[List[Tuple[int,int,int,int]], List[GadgetHit]]:
-        model = _get_model()
-        res   = model(frame, verbose=False)[0]
-        _, frame_w = frame.shape[:2]
+    def _run_yolo(self, frame):
+        try:
+            model = _get_model()
 
-        persons: List[Tuple[Tuple[int,int,int,int], float]] = []
-        gadgets: List[GadgetHit] = []
+        # ✅ Optional resize (reduces GPU load)
+            img = cv2.resize(frame, (640, 384))
 
-        for box in res.boxes:
-            cls_id       = int(box.cls[0])
-            conf         = float(box.conf[0])
-            name         = model.names[cls_id].lower()
-            x1,y1,x2,y2 = map(int, box.xyxy[0])
-            bbox         = (x1, y1, x2, y2)
+            results = model(
+            img,
+            device=0,
+            verbose=False
+        )[0]
 
-            if name == "person" and conf > PILOT_CONFIDENCE_THRESHOLD:
-                persons.append((bbox, conf))
-            elif name in GADGET_CLASSES and conf > GADGET_CONFIDENCE_THRESHOLD:
-                # Filter A: shape check (geometry)
-                # Filter D: pixel content check (real phone has edges)
-                if (_is_valid_gadget_shape(bbox, frame_w) and
-                        _has_phone_like_edges(frame, bbox)):
-                    gadgets.append(GadgetHit(name, conf, bbox))
+            h, w = frame.shape[:2]
+            scale_x = w / 640
+            scale_y = h / 384
 
-        persons.sort(
-            key=lambda p: (p[0][2]-p[0][0]) * (p[0][3]-p[0][1]),
-            reverse=True,
+            persons = []
+            gadgets = []
+
+            for box in results.boxes:
+                cls_id = int(box.cls[0])
+                conf = float(box.conf[0])
+                name = model.names[cls_id].lower()
+
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            # ✅ Scale back to original frame
+                x1 = int(x1 * scale_x)
+                x2 = int(x2 * scale_x)
+                y1 = int(y1 * scale_y)
+                y2 = int(y2 * scale_y)
+
+                bbox = (x1, y1, x2, y2)
+
+                if name == "person" and conf > PILOT_CONFIDENCE_THRESHOLD:
+                    persons.append((bbox, conf))
+
+                elif name in GADGET_CLASSES and conf > GADGET_CONFIDENCE_THRESHOLD:
+                    try:
+                        if(_is_valid_gadget_shape(bbox, w) and _has_phone_like_edges(frame, bbox)):
+                            gadgets.append(GadgetHit(name, conf, bbox))
+                    except Exception as filter_error:
+                        print("Filter error:", filter_error)
+                        continue
+
+        # ✅ Sort persons by area
+            persons.sort(
+            key=lambda p: (p[0][2] - p[0][0]) * (p[0][3] - p[0][1]),
+            reverse=True
         )
-        return [p[0] for p in persons[:MAX_PILOTS]], gadgets
 
+            return [p[0] for p in persons[:MAX_PILOTS]], gadgets
+        except Exception as e:
+            print("🚨 YOLO ERROR:", e)
+            return [], []
 
 # ─────────────────────────────────────────
 # SHAPE FILTER  (Filter A)

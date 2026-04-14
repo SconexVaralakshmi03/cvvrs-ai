@@ -15,9 +15,11 @@ config/credentials.env
 logs/
 outputs/
 
+data/
 
 
 # 🔹 Model weights
+*.pt
 *.pth
 *.ckpt
 

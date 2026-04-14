@@ -40,7 +40,7 @@ from fastapi.responses import JSONResponse
 # Assumes api.py lives alongside the project root (same level as
 # config/, detector/, utils/).  Adjust sys.path if your layout
 # differs.
-from main import GadgetDetectionPipeline
+from app import GadgetDetectionPipeline
 
 # ─────────────────────────────────────────────────────────────────
 
