@@ -55,6 +55,14 @@ app = FastAPI(
 )
 
 
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 # ── Health check ─────────────────────────────────────────────────
 
 @app.get("/health", tags=["status"])
@@ -130,6 +138,13 @@ async def analyze_video(
             report = json.load(f)
 
         return JSONResponse(content=report)
+
+    finally:
+        # Always clean up the temporary upload file
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
     finally:
         # Always clean up the temporary upload file
