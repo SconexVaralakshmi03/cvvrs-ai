@@ -1,29 +1,3 @@
-"""
-api.py — FastAPI wrapper for the Loco Pilot Distraction Detection pipeline.
-
-Endpoints
----------
-POST /analyze
-    Accepts a video file upload + optional form fields.
-    Runs GadgetDetectionPipeline synchronously (blocking until done).
-    Returns the analysis JSON report on completion.
-
-Usage
------
-    uvicorn api:app --host 0.0.0.0 --port 8000
-
-Request (multipart/form-data)
-------------------------------
-    video           : video file  (required)
-    video_id        : str         (optional — used as analysis_id; defaults to filename stem)
-    train_detail_id : int         (optional, default 0)
-
-Response (200 OK)
-------------------
-    The full analysis_report.json produced by ViolationStore.finalize(),
-    exactly matching the documented JSON schema.
-"""
-
 from __future__ import annotations
 
 import json
@@ -35,11 +9,9 @@ from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 # ── Pipeline import ──────────────────────────────────────────────
-# Assumes api.py lives alongside the project root (same level as
-# config/, detector/, utils/).  Adjust sys.path if your layout
-# differs.
 from main import GadgetDetectionPipeline
 
 # ─────────────────────────────────────────────────────────────────
@@ -54,8 +26,7 @@ app = FastAPI(
     version="1.0.0",
 )
 
-
-from fastapi.middleware.cors import CORSMiddleware
+# ── CORS ─────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -63,60 +34,43 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-# ── Health check ─────────────────────────────────────────────────
 
+# ── Health check ─────────────────────────────────────────────────
 @app.get("/health", tags=["status"])
 def health() -> dict:
     return {"status": "ok"}
 
 
 # ── Main analysis endpoint ────────────────────────────────────────
-
 @app.post("/analyze", tags=["analysis"])
 async def analyze_video(
     video: UploadFile = File(..., description="Video file to analyse"),
-    video_id: Optional[str] = Form(
-        default=None,
-        description="Analysis ID / video identifier. Defaults to the filename stem.",
-    ),
-    train_detail_id: int = Form(
-        default=0,
-        description="Train detail ID stored alongside results in the database.",
-    ),
+    video_id: Optional[str] = Form(default=None),
+    train_detail_id: int = Form(default=0),
 ) -> JSONResponse:
-    """
-    Run the full distraction-detection pipeline on the uploaded video.
 
-    - Saves the upload to a temporary file.
-    - Runs GadgetDetectionPipeline (phone · absence · drowsiness).
-    - Returns the finalized JSON report (also written to
-      outputs/<analysis_id>/analysis_report.json and uploaded to S3/DB).
-    - Cleans up the temporary file after processing.
-    """
-
-    # ── 1. Persist the upload to a temp file ─────────────────────
     suffix = os.path.splitext(video.filename or "video.mp4")[1] or ".mp4"
     tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
 
     try:
-        # Write upload to disk
+        # Save uploaded file
         with os.fdopen(tmp_fd, "wb") as tmp_file:
             shutil.copyfileobj(video.file, tmp_file)
 
-        # ── 2. Determine analysis_id ──────────────────────────────
+        # Generate analysis ID
         if video_id and video_id.strip():
             analysis_id = video_id.strip()
         else:
-            stem        = os.path.splitext(video.filename or "video")[0]
+            stem = os.path.splitext(video.filename or "video")[0]
             analysis_id = stem or "analysis"
 
-        # ── 3. Run the pipeline ───────────────────────────────────
+        # Run pipeline
         pipeline = GadgetDetectionPipeline(
-            source          = tmp_path,
-            analysis_id     = analysis_id,
-            train_detail_id = train_detail_id,
-            save            = False,   # no annotated output video
-            display         = False,   # headless — no GUI
+            source=tmp_path,
+            analysis_id=analysis_id,
+            train_detail_id=train_detail_id,
+            save=False,
+            display=False,
         )
 
         try:
@@ -127,27 +81,21 @@ async def analyze_video(
                 detail=f"Pipeline error: {exc}\n{traceback.format_exc()}",
             )
 
-        # ── 4. Read and return the JSON report ────────────────────
+        # Validate report
         if not report_path or not os.path.isfile(report_path):
             raise HTTPException(
                 status_code=500,
                 detail="Pipeline completed but report file was not created.",
             )
 
+        # Read JSON report
         with open(report_path, encoding="utf-8") as f:
             report = json.load(f)
 
         return JSONResponse(content=report)
 
     finally:
-        # Always clean up the temporary upload file
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-
-    finally:
-        # Always clean up the temporary upload file
+        # Cleanup temp file
         try:
             os.remove(tmp_path)
         except OSError:
