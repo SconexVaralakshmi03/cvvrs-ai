@@ -22,6 +22,7 @@ data/
 # 🔹 Model weights
 *.pth
 *.ckpt
+*.pt
 
 # 🔹 IDE
 .vscode/

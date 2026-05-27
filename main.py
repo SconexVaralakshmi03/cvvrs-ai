@@ -80,11 +80,19 @@ class GadgetDetectionPipeline:
         train_detail_id: int           = 0,
         save:            bool          = False,
         display:         bool          = False,
+        time_offset:     float         = 0.0,
+        frame_offset:    int           = 0,       # ← NEW: cumulative frame count before this video
+        shared_vstore=None,
+        original_filename: Optional[str] = None,
     ) -> None:
-        self.source          = source
-        self.train_detail_id = train_detail_id
-        self.save            = save
-        self.display         = display
+        self.source            = source
+        self.train_detail_id   = train_detail_id
+        self.save              = save
+        self.display           = display
+        self.time_offset       = time_offset      # cumulative seconds before this video
+        self.frame_offset      = frame_offset     # cumulative frames before this video
+        self.shared_vstore     = shared_vstore    # if set, use this instead of creating new one
+        self.original_filename = original_filename  # real upload name, overrides tmp path basename
 
         if analysis_id:
             self.analysis_id = analysis_id
@@ -119,7 +127,8 @@ class GadgetDetectionPipeline:
     # ENTRY POINT
     
 
-    def run(self) -> str:
+    def run(self) -> tuple:
+        """Returns (report_path, duration_seconds, total_frame_count)."""
         import time
         start_time = time.time()
 
@@ -144,11 +153,21 @@ class GadgetDetectionPipeline:
               f"Droop every {RAW_FRAME_SKIP * DROOP_EVERY} raw frames")
 
         source_str  = str(self.source)
+        # Prefer the real uploaded filename passed in from api.py;
+        # fall back to basename of the (temp) path for direct/CLI use.
         source_name = (
-            os.path.basename(source_str)
-            if isinstance(self.source, str) else "webcam"
+            self.original_filename
+            if self.original_filename
+            else (os.path.basename(source_str) if isinstance(self.source, str) else "webcam")
         )
-        duration_s = round(total / fps, 3) if total > 0 and fps > 0 else 0.0
+        # Seek to end to get true duration — handles VFR and mismatched fps tags
+        # (e.g. cabin_video.mp4 has container fps=30 but actual fps=6)
+        cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
+        duration_s = round(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0, 3)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)   # rewind for processing
+        if duration_s <= 0:
+            # Fallback for sources that don't support seek-to-end
+            duration_s = round(total / fps, 3) if total > 0 and fps > 0 else 0.0
         h, m, s    = (
             int(duration_s) // 3600,
             (int(duration_s) % 3600) // 60,
@@ -170,11 +189,16 @@ class GadgetDetectionPipeline:
             "sizeMb":            size_mb,
         }
 
-        self.vstore = ViolationStore(
-            analysis_id     = self.analysis_id,
-            train_detail_id = self.train_detail_id,
-            video_info      = video_info,
-        )
+        if self.shared_vstore is not None:
+            # Batch mode: attach this video's metadata to the shared store
+            self.vstore = self.shared_vstore
+            self.vstore.add_video_info(video_info)
+        else:
+            self.vstore = ViolationStore(
+                analysis_id     = self.analysis_id,
+                train_detail_id = self.train_detail_id,
+                video_info      = video_info,
+            )
         self._print_banner(fps, width, height, total)
 
         if self.save:
@@ -209,6 +233,8 @@ class GadgetDetectionPipeline:
                 raw_frame, raw_frame_no, video_time = item
 
                 # ── Skip most raw frames — pass through as-is ─────
+                # raw_frame_no here is already globally offset so the
+                # modulo cadence is kept consistent across videos.
                 if raw_frame_no % RAW_FRAME_SKIP != 0:
                     self._write_queue.put(raw_frame)
                     continue
@@ -249,17 +275,29 @@ class GadgetDetectionPipeline:
             processing_time = round(time.time() - start_time, 3)
             self._print_summary(raw_frame_no, processing_time)
             finalize_report()
-            report_path = self.vstore.finalize(processing_time=processing_time)
+            # In batch mode (shared_vstore) we do NOT finalize here —
+            # api.py finalizes the shared store once after ALL videos are done.
+            if self.shared_vstore is None:
+                report_path = self.vstore.finalize(processing_time=processing_time)
+            else:
+                report_path = ""   # will be set by api.py after last video
 
         actual_fps = raw_frame_no / processing_time if processing_time > 0 else 0
         print(f"\nTotal Time : {processing_time:.2f}s   FPS : {actual_fps:.2f}")
-        return report_path
+        # Return duration_s and total so api.py can accumulate offsets
+        # without re-opening the (already-deleted) temp file.
+        return report_path, duration_s, total
 
  
     # READER THREAD
    
 
     def _reader_loop(self, cap: cv2.VideoCapture) -> None:
+        # frame_no counts frames within THIS video (1-based).
+        # We add self.frame_offset so every frame has a globally unique
+        # index across the entire batch — prevents deduplication collisions
+        # in ViolationStore._seen_frames when two videos share the same
+        # local frame numbers.
         frame_no = 0
         try:
             while True:
@@ -267,8 +305,9 @@ class GadgetDetectionPipeline:
                 if not ret:
                     break
                 frame_no  += 1
-                video_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-                self._read_queue.put((frame, frame_no, video_time))
+                global_frame_no = frame_no + self.frame_offset          # ← CHANGED
+                video_time      = (cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0) + self.time_offset
+                self._read_queue.put((frame, global_frame_no, video_time))
         except Exception:
             self.logger.error("Reader error:\n" + traceback.format_exc())
         finally:
@@ -466,13 +505,15 @@ class GadgetDetectionPipeline:
             r_ref = next((r for r in results if r.distracted), None)
             conf  = r_ref.gadgets[0].confidence if (r_ref and r_ref.gadgets) else 0.9
             dur   = r_ref.timer_value if r_ref else 0.0
-            event_time = max(0, video_time - GADGET_ALLOWED_DURATION)
+            # Clamp to time_offset floor so we never produce a timestamp
+            # earlier than the start of this video in the combined timeline.
+            event_time = max(self.time_offset, video_time - GADGET_ALLOWED_DURATION)  # ← CHANGED
             self.vstore.record_violation(
                 annotated_frame=annotated, original_frame=frame,
                 video_time=event_time, frame_index=raw_frame_no,
                 event_type="phone_use", severity="CRITICAL",
                 confidence=conf, risk_score=80, risk_level="CRITICAL",
-                factors=["phone_use", "distraction"], duration=dur,
+                factors=["phone_use"], duration=dur,
             )
             log_distraction(self.logger, event_time,
                             event="One of the pilots is using a mobile phone",
@@ -481,7 +522,7 @@ class GadgetDetectionPipeline:
         if absence_log_events:
             ar_ref  = next((ar for ar in absence_results if ar.absent), None)
             dur_abs = ar_ref.timer_value if ar_ref else 0.0
-            event_time = max(0, video_time - ABSENCE_ALLOWED_DURATION)
+            event_time = max(self.time_offset, video_time - ABSENCE_ALLOWED_DURATION)  # ← CHANGED
             self.vstore.record_violation(
                 annotated_frame=annotated, original_frame=frame,
                 video_time=event_time, frame_index=raw_frame_no,
@@ -512,7 +553,7 @@ class GadgetDetectionPipeline:
 
             dr_ref  = next((dr for dr in droop_results if dr.drooping), None)
             dur_drp = dr_ref.timer_value if dr_ref else 0.0
-            event_time = max(0, video_time - HEAD_DROP_DURATION)
+            event_time = max(self.time_offset, video_time - HEAD_DROP_DURATION)  # ← CHANGED
             self.vstore.record_violation(
                 annotated_frame=annotated, original_frame=frame,
                 video_time=event_time, frame_index=raw_frame_no,

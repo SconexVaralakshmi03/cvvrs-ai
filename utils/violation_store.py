@@ -25,16 +25,19 @@ class _Violation:
     risk_level:      str
     confidence:      float
     factors:         List[str]
+    source_filename: str                   = ""    # e.g. "ax.mp4"
+    local_time_str:  str                   = ""    # local time within that file e.g. "00:00:18"
     frame_path:      Optional[str]         = None
-    annotated_frame: Optional[np.ndarray] = None
+    annotated_frame: Optional[np.ndarray]  = None
 
 
 class ViolationStore:
 
-    def __init__(self, analysis_id: str, train_detail_id: int, video_info: Dict[str, Any]):
+    def __init__(self, analysis_id: str, train_detail_id: int, video_info: Optional[Dict[str, Any]] = None):
         self.analysis_id     = analysis_id
         self.train_detail_id = train_detail_id
-        self.video_info      = video_info
+        # video_infos is always a list — 1 entry for single-video, N entries for batch
+        self.video_infos: List[Dict[str, Any]] = [video_info] if video_info is not None else []
 
         self.output_dir = os.path.join(OUTPUTS_ROOT, analysis_id)
         self.frames_dir = os.path.join(self.output_dir, "frames")
@@ -43,6 +46,13 @@ class ViolationStore:
         self._violations: List[_Violation] = []
         self._seen_frames: set             = set()
         print(f"[ViolationStore] Output dir : {self.output_dir}")
+
+    def add_video_info(self, video_info: Dict[str, Any]) -> None:
+        """
+        Register one video's metadata into the shared store.
+        Called once per video in batch mode (api.py passes shared_vstore).
+        """
+        self.video_infos.append(video_info)
 
     def record_violation(
         self,
@@ -57,26 +67,39 @@ class ViolationStore:
         risk_level:      str   = "CRITICAL",
         factors:         Optional[List[str]] = None,
         duration:        float = 0.0,
+        source_filename: str   = "",   # original upload filename e.g. "ax.mp4"
+        local_video_time: float = -1.0, # raw video_time before offset; -1 = same as video_time
     ):
-        if frame_index in self._seen_frames:
+        # Deduplicate on (frame_index, event_type) so that:
+        #  • the same violation type on the same frame is recorded only once
+        #  • different violation types on the same frame are each recorded
+        #  • frame numbers from different videos never collide (frame_offset
+        #    in main.py makes every global frame_index unique across the batch)
+        dedup_key = (frame_index, event_type)
+        if dedup_key in self._seen_frames:
             return
-        self._seen_frames.add(frame_index)
-        factors  = factors or []
-        t        = int(round(video_time))
-        time_str = f"{t // 3600:02d}:{(t % 3600) // 60:02d}:{t % 60:02d}"
+        self._seen_frames.add(dedup_key)
+        factors   = factors or []
+        t         = int(round(video_time))
+        time_str  = f"{t // 3600:02d}:{(t % 3600) // 60:02d}:{t % 60:02d}"
+        # Build the per-file local timestamp (time within the source video)
+        local_t   = int(round(local_video_time if local_video_time >= 0 else video_time))
+        local_str = f"{local_t // 3600:02d}:{(local_t % 3600) // 60:02d}:{local_t % 60:02d}"
         self._violations.append(_Violation(
-            timestamp       = video_time,
-            time_str        = time_str,
-            frame_index     = frame_index,
-            type            = event_type,
-            events          = [event_type],
-            severity        = severity,
-            duration        = round(duration, 2),
-            risk_score      = risk_score,
-            risk_level      = risk_level,
-            confidence      = round(confidence, 3),
-            factors         = list(factors),
-            annotated_frame = annotated_frame.copy() if annotated_frame is not None else None,
+            timestamp        = video_time,
+            time_str         = time_str,
+            frame_index      = frame_index,
+            type             = event_type,
+            events           = [event_type],
+            severity         = severity,
+            duration         = round(duration, 2),
+            risk_score       = risk_score,
+            risk_level       = risk_level,
+            confidence       = round(confidence, 3),
+            factors          = list(factors),
+            source_filename  = source_filename,
+            local_time_str   = local_str,
+            annotated_frame  = annotated_frame.copy() if annotated_frame is not None else None,
         ))
 
     def _deduplicate_by_frame(self):
@@ -124,18 +147,20 @@ class ViolationStore:
             if best_frame is None and v.annotated_frame is not None:
                 best_frame = v.annotated_frame
         return _Violation(
-            timestamp       = base.timestamp,
-            time_str        = base.time_str,
-            frame_index     = base.frame_index,
-            type            = base.type,
-            events          = list(set(events)),
-            severity        = base.severity,
-            duration        = base.duration,
-            risk_score      = max_risk,
-            risk_level      = risk_level,
-            confidence      = base.confidence,
-            factors         = list(set(factors)),
-            annotated_frame = best_frame,
+            timestamp        = base.timestamp,
+            time_str         = base.time_str,
+            frame_index      = base.frame_index,
+            type             = base.type,
+            events           = list(set(events)),
+            severity         = base.severity,
+            duration         = base.duration,
+            risk_score       = max_risk,
+            risk_level       = risk_level,
+            confidence       = base.confidence,
+            factors          = list(set(factors)),
+            source_filename  = base.source_filename,
+            local_time_str   = base.local_time_str,
+            annotated_frame  = best_frame,
         )
 
     def extract_violation_frames(self, video_path: str):
@@ -182,7 +207,9 @@ class ViolationStore:
             "analysis_id":     self.analysis_id,
             "train_detail_id": self.train_detail_id,
             "processing_time": round(processing_time, 3),
-            "video_info":      self.video_info,
+            # Single video → keep as dict for backwards compat; batch → list
+            "video_info": self.video_infos[0] if len(self.video_infos) == 1
+                          else self.video_infos,
             "violations": [
                 {
                     "timestamp":   v.time_str,
@@ -194,6 +221,7 @@ class ViolationStore:
                     "risk_level":  v.risk_level,
                     "confidence":  v.confidence,
                     "factors":     v.factors,
+                    "original_video_timestamp": f"{v.source_filename} {v.local_time_str}",
                     "frame_path":  v.frame_path,
                 }
                 for v in self._violations
@@ -203,7 +231,10 @@ class ViolationStore:
     def finalize(self, processing_time: float = 0.0) -> str:
         self._deduplicate_by_frame()
         self._merge_by_time_window()
-        self.extract_violation_frames(self.video_info["videoPath"])
+        # Extract frames from every video in the batch (or the single video)
+        for vi in self.video_infos:
+            if vi and vi.get("videoPath"):
+                self.extract_violation_frames(vi["videoPath"])
         report   = self._build_report(processing_time=processing_time)
         out_path = os.path.join(self.output_dir, "analysis_report.json")
         with open(out_path, "w", encoding="utf-8") as f:
