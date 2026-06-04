@@ -17,13 +17,12 @@ import numpy as np
 
 DRAW           = False  # set True only for visual debug
 RAW_FRAME_SKIP = 3      # process 1 in every N raw frames
-GADGET_EVERY   = 6      # YOLO  every Nth processed frame
+GADGET_EVERY   = 6      # YOLO every Nth processed frame
 ABSENCE_EVERY  = 4      # absence every Nth processed frame
 DROOP_EVERY    = 15     # droop every Nth processed frame
- # allowed duration in seconds before logging violation
 
 
-from config.settings import OUTPUT_PATH, WINDOW_NAME, DISPLAY_SCALE,GADGET_ALLOWED_DURATION,ABSENCE_ALLOWED_DURATION,HEAD_DROP_DURATION
+from config.settings import OUTPUT_PATH, WINDOW_NAME, DISPLAY_SCALE, GADGET_ALLOWED_DURATION, ABSENCE_ALLOWED_DURATION, HEAD_DROP_DURATION
 from utils.logger import setup_logger, log_distraction, finalize_report
 from utils.violation_store import ViolationStore
 from utils.draw import (
@@ -80,19 +79,11 @@ class GadgetDetectionPipeline:
         train_detail_id: int           = 0,
         save:            bool          = False,
         display:         bool          = False,
-        time_offset:     float         = 0.0,
-        frame_offset:    int           = 0,       # ← NEW: cumulative frame count before this video
-        shared_vstore=None,
-        original_filename: Optional[str] = None,
     ) -> None:
-        self.source            = source
-        self.train_detail_id   = train_detail_id
-        self.save              = save
-        self.display           = display
-        self.time_offset       = time_offset      # cumulative seconds before this video
-        self.frame_offset      = frame_offset     # cumulative frames before this video
-        self.shared_vstore     = shared_vstore    # if set, use this instead of creating new one
-        self.original_filename = original_filename  # real upload name, overrides tmp path basename
+        self.source          = source
+        self.train_detail_id = train_detail_id
+        self.save            = save
+        self.display         = display
 
         if analysis_id:
             self.analysis_id = analysis_id
@@ -113,22 +104,31 @@ class GadgetDetectionPipeline:
         self._writer:  Optional[cv2.VideoWriter] = None
         self.vstore:   Optional[ViolationStore]  = None
 
-        # 3 workers: one per detector, no excess overhead
         self.executor = ThreadPoolExecutor(max_workers=3)
 
         self._prev_pilot_boxes      = []
         self._prev_frame_detections = None
-        self._processed_frame_no    = 0   
+        self._processed_frame_no    = 0
+
+        # Absence bbox cache — see FIX notes below.
+        self._absence_pilot_boxes: list = []
+
+        # FIX (Bug #1): Track how many consecutive YOLO runs returned zero
+        # persons. When YOLO misses sporadically (model confidence blip) we
+        # keep the last known boxes. But when YOLO consistently returns empty
+        # for YOLO_EMPTY_RUNS_BEFORE_ABSENT consecutive runs, the pilot has
+        # genuinely left and we pass an empty list so the absence timer starts.
+        self._yolo_empty_run_count: int = 0
+        YOLO_EMPTY_RUNS_BEFORE_ABSENT   = 3  # ~3 × GADGET_EVERY processed frames
 
         self._read_queue:  queue.Queue = queue.Queue(maxsize=READ_QUEUE_MAXSIZE)
         self._write_queue: queue.Queue = queue.Queue(maxsize=WRITE_QUEUE_MAXSIZE)
 
-    
+    # ─────────────────────────────────────────
     # ENTRY POINT
-    
+    # ─────────────────────────────────────────
 
-    def run(self) -> tuple:
-        """Returns (report_path, duration_seconds, total_frame_count)."""
+    def run(self) -> str:
         import time
         start_time = time.time()
 
@@ -153,21 +153,11 @@ class GadgetDetectionPipeline:
               f"Droop every {RAW_FRAME_SKIP * DROOP_EVERY} raw frames")
 
         source_str  = str(self.source)
-        # Prefer the real uploaded filename passed in from api.py;
-        # fall back to basename of the (temp) path for direct/CLI use.
         source_name = (
-            self.original_filename
-            if self.original_filename
-            else (os.path.basename(source_str) if isinstance(self.source, str) else "webcam")
+            os.path.basename(source_str)
+            if isinstance(self.source, str) else "webcam"
         )
-        # Seek to end to get true duration — handles VFR and mismatched fps tags
-        # (e.g. cabin_video.mp4 has container fps=30 but actual fps=6)
-        cap.set(cv2.CAP_PROP_POS_AVI_RATIO, 1)
-        duration_s = round(cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0, 3)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)   # rewind for processing
-        if duration_s <= 0:
-            # Fallback for sources that don't support seek-to-end
-            duration_s = round(total / fps, 3) if total > 0 and fps > 0 else 0.0
+        duration_s = round(total / fps, 3) if total > 0 and fps > 0 else 0.0
         h, m, s    = (
             int(duration_s) // 3600,
             (int(duration_s) % 3600) // 60,
@@ -189,16 +179,11 @@ class GadgetDetectionPipeline:
             "sizeMb":            size_mb,
         }
 
-        if self.shared_vstore is not None:
-            # Batch mode: attach this video's metadata to the shared store
-            self.vstore = self.shared_vstore
-            self.vstore.add_video_info(video_info)
-        else:
-            self.vstore = ViolationStore(
-                analysis_id     = self.analysis_id,
-                train_detail_id = self.train_detail_id,
-                video_info      = video_info,
-            )
+        self.vstore = ViolationStore(
+            analysis_id     = self.analysis_id,
+            train_detail_id = self.train_detail_id,
+            video_info      = video_info,
+        )
         self._print_banner(fps, width, height, total)
 
         if self.save:
@@ -232,14 +217,10 @@ class GadgetDetectionPipeline:
 
                 raw_frame, raw_frame_no, video_time = item
 
-                # ── Skip most raw frames — pass through as-is ─────
-                # raw_frame_no here is already globally offset so the
-                # modulo cadence is kept consistent across videos.
                 if raw_frame_no % RAW_FRAME_SKIP != 0:
                     self._write_queue.put(raw_frame)
                     continue
 
-                # ── Process this frame ────────────────────────────
                 self._processed_frame_no += 1
                 annotated = self._process_frame(
                     raw_frame, video_time, raw_frame_no, self._processed_frame_no
@@ -275,29 +256,17 @@ class GadgetDetectionPipeline:
             processing_time = round(time.time() - start_time, 3)
             self._print_summary(raw_frame_no, processing_time)
             finalize_report()
-            # In batch mode (shared_vstore) we do NOT finalize here —
-            # api.py finalizes the shared store once after ALL videos are done.
-            if self.shared_vstore is None:
-                report_path = self.vstore.finalize(processing_time=processing_time)
-            else:
-                report_path = ""   # will be set by api.py after last video
+            report_path = self.vstore.finalize(processing_time=processing_time)
 
         actual_fps = raw_frame_no / processing_time if processing_time > 0 else 0
         print(f"\nTotal Time : {processing_time:.2f}s   FPS : {actual_fps:.2f}")
-        # Return duration_s and total so api.py can accumulate offsets
-        # without re-opening the (already-deleted) temp file.
-        return report_path, duration_s, total
+        return report_path
 
- 
+    # ─────────────────────────────────────────
     # READER THREAD
-   
+    # ─────────────────────────────────────────
 
     def _reader_loop(self, cap: cv2.VideoCapture) -> None:
-        # frame_no counts frames within THIS video (1-based).
-        # We add self.frame_offset so every frame has a globally unique
-        # index across the entire batch — prevents deduplication collisions
-        # in ViolationStore._seen_frames when two videos share the same
-        # local frame numbers.
         frame_no = 0
         try:
             while True:
@@ -305,17 +274,16 @@ class GadgetDetectionPipeline:
                 if not ret:
                     break
                 frame_no  += 1
-                global_frame_no = frame_no + self.frame_offset          # ← CHANGED
-                video_time      = (cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0) + self.time_offset
-                self._read_queue.put((frame, global_frame_no, video_time))
+                video_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                self._read_queue.put((frame, frame_no, video_time))
         except Exception:
             self.logger.error("Reader error:\n" + traceback.format_exc())
         finally:
             self._read_queue.put(_STOP)
 
-    
+    # ─────────────────────────────────────────
     # WRITER THREAD
-    
+    # ─────────────────────────────────────────
 
     def _writer_loop(self) -> None:
         try:
@@ -328,9 +296,9 @@ class GadgetDetectionPipeline:
         except Exception:
             self.logger.error("Writer error:\n" + traceback.format_exc())
 
-    
+    # ─────────────────────────────────────────
     # PER-FRAME PROCESSING
-    
+    # ─────────────────────────────────────────
 
     def _process_frame(
         self,
@@ -341,22 +309,30 @@ class GadgetDetectionPipeline:
     ) -> np.ndarray:
         annotated = frame
 
-        # Cadences are relative to processed_frame_no so that the effective ML frequency is consistent regardless of RAW_FRAME_SKIP.
         run_gadget  = (processed_frame_no % GADGET_EVERY  == 0)
-        run_absence = (processed_frame_no % ABSENCE_EVERY == 0)
+        # FIX (Bug #2): absence ran every ABSENCE_EVERY=4 processed frames but
+        # YOLO only ran every GADGET_EVERY=6. Between YOLO updates the absence
+        # detector received stale boxes, under-counting the timer. Now absence
+        # runs on the same cadence as YOLO so its input is always fresh.
+        run_absence = run_gadget
         run_droop   = (processed_frame_no % DROOP_EVERY   == 0)
 
         prev_pilot_boxes     = self._prev_pilot_boxes
         prev_frame_detection = self._prev_frame_detections
 
         future_gadget = (
-            self.executor.submit(self.detector.process, frame, round(video_time, 0))
+            self.executor.submit(self.detector.process, frame, round(video_time, 3))
             if run_gadget else None
         )
         future_absence = (
+            # KEY FIX: use _absence_pilot_boxes (synced only on YOLO frames
+            # that actually returned results) instead of _prev_pilot_boxes
+            # (which can be empty on non-YOLO frames).
             self.executor.submit(
                 self.absence_detector.process,
-                prev_pilot_boxes, video_time, frame.shape[1], frame.shape[0],
+                self._absence_pilot_boxes,
+                video_time,
+                frame.shape[1], frame.shape[0],
             )
             if run_absence else None
         )
@@ -391,10 +367,27 @@ class GadgetDetectionPipeline:
             self.logger.error(f"Droop error frame {raw_frame_no}: {exc}", exc_info=True)
 
         if run_gadget:
-            self._prev_pilot_boxes      = [(r.pilot_id, r.bbox) for r in results]
+            new_boxes = [(r.pilot_id, r.bbox) for r in results]
+            self._prev_pilot_boxes      = new_boxes
             self._prev_frame_detections = self.detector.last_frame_detections
 
-        #  Draw (skipped entirely when DRAW=False
+            # FIX (Bug #1): The old logic never cleared _absence_pilot_boxes
+            # when YOLO returned empty, so a pilot who genuinely stood up and
+            # left was stuck as "present" forever (stale cache).
+            # New logic: track consecutive empty YOLO runs. A single empty run
+            # is likely a detection blip — keep the cached boxes. After
+            # YOLO_EMPTY_RUNS_BEFORE_ABSENT consecutive empty runs the pilot
+            # has genuinely left; clear the cache so absence detection fires.
+            YOLO_EMPTY_RUNS_BEFORE_ABSENT = 3
+            if new_boxes:
+                self._absence_pilot_boxes  = new_boxes
+                self._yolo_empty_run_count = 0
+            else:
+                self._yolo_empty_run_count += 1
+                if self._yolo_empty_run_count >= YOLO_EMPTY_RUNS_BEFORE_ABSENT:
+                    self._absence_pilot_boxes = []  # real absence — clear cache
+
+        # Draw (skipped entirely when DRAW=False)
         if DRAW:
             for g in self.detector.last_gadget_hits:
                 draw_gadget_box(annotated, g.bbox, g.class_name, g.confidence)
@@ -500,20 +493,18 @@ class GadgetDetectionPipeline:
                                             dr.timer_value, color=(0, 50, 200))
             draw_hud(annotated, video_time, raw_frame_no, len(results))
 
-        #  Log + store violations
+        # Log + store violations
         if log_events:
             r_ref = next((r for r in results if r.distracted), None)
             conf  = r_ref.gadgets[0].confidence if (r_ref and r_ref.gadgets) else 0.9
             dur   = r_ref.timer_value if r_ref else 0.0
-            # Clamp to time_offset floor so we never produce a timestamp
-            # earlier than the start of this video in the combined timeline.
-            event_time = max(self.time_offset, video_time - GADGET_ALLOWED_DURATION)  # ← CHANGED
+            event_time = max(0, video_time - GADGET_ALLOWED_DURATION)
             self.vstore.record_violation(
                 annotated_frame=annotated, original_frame=frame,
                 video_time=event_time, frame_index=raw_frame_no,
                 event_type="phone_use", severity="CRITICAL",
                 confidence=conf, risk_score=80, risk_level="CRITICAL",
-                factors=["phone_use"], duration=dur,
+                factors=["phone_use", "distraction"], duration=dur,
             )
             log_distraction(self.logger, event_time,
                             event="One of the pilots is using a mobile phone",
@@ -522,7 +513,7 @@ class GadgetDetectionPipeline:
         if absence_log_events:
             ar_ref  = next((ar for ar in absence_results if ar.absent), None)
             dur_abs = ar_ref.timer_value if ar_ref else 0.0
-            event_time = max(self.time_offset, video_time - ABSENCE_ALLOWED_DURATION)  # ← CHANGED
+            event_time = max(0, video_time - ABSENCE_ALLOWED_DURATION)
             self.vstore.record_violation(
                 annotated_frame=annotated, original_frame=frame,
                 video_time=event_time, frame_index=raw_frame_no,
@@ -553,7 +544,7 @@ class GadgetDetectionPipeline:
 
             dr_ref  = next((dr for dr in droop_results if dr.drooping), None)
             dur_drp = dr_ref.timer_value if dr_ref else 0.0
-            event_time = max(self.time_offset, video_time - HEAD_DROP_DURATION)  # ← CHANGED
+            event_time = max(0, video_time - HEAD_DROP_DURATION)
             self.vstore.record_violation(
                 annotated_frame=annotated, original_frame=frame,
                 video_time=event_time, frame_index=raw_frame_no,
@@ -566,9 +557,9 @@ class GadgetDetectionPipeline:
 
         return annotated
 
-    
+    # ─────────────────────────────────────────
     # HELPERS
-    
+    # ─────────────────────────────────────────
 
     def _print_banner(self, fps: float, w: int, h: int, total: int) -> None:
         self.logger.info(
@@ -595,9 +586,9 @@ class GadgetDetectionPipeline:
         )
 
 
-
+# ─────────────────────────────────────────
 # CLI
-
+# ─────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Loco Pilot Distraction Detection")

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from typing import List, Tuple, Dict, Optional
 
@@ -39,12 +38,15 @@ def get_shared_yolo_model():
 
 GREEN_LINE_RATIO = 0.57
 
-# ── Miss tolerance ────────────────────────────────────────────────
 # How many consecutive frames YOLO can miss the phone before the
 # distraction timer resets.
-# Set to 3 (was 8) — shorter window prevents brief false hits from
-# lingering on screen and in logs after the phone disappears.
 GADGET_MISS_TOLERANCE = 3
+
+# Set to True only for visual debug — produces console spam in production.
+DEBUG_YOLO = False
+
+# Wrist-to-ear distance threshold (fraction of frame width).
+WRIST_EAR_THRESH_FRACTION = 0.15
 
 
 # ─────────────────────────────────────────
@@ -57,6 +59,8 @@ class GadgetHit:
     confidence: float
     bbox:       Tuple[int, int, int, int]
     near_ear:   bool = False
+    from_pose:  bool = False
+
 
 @dataclass
 class PilotResult:
@@ -65,6 +69,7 @@ class PilotResult:
     gadgets:     List[GadgetHit] = field(default_factory=list)
     distracted:  bool  = False
     timer_value: float = 0.0
+
 
 @dataclass
 class FrameDetections:
@@ -76,44 +81,48 @@ class FrameDetections:
 
 
 # ─────────────────────────────────────────
-# PILOT TIMER  (wall clock only)
+# PILOT TIMER  — uses video_time, not wall clock
 # ─────────────────────────────────────────
 
 @dataclass
 class _PilotTimer:
-    pilot_id:    int
-    start_time:  Optional[float] = None
-    last_logged: Optional[float] = None
-    miss_frames: int = 0
-    last_person_seen: Optional[float] = None
-    def activate(self):
+    pilot_id:         int
+    start_vtime:      Optional[float] = None   # video_time when distraction started
+    last_logged:      Optional[float] = None   # video_time of last log
+    miss_frames:      int = 0
+    # FIX (Bug #5b): renamed from last_person_seen and changed from wall clock
+    # (time.monotonic()) to video_time so tolerance checks work correctly when
+    # video is processed faster or slower than real time.
+    last_person_seen_vtime: Optional[float] = None
+
+    def activate(self, video_time: float):
         self.miss_frames = 0
-        if self.start_time is None:
-            self.start_time = time.monotonic()
+        if self.start_vtime is None:
+            self.start_vtime = video_time
 
     def miss(self) -> bool:
         self.miss_frames += 1
         return self.miss_frames > GADGET_MISS_TOLERANCE
 
     def reset(self):
-        self.start_time  = None
+        self.start_vtime = None
         self.last_logged = None
         self.miss_frames = 0
 
-    def elapsed(self) -> float:
-        if self.start_time is None:
+    def elapsed(self, video_time: float) -> float:
+        if self.start_vtime is None:
             return 0.0
-        return time.monotonic() - self.start_time
+        return max(0.0, video_time - self.start_vtime)
 
-    def should_log(self) -> bool:
-        if self.elapsed() < GADGET_ALLOWED_DURATION:
+    def should_log(self, video_time: float) -> bool:
+        if self.elapsed(video_time) < GADGET_ALLOWED_DURATION:
             return False
         if self.last_logged is None:
             return True
-        return (time.monotonic() - self.last_logged) >= RELOG_INTERVAL
+        return (video_time - self.last_logged) >= RELOG_INTERVAL
 
-    def mark_logged(self):
-        self.last_logged = time.monotonic()
+    def mark_logged(self, video_time: float):
+        self.last_logged = video_time
 
 
 # ─────────────────────────────────────────
@@ -131,42 +140,59 @@ class GadgetDetector:
              based on whether their centre is above or below the
              horizontal split line (57% of frame height).
 
-    Step 3 — PHONE VALIDATION (3 filters must ALL pass):
+    Step 3 — PHONE VALIDATION (filters must ALL pass):
 
         Filter A — Shape check
             Phone bbox must have realistic size and aspect ratio.
-            Rejects tiny blobs, thin arms, wide panels/papers.
 
         Filter B — Person bbox required
             If YOLO did not detect a person in that pilot zone,
             the phone is IGNORED completely.
-            → No person detected = no phone alert (prevents false
-              alerts from instrument panels, papers, empty zones).
+            Last known person bbox is cached across YOLO frames
+            so a missed person detection doesn't kill a valid phone hit.
 
         Filter C — Ear/head proximity check
-            Phone centre must be inside the TOP 40% of the pilot's
-            person bbox (= head/shoulder region), expanded by 15%
-            margin for YOLO jitter tolerance.
-            → Phone on console/lap = ignored (centre below head zone)
-            → Phone held to ear   = valid hit
+            Phone centre must be inside the TOP 45% of the pilot's
+            person bbox (head/shoulder region).
 
-    Step 4 — Timer:
+        Filter D — Edge variance check
+            Real phones have sharp edges (Laplacian variance).
+            Lowered threshold for IR footage.
+
+    Step 4 — WRIST-TO-EAR HEURISTIC
+        If MediaPipe pose landmarks are provided, check if wrist is
+        near ear. This catches phones that YOLO misses.
+
+    Step 5 — Timer:
         Phone must be continuously valid for GADGET_ALLOWED_DURATION
-        seconds. YOLO can miss for up to GADGET_MISS_TOLERANCE frames
-        without resetting the timer (handles brief detection gaps).
-        After GADGET_ALLOWED_DURATION → distracted=True → red border
-        + banner appear + log entry written.
+        seconds (video time). YOLO can miss for up to
+        GADGET_MISS_TOLERANCE frames without resetting the timer.
 
-    WHY HAND NEAR EAR (NO PHONE) CAN STILL FALSE-TRIGGER:
-        YOLO sometimes misclassifies a dark hand or fist held near
-        the face as "cell phone". This is a YOLO model limitation.
-        The confidence threshold (0.65) and shape filters reduce this
-        but cannot eliminate it entirely with a generic YOLO model.
-        A custom-trained model on locomotive cabin footage would
-        remove this class of false positive permanently.
+    KEY FIXES applied:
+    ──────────────────
+    FIX 1 — _last_known_bbox cache:
+        YOLO runs every 18 frames. Between runs, bbox_by_pid[pid] is
+        None, killing valid phone detections. We cache the last known
+        person bbox and reuse it when YOLO misses.
+
+    FIX 2 — phone_frame_counter threshold lowered from 3 → 1:
+        With YOLO running every 18 frames, the counter could never
+        reach 3 before being reset. Now 1 confirmed detection
+        activates the timer.
+
+    FIX 3 — PERSON_MISS_TOLERANCE_TIME raised from 1.0s → 3.0s:
+        18 frames @ 25fps = 0.72s between YOLO runs. 1.0s grace was
+        too tight. 3.0s gives enough headroom for sparse YOLO runs.
+
+    FIX 4 — Timers now use video_time instead of time.monotonic():
+        Processing a 43-min video faster than real-time caused wall-
+        clock timers to fire and expire long before the video ended,
+        producing violations only in the first ~12 min. All timer
+        methods now accept video_time so they track the video
+        timeline accurately regardless of processing speed.
     """
 
-    HEAD_ZONE_FRACTION = 0.45   # top 40% of pilot body = head region
+    HEAD_ZONE_FRACTION = 0.45
 
     def __init__(self) -> None:
         self.timers: Dict[int, _PilotTimer] = {
@@ -176,11 +202,23 @@ class GadgetDetector:
         self.last_gadget_hits:       List[GadgetHit] = []
         self._last_gadgets_by_pilot: Dict[int, List[GadgetHit]] = {1: [], 2: []}
         self.last_frame_detections:  Optional[FrameDetections] = None
+
+        # Threshold = 1: YOLO runs every 18 frames — counter can never
+        # reach 3 before reset (was 3).
         self.phone_frame_counter = {1: 0, 2: 0}
+
+        # Cache last known person bbox per pilot so valid phone detections
+        # are not dropped on frames where YOLO skips person detection.
+        self._last_known_bbox: Dict[int, Optional[Tuple[int, int, int, int]]] = {
+            1: None,
+            2: None,
+        }
+
     def process(
         self,
-        frame:      np.ndarray,
-        video_time: float,
+        frame:          np.ndarray,
+        video_time:     float,
+        pose_landmarks: Optional[Dict[int, list]] = None,
     ) -> Tuple[List[PilotResult], List[Tuple[int, str]]]:
 
         enhanced = self._smart_enhance(frame)
@@ -190,15 +228,34 @@ class GadgetDetector:
         split_y = int(frame_h * GREEN_LINE_RATIO)
 
         pilot_boxes = self._assign_pilots_by_zone(raw_boxes, split_y)
-        bbox_by_pid: Dict[int, Optional[Tuple[int,int,int,int]]] = {1: None, 2: None}
+        bbox_by_pid: Dict[int, Optional[Tuple[int, int, int, int]]] = {1: None, 2: None}
         for pid, pbox in pilot_boxes:
             bbox_by_pid[pid] = pbox
 
-        # ── GADGET ASSIGNMENT ─────────────────────────────────────
-        # Only phones that pass ALL 3 filters count.
-        gadgets_by_pilot = self._assign_gadgets_near_ear(
-            raw_gadgets, bbox_by_pid
-        )
+        # BBOX CACHE: fill frames where YOLO skipped person detection
+        for pid in [1, 2]:
+            if bbox_by_pid[pid] is not None:
+                self._last_known_bbox[pid] = bbox_by_pid[pid]
+            elif self._last_known_bbox[pid] is not None:
+                bbox_by_pid[pid] = self._last_known_bbox[pid]
+
+        # GADGET ASSIGNMENT
+        gadgets_by_pilot = self._assign_gadgets_near_ear(raw_gadgets, bbox_by_pid)
+
+        # WRIST-TO-EAR HEURISTIC
+        if pose_landmarks:
+            wrist_hits = self._check_wrist_near_ear(
+                pose_landmarks, frame_w, frame_h, bbox_by_pid
+            )
+            for pid, hit in wrist_hits.items():
+                if hit and not gadgets_by_pilot.get(pid):
+                    gadgets_by_pilot[pid] = [GadgetHit(
+                        class_name = "cell phone",
+                        confidence = 0.75,
+                        bbox       = (0, 0, 0, 0),
+                        near_ear   = True,
+                        from_pose  = True,
+                    )]
 
         results:    List[PilotResult]     = []
         log_events: List[Tuple[int, str]] = []
@@ -207,44 +264,45 @@ class GadgetDetector:
             pbox    = bbox_by_pid[pid]
             matched = gadgets_by_pilot.get(pid, [])
             timer   = self.timers[pid]
+
             if pbox is not None:
-                timer.last_person_seen = time.monotonic()
+                timer.last_person_seen_vtime = video_time
+
             if matched:
                 self.phone_frame_counter[pid] += 1
-                if self.phone_frame_counter[pid] >= 3:
-                    timer.activate()
+                if self.phone_frame_counter[pid] >= 1:
+                    timer.activate(video_time)
                 self._last_gadgets_by_pilot[pid] = matched
             else:
+                self.phone_frame_counter[pid] = 0
                 if timer.miss():
                     timer.reset()
                     self._last_gadgets_by_pilot[pid] = []
 
-            distracted = timer.elapsed() >= GADGET_ALLOWED_DURATION
+            distracted = timer.elapsed(video_time) >= GADGET_ALLOWED_DURATION
 
-            display_gadgets = matched 
-
-            if distracted and timer.should_log():
+            if distracted and timer.should_log(video_time):
                 last_known = self._last_gadgets_by_pilot[pid]
                 best = (max(matched, key=lambda g: g.confidence)
                         if matched else
                         (last_known[0] if last_known else None))
                 name = best.class_name if best else "cell phone"
                 log_events.append((pid, name))
-                timer.mark_logged()
+                timer.mark_logged(video_time)
 
             if pbox is not None or matched:
                 if pbox is None:
                     if pid == 2:
-                        pbox = (frame_w//4, 0, 3*frame_w//4, split_y)
+                        pbox = (frame_w // 4, 0, 3 * frame_w // 4, split_y)
                     else:
-                        pbox = (frame_w//4, split_y, 3*frame_w//4, frame_h)
+                        pbox = (frame_w // 4, split_y, 3 * frame_w // 4, frame_h)
 
                 results.append(PilotResult(
                     pilot_id    = pid,
                     bbox        = pbox,
-                    gadgets     = display_gadgets,
+                    gadgets     = matched,
                     distracted  = distracted,
-                    timer_value = timer.elapsed(),
+                    timer_value = timer.elapsed(video_time),
                 ))
 
         self.last_gadget_hits = raw_gadgets
@@ -268,25 +326,71 @@ class GadgetDetector:
         return results, log_events
 
     # ─────────────────────────────────────────────────────────────
+    # WRIST-TO-EAR HEURISTIC
+    # ─────────────────────────────────────────────────────────────
+
+    def _check_wrist_near_ear(
+        self,
+        pose_landmarks: Dict[int, list],
+        frame_w:        int,
+        frame_h:        int,
+        bbox_by_pid:    Dict[int, Optional[Tuple[int, int, int, int]]],
+    ) -> Dict[int, bool]:
+        LEFT_EAR    = 7
+        RIGHT_EAR   = 8
+        LEFT_WRIST  = 15
+        RIGHT_WRIST = 16
+
+        result = {1: False, 2: False}
+        thresh = WRIST_EAR_THRESH_FRACTION * frame_w
+
+        for pid, landmarks in pose_landmarks.items():
+            if landmarks is None or len(landmarks) < 17:
+                continue
+
+            pbox = bbox_by_pid.get(pid)
+
+            for ear_idx, wrist_idx in [
+                (LEFT_EAR, LEFT_WRIST),
+                (RIGHT_EAR, RIGHT_WRIST),
+            ]:
+                try:
+                    ear   = landmarks[ear_idx]
+                    wrist = landmarks[wrist_idx]
+
+                    if hasattr(ear, 'x'):
+                        ex, ey = ear.x * frame_w,   ear.y * frame_h
+                        wx, wy = wrist.x * frame_w, wrist.y * frame_h
+                    else:
+                        ex, ey = ear[0],   ear[1]
+                        wx, wy = wrist[0], wrist[1]
+
+                    dist = np.hypot(wx - ex, wy - ey)
+
+                    if dist < thresh:
+                        if pbox is not None:
+                            px1, py1, px2, py2 = pbox
+                            upper_limit = py1 + 0.6 * (py2 - py1)
+                            if wy > upper_limit:
+                                continue
+
+                        result[pid] = True
+                        break
+
+                except (IndexError, AttributeError):
+                    continue
+
+        return result
+
+    # ─────────────────────────────────────────────────────────────
     # FILTER: ear proximity  (Filter B + C combined)
     # ─────────────────────────────────────────────────────────────
 
     def _assign_gadgets_near_ear(
         self,
         gadgets:     List[GadgetHit],
-        bbox_by_pid: Dict[int, Optional[Tuple[int,int,int,int]]],
+        bbox_by_pid: Dict[int, Optional[Tuple[int, int, int, int]]],
     ) -> Dict[int, List[GadgetHit]]:
-        """
-        Filter B — person bbox MUST exist for this pilot.
-                   No person detected → phone completely ignored.
-                   (Removes false alerts from empty zones, panels,
-                    papers, and instrument screens.)
-
-        Filter C — phone centre must be in head zone (top 40% of
-                   person bbox + 15% margin).
-                   Phone on desk/lap → ignored.
-                   Phone at ear      → valid.
-        """
         by_pilot: Dict[int, List[GadgetHit]] = {1: [], 2: []}
 
         for g in gadgets:
@@ -297,23 +401,34 @@ class GadgetDetector:
             for pid in [1, 2]:
                 pbox = bbox_by_pid.get(pid)
 
-                # ── Filter B: person must be detected ────────────
-                PERSON_MISS_TOLERANCE_TIME = 1.0
+                # 18 frames @ 25fps = 0.72s between YOLO runs.
+                # 3.0s gives safe headroom for sparse YOLO runs.
+                PERSON_MISS_TOLERANCE_TIME = 3.0
+
                 if pbox is None:
+                    # FIX (Bug #5a): the old code fell through to a bare
+                    # `continue` regardless of whether the tolerance check
+                    # passed, making the cached-bbox path a complete no-op.
+                    # Now we correctly skip only when tolerance has expired.
+                    # FIX (Bug #5b): replaced time.monotonic() (wall clock)
+                    # with video_time stored on the timer, matching the fix
+                    # already applied everywhere else in the codebase.
                     timer = self.timers.get(pid)
-                    if timer is None or timer.last_person_seen is None:
+                    if timer is None or timer.last_person_seen_vtime is None:
                         continue
-                    if (time.monotonic() - timer.last_person_seen) > PERSON_MISS_TOLERANCE_TIME:
+                    if (video_time - timer.last_person_seen_vtime) > PERSON_MISS_TOLERANCE_TIME:
                         continue
-                    # bbox missing this frame but seen recently — skip to avoid unpacking None
-                    continue
+                    # Tolerance OK — fall through to use _last_known_bbox below
+                    pbox = self._last_known_bbox.get(pid)
+                    if pbox is None:
+                        continue
+
                 px1, py1, px2, py2 = pbox
                 p_h = py2 - py1
                 p_w = px2 - px1
                 if p_h <= 0:
                     continue
 
-                # ── Filter C: phone must be in head zone ─────────
                 head_bottom = py1 + self.HEAD_ZONE_FRACTION * p_h
                 my = GADGET_EAR_PROXIMITY_MARGIN * p_h
                 mx = GADGET_EAR_PROXIMITY_MARGIN * p_w
@@ -327,58 +442,71 @@ class GadgetDetector:
 
     @staticmethod
     def _assign_pilots_by_zone(
-        boxes:   List[Tuple[int,int,int,int]],
+        boxes:   List[Tuple[int, int, int, int]],
         split_y: int,
-    ) -> List[Tuple[int, Tuple[int,int,int,int]]]:
+    ) -> List[Tuple[int, Tuple[int, int, int, int]]]:
         if not boxes:
             return []
         upper, lower = [], []
         for box in boxes:
             cy = (box[1] + box[3]) / 2
             (upper if cy < split_y else lower).append(box)
-        area = lambda b: (b[2]-b[0]) * (b[3]-b[1])
+        area = lambda b: (b[2] - b[0]) * (b[3] - b[1])
         result = []
         if upper: result.append((2, max(upper, key=area)))
         if lower: result.append((1, max(lower, key=area)))
         return result
 
+    # ─────────────────────────────────────────────────────────────
+    # IR ENHANCEMENT
+    # ─────────────────────────────────────────────────────────────
+
     def _smart_enhance(self, frame: np.ndarray) -> np.ndarray:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if np.mean(gray) < 100:
-            clahe    = cv2.createCLAHE(2.5, (8, 8))
-            enhanced = clahe.apply(gray)
-            return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        mean_val = np.mean(gray)
+
+        if mean_val < 160:
+            clahe     = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            enhanced  = clahe.apply(gray)
+            blurred   = cv2.GaussianBlur(enhanced, (0, 0), 3)
+            sharpened = cv2.addWeighted(enhanced, 1.5, blurred, -0.5, 0)
+            return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+
         return frame
+
+    # ─────────────────────────────────────────────────────────────
+    # YOLO INFERENCE
+    # ─────────────────────────────────────────────────────────────
 
     def _run_yolo(
         self,
         frame: np.ndarray,
-    ) -> Tuple[List[Tuple[int,int,int,int]], List[GadgetHit]]:
+    ) -> Tuple[List[Tuple[int, int, int, int]], List[GadgetHit]]:
         model = _get_model()
         res   = model(frame, verbose=False)[0]
         _, frame_w = frame.shape[:2]
 
-        persons: List[Tuple[Tuple[int,int,int,int], float]] = []
+        persons: List[Tuple[Tuple[int, int, int, int], float]] = []
         gadgets: List[GadgetHit] = []
 
         for box in res.boxes:
             cls_id       = int(box.cls[0])
             conf         = float(box.conf[0])
             name         = model.names[cls_id].lower()
-            x1,y1,x2,y2 = map(int, box.xyxy[0])
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
             bbox         = (x1, y1, x2, y2)
 
             if name == "person" and conf > PILOT_CONFIDENCE_THRESHOLD:
                 persons.append((bbox, conf))
-            elif name in GADGET_CLASSES and conf > GADGET_CONFIDENCE_THRESHOLD:
-                # Filter A: shape check (geometry)
-                # Filter D: pixel content check (real phone has edges)
-                if (_is_valid_gadget_shape(bbox, frame_w) and
-                        _has_phone_like_edges(frame, bbox)):
-                    gadgets.append(GadgetHit(name, conf, bbox))
+
+            elif name in GADGET_CLASSES:
+                if conf > GADGET_CONFIDENCE_THRESHOLD:
+                    if (_is_valid_gadget_shape(bbox, frame_w) and
+                            _has_phone_like_edges(frame, bbox)):
+                        gadgets.append(GadgetHit(name, conf, bbox))
 
         persons.sort(
-            key=lambda p: (p[0][2]-p[0][0]) * (p[0][3]-p[0][1]),
+            key=lambda p: (p[0][2] - p[0][0]) * (p[0][3] - p[0][1]),
             reverse=True,
         )
         return [p[0] for p in persons[:MAX_PILOTS]], gadgets
@@ -388,16 +516,7 @@ class GadgetDetector:
 # SHAPE FILTER  (Filter A)
 # ─────────────────────────────────────────
 
-def _is_valid_gadget_shape(bbox: Tuple[int,int,int,int], frame_w: int) -> bool:
-    """
-    Filter A — geometric shape sanity check.
-
-    Rejects detections impossible for a real phone:
-      • Too small area
-      • Width or height below minimum pixel size
-      • Wrong aspect ratio (thin arms, wide panels)
-      • Too wide relative to frame
-    """
+def _is_valid_gadget_shape(bbox: Tuple[int, int, int, int], frame_w: int) -> bool:
     x1, y1, x2, y2 = bbox
     w = x2 - x1
     h = y2 - y1
@@ -405,8 +524,6 @@ def _is_valid_gadget_shape(bbox: Tuple[int,int,int,int], frame_w: int) -> bool:
         return False
     if (w * h) < GADGET_MIN_AREA:
         return False
-    # Both dimensions must meet minimums independently.
-    # A shadow blob may pass area check but fail width or height.
     if w < GADGET_MIN_WIDTH_PX or h < GADGET_MIN_HEIGHT_PX:
         return False
     aspect = w / h
@@ -417,31 +534,17 @@ def _is_valid_gadget_shape(bbox: Tuple[int,int,int,int], frame_w: int) -> bool:
     return True
 
 
+# ─────────────────────────────────────────
+# EDGE VARIANCE FILTER  (Filter D)
+# ─────────────────────────────────────────
+
 def _has_phone_like_edges(
     frame: np.ndarray,
-    bbox:  Tuple[int,int,int,int],
+    bbox:  Tuple[int, int, int, int],
 ) -> bool:
-    """
-    Pixel content check — separates real phone from shadow/hand.
-
-    HOW IT WORKS:
-      A real phone is a manufactured rectangular object with sharp,
-      high-contrast edges (screen border, body outline).
-      The Laplacian operator highlights edges. The variance of the
-      Laplacian inside the detection bbox tells us how many sharp
-      edges are present.
-
-      Real phone   → HIGH Laplacian variance (lots of clear edges)
-      Dark shadow  → LOW  Laplacian variance (no edges, just dark blur)
-      Hand/skin    → MEDIUM variance but usually fails shape filter first
-
-    Threshold: GADGET_MIN_EDGE_VARIANCE (default 80.0)
-    Tune down if real phones are missed. Tune up if shadows still pass.
-    """
     x1, y1, x2, y2 = bbox
     h, w = frame.shape[:2]
 
-    # Clamp to frame bounds
     x1c = max(0, x1); y1c = max(0, y1)
     x2c = min(w, x2); y2c = min(h, y2)
 
@@ -452,19 +555,23 @@ def _has_phone_like_edges(
     if crop.size == 0:
         return False
 
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
-    lap  = cv2.Laplacian(gray, cv2.CV_64F)
+    gray     = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if len(crop.shape) == 3 else crop
+    lap      = cv2.Laplacian(gray, cv2.CV_64F)
     variance = lap.var()
 
-    return variance >= GADGET_MIN_EDGE_VARIANCE
+    # Floor at 35.0 for IR footage
+    effective_threshold = min(GADGET_MIN_EDGE_VARIANCE, 35.0)
+
+    return variance >= effective_threshold
 
 
 def _intersection_area(a, b):
     ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
     ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
-    return max(0, ix2-ix1) * max(0, iy2-iy1)
+    return max(0, ix2 - ix1) * max(0, iy2 - iy1)
 
 def _iou(a, b):
     inter = _intersection_area(a, b)
-    if inter == 0: return 0.0
-    return inter / ((a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter)
+    if inter == 0:
+        return 0.0
+    return inter / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter)
