@@ -64,6 +64,7 @@ from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
+import numpy as np
 
 from config.settings import (
     EAR_THRESHOLD,
@@ -94,7 +95,7 @@ HEAD_SCORE_WINDOW      = 10    # ~1.5 s at 25 fps
 
 # ── Eye-closure gate ─────────────────────────────────────────────
 # Consecutive frames with EAR < EAR_THRESHOLD before "eyes closed" fires
-EYE_CLOSED_FRAMES      = 15    # ~0.6 s at 25 fps; ignores normal blinks
+EYE_CLOSED_FRAMES      = 6    # ~0.6 s at 25 fps; ignores normal blinks
 
 # ── Seat check ───────────────────────────────────────────────────
 # Pilot bounding box must occupy at least this fraction of the vertical
@@ -309,7 +310,7 @@ class HeadDroopDetector:
 
     def process(
         self,
-        frame:            "np.ndarray",
+        frame:            np.ndarray,
         video_time:       float,
         frame_detections: Optional[FrameDetections],
     ) -> Tuple[List[DroopResult], List[Tuple[int, str]]]:
@@ -494,10 +495,8 @@ class HeadDroopDetector:
 
         
 
-            # Eye-closed streak — requires torso still to avoid
-            # flagging a pilot who merely reaches forward with eyes
-            # momentarily closed.
-            if eye_closed_this_frame and torso_still:
+            # Eye-closed streak
+            if eye_closed_this_frame:
                 state.eye_closed_streak += 1
             else:
                 state.eye_closed_streak = 0
@@ -534,10 +533,9 @@ class HeadDroopDetector:
 
             eyes_long_shut = (state.eye_closed_streak >= EYE_CLOSED_FRAMES)
 
-            drowsy_signal =  (
-                high_forward_droop
-                or high_backward_tilt                               # NEW v5
-                or eyes_long_shut
+            drowsy_signal = (
+                (torso_still and (high_forward_droop or high_backward_tilt))
+                or eyes_long_shut   # eye closure does not require torso stillness
             )
             
             # ══════════════════════════════════════════════════════
