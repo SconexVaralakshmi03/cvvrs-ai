@@ -196,27 +196,8 @@ class SeatAbsenceDetector:
         split_y: int,
     ) -> bool:
         """
-        Pilot 2 (upper zone):
-            IN SEAT  → box centre is ABOVE split_y
-            ABSENT   → box centre is BELOW split_y OR no detection
-
-        Pilot 1 (lower zone):
-            IN SEAT  → box CENTRE is in the lower zone (>= split_y)
-            ABSENT   → box centre is above split_y OR no detection
-
-        FIX (Bug #3): Previously Pilot 1 used `y2 >= split_y` which
-        allowed a standing pilot whose feet were still visible to be
-        counted as seated. Now uses the bbox centre, consistent with
-        the Pilot 2 logic.
+        If the bounding box exists for this PID, they are in the seat.
+        The pilot assignment and MediaPipe hallucination filters have already
+        validated that this bounding box is a real, seated person.
         """
-        if bbox is None:
-            return False
-
-        x1, y1, x2, y2 = bbox
-        cy = (y1 + y2) / 2  # use centre for both pilots — consistent & robust
-
-        if pid == 2:
-            return cy < split_y
-        else:
-            # FIX: was `y2 >= split_y`; now uses centre
-            return cy >= split_y
+        return bbox is not None

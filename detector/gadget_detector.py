@@ -36,7 +36,7 @@ def _get_model():
 def get_shared_yolo_model():
     return _get_model()
 
-GREEN_LINE_RATIO = 0.57
+GREEN_LINE_RATIO = 0.80
 
 # How many consecutive frames YOLO can miss the phone before the
 # distraction timer resets.
@@ -54,7 +54,7 @@ WRIST_EAR_THRESH_FRACTION = 0.15
 # ─────────────────────────────────────────
 
 @dataclass
-class GadgetHit:
+class ObjectHit:
     class_name: str
     confidence: float
     bbox:       Tuple[int, int, int, int]
@@ -66,7 +66,7 @@ class GadgetHit:
 class PilotResult:
     pilot_id:    int
     bbox:        Tuple[int, int, int, int]
-    gadgets:     List[GadgetHit] = field(default_factory=list)
+    gadgets:     List[ObjectHit] = field(default_factory=list)
     distracted:  bool  = False
     timer_value: float = 0.0
 
@@ -74,7 +74,7 @@ class PilotResult:
 @dataclass
 class FrameDetections:
     person_boxes: List[Tuple[Tuple[int, int, int, int], float]]
-    gadgets:      List[GadgetHit]
+    gadgets:      List[ObjectHit]
     pilot_crops:  Dict[int, Tuple[np.ndarray, int, int, int, int]]
     split_y:      int
     frame_shape:  Tuple[int, int, int]
@@ -129,7 +129,7 @@ class _PilotTimer:
 # MAIN DETECTOR
 # ─────────────────────────────────────────
 
-class GadgetDetector:
+class YoloObjectDetector:
     """
     HOW GADGET DETECTION WORKS — plain English
     ───────────────────────────────────────────
@@ -192,15 +192,15 @@ class GadgetDetector:
         timeline accurately regardless of processing speed.
     """
 
-    HEAD_ZONE_FRACTION = 0.45
+    HEAD_ZONE_FRACTION = 1.0
 
     def __init__(self) -> None:
         self.timers: Dict[int, _PilotTimer] = {
             1: _PilotTimer(1),
             2: _PilotTimer(2),
         }
-        self.last_gadget_hits:       List[GadgetHit] = []
-        self._last_gadgets_by_pilot: Dict[int, List[GadgetHit]] = {1: [], 2: []}
+        self.last_object_hits:       List[ObjectHit] = []
+        self._last_gadgets_by_pilot: Dict[int, List[ObjectHit]] = {1: [], 2: []}
         self.last_frame_detections:  Optional[FrameDetections] = None
 
         # Threshold = 1: YOLO runs every 18 frames — counter can never
@@ -236,11 +236,12 @@ class GadgetDetector:
         for pid in [1, 2]:
             if bbox_by_pid[pid] is not None:
                 self._last_known_bbox[pid] = bbox_by_pid[pid]
+                self.timers[pid].last_person_seen_vtime = video_time
             elif self._last_known_bbox[pid] is not None:
                 bbox_by_pid[pid] = self._last_known_bbox[pid]
 
         # GADGET ASSIGNMENT
-        gadgets_by_pilot = self._assign_gadgets_near_ear(raw_gadgets, bbox_by_pid)
+        gadgets_by_pilot = self._assign_gadgets_near_ear(raw_gadgets, bbox_by_pid, video_time)
 
         # WRIST-TO-EAR HEURISTIC
         if pose_landmarks:
@@ -249,7 +250,7 @@ class GadgetDetector:
             )
             for pid, hit in wrist_hits.items():
                 if hit and not gadgets_by_pilot.get(pid):
-                    gadgets_by_pilot[pid] = [GadgetHit(
+                    gadgets_by_pilot[pid] = [ObjectHit(
                         class_name = "cell phone",
                         confidence = 0.75,
                         bbox       = (0, 0, 0, 0),
@@ -305,7 +306,7 @@ class GadgetDetector:
                     timer_value = timer.elapsed(video_time),
                 ))
 
-        self.last_gadget_hits = raw_gadgets
+        self.last_object_hits = raw_gadgets
 
         pilot_crops: Dict[int, Tuple[np.ndarray, int, int, int, int]] = {}
         for pid, pbox in pilot_boxes:
@@ -388,10 +389,11 @@ class GadgetDetector:
 
     def _assign_gadgets_near_ear(
         self,
-        gadgets:     List[GadgetHit],
+        gadgets:     List[ObjectHit],
         bbox_by_pid: Dict[int, Optional[Tuple[int, int, int, int]]],
-    ) -> Dict[int, List[GadgetHit]]:
-        by_pilot: Dict[int, List[GadgetHit]] = {1: [], 2: []}
+        video_time:  float,
+    ) -> Dict[int, List[ObjectHit]]:
+        by_pilot: Dict[int, List[ObjectHit]] = {1: [], 2: []}
 
         for g in gadgets:
             gx1, gy1, gx2, gy2 = g.bbox
@@ -449,8 +451,8 @@ class GadgetDetector:
             return []
         upper, lower = [], []
         for box in boxes:
-            cy = (box[1] + box[3]) / 2
-            (upper if cy < split_y else lower).append(box)
+            y2 = box[3]
+            (upper if y2 < split_y else lower).append(box)
         area = lambda b: (b[2] - b[0]) * (b[3] - b[1])
         result = []
         if upper: result.append((2, max(upper, key=area)))
@@ -481,13 +483,13 @@ class GadgetDetector:
     def _run_yolo(
         self,
         frame: np.ndarray,
-    ) -> Tuple[List[Tuple[int, int, int, int]], List[GadgetHit]]:
+    ) -> Tuple[List[Tuple[int, int, int, int]], List[ObjectHit]]:
         model = _get_model()
         res   = model(frame, verbose=False)[0]
         _, frame_w = frame.shape[:2]
 
         persons: List[Tuple[Tuple[int, int, int, int], float]] = []
-        gadgets: List[GadgetHit] = []
+        gadgets: List[ObjectHit] = []
 
         for box in res.boxes:
             cls_id       = int(box.cls[0])
@@ -503,7 +505,7 @@ class GadgetDetector:
                 if conf > GADGET_CONFIDENCE_THRESHOLD:
                     if (_is_valid_gadget_shape(bbox, frame_w) and
                             _has_phone_like_edges(frame, bbox)):
-                        gadgets.append(GadgetHit(name, conf, bbox))
+                        gadgets.append(ObjectHit(name, conf, bbox))
 
         persons.sort(
             key=lambda p: (p[0][2] - p[0][0]) * (p[0][3] - p[0][1]),
