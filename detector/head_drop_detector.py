@@ -384,7 +384,7 @@ class HeadDroopDetector:
                 nose = lm[0]
                 best_ear = max(lm[7], lm[8], key=lambda m: m.visibility)
                 best_shoulder = max(lm[11], lm[12], key=lambda m: m.visibility)
-                if nose.visibility < 0.85 or best_ear.visibility < 0.85 or best_shoulder.visibility < 0.70:
+                if nose.visibility < 0.30 or best_ear.visibility < 0.30 or best_shoulder.visibility < 0.30:
                     is_hallucination = True
                     
             if is_hallucination:
