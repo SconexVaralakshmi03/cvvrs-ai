@@ -14,8 +14,24 @@ import warnings
 import cv2
 import numpy as np
 
+class TeeLogger:
+    def __init__(self, filename, stream):
+        self.stream = stream
+        self.file = open(filename, 'a', encoding='utf-8')
+    def write(self, data):
+        self.stream.write(data)
+        self.file.write(data)
+        self.stream.flush()
+        self.file.flush()
+    def flush(self):
+        self.stream.flush()
+        self.file.flush()
+
+sys.stdout = TeeLogger('run_logs.txt', sys.stdout)
+sys.stderr = TeeLogger('run_logs.txt', sys.stderr)
+
 print(
-    "[main] ✅ NEW main.py loaded — v4 (shared_vstore, time_offset, frame_offset, source_filename)"
+    "[main] [OK] NEW main.py loaded — v5 (merged: landmark ear-check, mouth-exclusion, wrist-confirm)"
 )
 
 DRAW = False
@@ -23,6 +39,16 @@ RAW_FRAME_SKIP = 3
 GADGET_EVERY = 6
 ABSENCE_EVERY = 4
 DROOP_EVERY = 6
+
+# ── MediaPipe pose (optional — graceful degradation if not installed) ─────────
+try:
+    import mediapipe as mp
+    _mp_pose    = mp.solutions.pose
+    _MP_AVAILABLE = True
+except ImportError:
+    _mp_pose      = None
+    _MP_AVAILABLE = False
+    print("[main] WARNING: mediapipe not installed — gadget detector will use bbox fallback")
 
 from config.settings import (
     WINDOW_NAME,
@@ -51,6 +77,16 @@ from detector.seat_absence_detector import SeatAbsenceDetector
 from detector.head_drop_detector import HeadDroopDetector
 
 _STOP = object()
+
+
+# Simple container so MediaPipe landmark coordinates can be patched to
+# full-frame space before being passed to the gadget detector.
+class _PatchedLandmark:
+    __slots__ = ("x", "y", "visibility")
+    def __init__(self, x: float, y: float, visibility: float):
+        self.x          = x
+        self.y          = y
+        self.visibility = visibility
 READ_QUEUE_MAXSIZE = 8
 WRITE_QUEUE_MAXSIZE = 8
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -119,6 +155,21 @@ class PilotMonitoringPipeline:
         self.yolo_detector = YoloObjectDetector()
         self.absence_detector = SeatAbsenceDetector()
         self.droop_detector = HeadDroopDetector()
+
+        # MediaPipe pose — reused across frames, graceful if not installed
+        if _MP_AVAILABLE:
+            self._pose = _mp_pose.Pose(
+                static_image_mode=False,
+                model_complexity=1,
+                enable_segmentation=False,
+                min_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
+        else:
+            self._pose = None
+        self._frame_height: int = 480
+        self._frame_width:  int = 848
+
         self.vstore: Optional[ViolationStore] = None
         self.executor = ThreadPoolExecutor(max_workers=3)
 
@@ -149,6 +200,8 @@ class PilotMonitoringPipeline:
         fps = _raw_fps or 25.0
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self._frame_width  = width
+        self._frame_height = height
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         print(
@@ -325,9 +378,12 @@ class PilotMonitoringPipeline:
 
         prev_frame_detection = self._prev_frame_detections
 
+        # ── Build per-pilot MediaPipe landmarks for gadget detector ───────────
+        pose_landmarks_by_pilot = self._get_pose_landmarks(frame) if run_yolo else None
+
         future_yolo = (
             self.executor.submit(
-                self.yolo_detector.process, frame, round(global_time, 3)
+                self.yolo_detector.process, frame, round(global_time, 3), pose_landmarks_by_pilot
             )
             if run_yolo
             else None
@@ -382,7 +438,6 @@ class PilotMonitoringPipeline:
             new_boxes = [
                 (r.pilot_id, r.bbox)
                 for r in results
-                if self._pilot_is_seated.get(r.pilot_id, True)
             ]
 
             self._prev_pilot_boxes = new_boxes
@@ -611,14 +666,7 @@ class PilotMonitoringPipeline:
                 if is_sleeping:
                     event_msg, etype = "One of the pilots is sleeping", "sleeping"
                 else:
-                    if dtype == "FORWARD":
-                        etype = "forward_droop"
-                    elif dtype == "BACKWARD":
-                        etype = "backward_droop"
-                    elif dtype == "EYES":
-                        etype = "eyes_closed"
-                    else:
-                        etype = "drowsy"
+                    etype = "drowsy"
                     event_msg = f"One of the pilots is drowsy ({dtype})"
 
                 dr_ref = next(
@@ -658,6 +706,60 @@ class PilotMonitoringPipeline:
                 )
 
         return annotated
+
+    def _get_pose_landmarks(self, frame: np.ndarray) -> Optional[dict]:
+        """
+        Run MediaPipe Pose on the full frame and return a dict:
+            { pilot_id: [landmark_0, ..., landmark_32] }
+
+        The frame is split at split_y (57 % of height) to assign each
+        detected person's landmarks to Pilot 1 or Pilot 2 independently,
+        using the same zone logic as the YOLO pilot assignment.
+
+        Returns None if MediaPipe is not installed or fails.
+        """
+        if self._pose is None:
+            return None
+
+        try:
+            h = self._frame_height
+            w = self._frame_width
+            from detector.gadget_detector import GREEN_LINE_RATIO
+            split_y = int(h * GREEN_LINE_RATIO)
+
+            zones = {
+                2: frame[0:split_y, 0:w],
+                1: frame[split_y:h,  0:w],
+            }
+
+            result: dict = {}
+            for pid, crop in zones.items():
+                if crop.size == 0:
+                    continue
+                rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                mp_result = self._pose.process(rgb)
+                if mp_result.pose_landmarks is None:
+                    continue
+
+                lms = mp_result.pose_landmarks.landmark
+                y_offset = split_y if pid == 1 else 0
+
+                patched = []
+                for lm in lms:
+                    crop_h = crop.shape[0]
+                    full_y = (lm.y * crop_h + y_offset) / h
+                    patched.append(_PatchedLandmark(
+                        x          = lm.x,
+                        y          = full_y,
+                        visibility = getattr(lm, "visibility", 1.0),
+                    ))
+                result[pid] = patched
+
+            return result if result else None
+
+        except Exception:
+            return None
+
 
     def _print_banner(self, fps, w, h, total):
         out_msg = (

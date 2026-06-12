@@ -354,7 +354,8 @@ class HeadDroopDetector:
                 state.miss_frames = 0
 
             crop, x1, y1, x2, y2 = crop_data
-            state.last_crop_data  = crop_data
+            # Create a copy of the crop to avoid holding a reference to the original frame
+            state.last_crop_data  = (crop.copy(), x1, y1, x2, y2)
 
             if crop.size == 0:
                 results.append(DroopResult(pid))
