@@ -494,7 +494,7 @@ import warnings
 import cv2
 import numpy as np
 
-print("[main] ✅ NEW main.py loaded — v5 (mediapipe ear-check, mouth-exclusion, wrist-confirm)")
+print("[main] ✅ NEW main.py loaded — v5 (merged: mediapipe ear-check, mouth-exclusion, wrist-confirm, fixed drowsiness)")
 
 DRAW           = False
 RAW_FRAME_SKIP = 3

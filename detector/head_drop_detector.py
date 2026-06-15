@@ -64,6 +64,7 @@ from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
+import numpy as np
 
 from config.settings import (
     EAR_THRESHOLD,
@@ -82,11 +83,11 @@ from detector.gadget_detector import FrameDetections
 # ──────────────────────────────────────────────────────────────────
 
 # ── Stillness gate ────────────────────────────────────────────────
-# Shoulder midpoint must move < this many pixels to count as "quiet"
-STILL_MOTION_PX        = 2.5   # px; train vibration ≈ 2-4 px, real move ≈ 15+
+# Shoulder midpoint must move < this fraction of crop height to count as "quiet"
+STILL_MOTION_RATIO     = 0.99   # Temporarily set to 99% to bypass stillness logic for testing
 
 # How many consecutive "quiet" frames before we say body is still
-STILL_FRAMES_REQUIRED  = 10    # ~0.4 s at 25 fps
+STILL_FRAMES_REQUIRED  = 3     # frames
 
 # ── Head-drop / head-tilt score ───────────────────────────────────
 # Rolling window length for accumulating head signal (frames)
@@ -94,7 +95,7 @@ HEAD_SCORE_WINDOW      = 10    # ~1.5 s at 25 fps
 
 # ── Eye-closure gate ─────────────────────────────────────────────
 # Consecutive frames with EAR < EAR_THRESHOLD before "eyes closed" fires
-EYE_CLOSED_FRAMES      = 15    # ~0.6 s at 25 fps; ignores normal blinks
+EYE_CLOSED_FRAMES      = 6    # ~0.6 s at 25 fps; ignores normal blinks
 
 # ── Seat check ───────────────────────────────────────────────────
 # Pilot bounding box must occupy at least this fraction of the vertical
@@ -132,6 +133,10 @@ class _PilotState:
     prev_shoulder:  Optional[Tuple[float, float]] = None
     prev_nose_y: Optional[float] = None
     still_counter:  int = 0          # consecutive quiet frames
+    
+    # Dynamic Baseline Tracking
+    baseline_gap_metric: Optional[float] = None
+    baseline_samples: List[float] = field(default_factory=list)
 
     # Forward head-drop score (rolling window of booleans)
     droop_window:      Deque[bool] = field(
@@ -169,19 +174,19 @@ class _PilotState:
             return 0.0
         return sum(self.back_droop_window) / len(self.back_droop_window)
 
-    def activate_alert(self):
+    def activate_alert(self, video_time: float):
         self.miss_frames = 0
         if self.alert_start is None:
-            self.alert_start = time.monotonic()
+            self.alert_start = video_time
 
     def reset_alert(self):
         self.alert_start = None
         self.last_logged = None
 
-    def alert_elapsed(self) -> float:
+    def alert_elapsed(self, video_time: float) -> float:
         if self.alert_start is None:
             return 0.0
-        return time.monotonic() - self.alert_start
+        return video_time - self.alert_start
 
     def full_reset(self):
         """Called when pilot disappears for too many frames."""
@@ -309,7 +314,7 @@ class HeadDroopDetector:
 
     def process(
         self,
-        frame:            "np.ndarray",
+        frame:            np.ndarray,
         video_time:       float,
         frame_detections: Optional[FrameDetections],
     ) -> Tuple[List[DroopResult], List[Tuple[int, str]]]:
@@ -349,7 +354,8 @@ class HeadDroopDetector:
                 state.miss_frames = 0
 
             crop, x1, y1, x2, y2 = crop_data
-            state.last_crop_data  = crop_data
+            # Create a copy of the crop to avoid holding a reference to the original frame
+            state.last_crop_data  = (crop.copy(), x1, y1, x2, y2)
 
             if crop.size == 0:
                 results.append(DroopResult(pid))
@@ -370,6 +376,23 @@ class HeadDroopDetector:
             pose_res = self._pose.process(rgb)
             face_res = self._face.process(rgb)
 
+            # ── Hallucination Filter ──────────────────────────────
+            is_hallucination = False
+            if pose_res.pose_landmarks is None and face_res.multi_face_landmarks is None:
+                is_hallucination = True
+            elif pose_res.pose_landmarks is not None:
+                lm = pose_res.pose_landmarks.landmark
+                nose = lm[0]
+                best_ear = max(lm[7], lm[8], key=lambda m: m.visibility)
+                best_shoulder = max(lm[11], lm[12], key=lambda m: m.visibility)
+                if nose.visibility < 0.30 or best_ear.visibility < 0.30 or best_shoulder.visibility < 0.30:
+                    is_hallucination = True
+                    
+            if is_hallucination:
+                state.full_reset()
+                results.append(DroopResult(pid, is_seated=False))
+                continue
+
             crop_h, crop_w = crop.shape[:2]
 
             # ══════════════════════════════════════════════════════
@@ -383,8 +406,15 @@ class HeadDroopDetector:
 
             if pose_res.pose_landmarks:
                 lm     = pose_res.pose_landmarks.landmark
-                curr_x = ((lm[11].x + lm[12].x) / 2) * crop_w
-                curr_y = ((lm[11].y + lm[12].y) / 2) * crop_h
+                
+                # Dynamically select the most visible shoulder (solves side-profile jitter)
+                if lm[11].visibility > lm[12].visibility:
+                    best_shoulder = lm[11]
+                else:
+                    best_shoulder = lm[12]
+                    
+                curr_x = best_shoulder.x * crop_w
+                curr_y = best_shoulder.y * crop_h
                 curr   = (curr_x, curr_y)
 
                 if state.prev_shoulder is not None:
@@ -392,17 +422,16 @@ class HeadDroopDetector:
                         curr[0] - state.prev_shoulder[0],
                         curr[1] - state.prev_shoulder[1],
                     )
-                    if motion < STILL_MOTION_PX:
+                    motion_ratio = motion / crop_h
+                    if motion_ratio < STILL_MOTION_RATIO:
                         state.still_counter = min(state.still_counter + 1, STILL_FRAMES_REQUIRED+5)
                     else:
                         # Active body movement → reset EVERYTHING.
                         # Torso move = not drowsy.
                         state.still_counter = max(0, state.still_counter - 2)
-                        if motion>6:
+                        if motion_ratio > 0.05:
                             state.droop_window.clear()
                             state.back_droop_window.clear()   # NEW v5
-                            state.eye_closed_streak = 0
-                            state.reset_alert()
 
                 state.prev_shoulder = curr
                 torso_still = state.is_still()
@@ -464,8 +493,22 @@ class HeadDroopDetector:
                 fallback_back = False
                 if pose_res.pose_landmarks:
                     lm = pose_res.pose_landmarks.landmark
-                    shoulder_y = ((lm[11].y + lm[12].y) / 2) * crop_h
+                    
+                    if lm[11].visibility > lm[12].visibility:
+                        best_shoulder = lm[11]
+                    else:
+                        best_shoulder = lm[12]
+                        
+                    if lm[7].visibility > lm[8].visibility:
+                        best_ear = lm[7]
+                    else:
+                        best_ear = lm[8]
+                        
+                    shoulder_y = best_shoulder.y * crop_h
+                    nose_x = lm[0].x * crop_w
                     nose_y = lm[0].y * crop_h
+                    ear_x = best_ear.x * crop_w
+                    ear_y = best_ear.y * crop_h
                     if state.prev_nose_y is not None:
                         motion = abs(nose_y - state.prev_nose_y)
                     else:
@@ -473,19 +516,56 @@ class HeadDroopDetector:
 
                     state.prev_nose_y = nose_y
 
-                    ratio_forward = (nose_y - shoulder_y) / crop_h
-                    ratio_back = (shoulder_y - nose_y) / crop_h
+                    # Hybrid Scale-Invariant Geometry (Shoulder vs Nose, normalized by Face Size)
+                    face_size = math.hypot(nose_x - ear_x, nose_y - ear_y)
+                    
+                    # Ensure high confidence to prevent hallucinating on empty seats
+                    if lm[0].visibility < 0.6 or best_ear.visibility < 0.6 or best_shoulder.visibility < 0.5:
+                        state.full_reset()
+                        results.append(DroopResult(pid, is_seated=False))
+                        continue
 
-                    #print("FORWARD ratio:", ratio_forward, "motion:", motion)
-                    #print("BACK ratio:", ratio_back, "motion:", motion)
+                    if face_size > crop_h * 0.05:
+                        gap_metric = (shoulder_y - nose_y) / face_size
+                    else:
+                        gap_metric = state.baseline_gap_metric if state.baseline_gap_metric is not None else 1.5
 
-        # ✅ FIXED CONDITION (IMPORTANT)
-                    if ratio_forward > 0.07:
-                        fallback_forward = True
+                    # DETERMINISTIC HALLUCINATION CHECK
+                    if gap_metric < 0:
+                        # Geometrically impossible (nose physically below shoulders).
+                        # MediaPipe is wildly hallucinating on an empty chair.
+                        state.full_reset()
+                        results.append(DroopResult(pid, is_seated=False))
+                        continue
 
-        # ✅ KEEP YOUR EXISTING BACK LOGIC
-                    if ratio_back > 0.15 and motion < 25:
-                        fallback_back = True
+                    # --- DYNAMIC BASELINE CALIBRATION ---
+                    if state.baseline_gap_metric is None:
+                        # Learning Phase: Collect samples when sitting still
+                        if torso_still:
+                            state.baseline_samples.append(gap_metric)
+                            if len(state.baseline_samples) >= 10:
+                                state.baseline_gap_metric = sum(state.baseline_samples) / 10
+                                state.baseline_samples.clear()
+                                print(f"[DEBUG PID {pid}] BASELINE ESTABLISHED: {state.baseline_gap_metric:.2f}")
+                    else:
+                        # Detection Phase
+                        deviation = gap_metric / state.baseline_gap_metric
+                        
+                        # Forward Droop: Gap shrinks by > 30%
+                        if deviation < 0.70 and motion < 25:
+                            fallback_forward = True
+
+                        # Backward Tilt: Gap grows by > 30%
+                        if deviation > 1.30 and motion < 25:
+                            fallback_back = True
+                            
+                        # Adaptive Tracking (EMA) - slowly adjust baseline to new normal posture
+                        if torso_still and not fallback_forward and not fallback_back and motion < 25:
+                            state.baseline_gap_metric = (0.95 * state.baseline_gap_metric) + (0.05 * gap_metric)
+                            
+                        # DEBUG PRINT
+                        if motion < 25:
+                            print(f"[DEBUG PID {pid}] gap_metric={gap_metric:.2f} | baseline={state.baseline_gap_metric:.2f} | dev={deviation:.2f} | fwd={fallback_forward} | back={fallback_back}")
                 final_forward = head_forward_this_frame or fallback_forward
                 final_back = head_backward_this_frame or fallback_back
     # ✅ append once (VERY IMPORTANT)
@@ -494,10 +574,8 @@ class HeadDroopDetector:
 
         
 
-            # Eye-closed streak — requires torso still to avoid
-            # flagging a pilot who merely reaches forward with eyes
-            # momentarily closed.
-            if eye_closed_this_frame and torso_still:
+            # Eye-closed streak
+            if eye_closed_this_frame:
                 state.eye_closed_streak += 1
             else:
                 state.eye_closed_streak = 0
@@ -519,7 +597,7 @@ class HeadDroopDetector:
 
             forward_score  = state.forward_droop_score()
             backward_score = state.backward_tilt_score()           # NEW v5
-            #print(f"[PID {pid}] still={torso_still} | face={face_detected} | fwd_score={forward_score:.2f} | back_score={backward_score:.2f} | eye_streak={state.eye_closed_streak}")
+            print(f"[PID {pid}] still={torso_still} | face={face_detected} | fwd_score={forward_score:.2f} | back_score={backward_score:.2f} | eye_streak={state.eye_closed_streak}")
             half_window = HEAD_SCORE_WINDOW // 2
 
             high_forward_droop = (
@@ -534,10 +612,9 @@ class HeadDroopDetector:
 
             eyes_long_shut = (state.eye_closed_streak >= EYE_CLOSED_FRAMES)
 
-            drowsy_signal =  (
-                high_forward_droop
-                or high_backward_tilt                               # NEW v5
-                or eyes_long_shut
+            drowsy_signal = (
+                (torso_still and (high_forward_droop or high_backward_tilt))
+                or eyes_long_shut   # eye closure does not require torso stillness
             )
             
             # ══════════════════════════════════════════════════════
@@ -545,11 +622,11 @@ class HeadDroopDetector:
             # ══════════════════════════════════════════════════════
 
             if drowsy_signal:
-                state.activate_alert()
+                state.activate_alert(video_time)
             else:
                 state.reset_alert()
 
-            elapsed  = state.alert_elapsed()
+            elapsed  = state.alert_elapsed(video_time)
             drooping = elapsed >= HEAD_DROP_DURATION
 
             # Determine which posture triggered the alert (for UI/log)
