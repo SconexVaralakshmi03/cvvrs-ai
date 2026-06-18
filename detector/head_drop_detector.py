@@ -1252,6 +1252,8 @@ from config.settings import (
     HEAD_DROOP_SCORE_THRESHOLD,
     HEAD_BACK_SCORE_THRESHOLD,
     RELOG_INTERVAL,
+    TORSO_RECLINE_MIN,
+    TORSO_HUNCH_MAX,
 )
 from detector.gadget_detector import FrameDetections
 
@@ -1559,6 +1561,7 @@ class HeadDroopDetector:
             # (prevents false alerts when pose is ambiguous).
 
             torso_still = False
+            torso_angle = None   # degrees from vertical; +ve = reclined back
 
             if pose_res.pose_landmarks:
                 lm     = pose_res.pose_landmarks.landmark
@@ -1585,6 +1588,24 @@ class HeadDroopDetector:
 
                 state.prev_shoulder = curr
                 torso_still = state.is_still()
+
+                # ── Torso angle (shoulder-to-hip line vs. vertical) ───
+                # A seated, attentive pilot's torso is close to vertical.
+                # Genuine recline-sleep tilts the torso itself backward,
+                # not just the head. This distinguishes recline-sleep from
+                # a normally-seated pilot whose head/ear offset alone can
+                # look "tilted back" due to camera angle or simply looking
+                # up/forward without actually leaning into the seat.
+                hip_x  = ((lm[23].x + lm[24].x) / 2) * crop_w
+                hip_y  = ((lm[23].y + lm[24].y) / 2) * crop_h
+                dx     = curr_x - hip_x
+                dy     = curr_y - hip_y   # shoulder above hip → dy negative
+                if dy != 0 or dx != 0:
+                    # angle from vertical, signed so leaning back (shoulder
+                    # moves backward/up relative to hip in image-x terms)
+                    # is positive — sign convention matched against
+                    # TORSO_RECLINE_MIN / TORSO_HUNCH_MAX in settings.
+                    torso_angle = math.degrees(math.atan2(dx, -dy))
             else:
                 # No pose detected — treat as active (suppress alert)
                 state.still_counter = max(0, state.still_counter - 2)
@@ -1658,18 +1679,25 @@ class HeadDroopDetector:
                     #print("FORWARD ratio:", ratio_forward, "motion:", motion)
                     #print("BACK ratio:", ratio_back, "motion:", motion)
 
-        # ✅ FIXED CONDITION (IMPORTANT)
-                    if ratio_forward > 0.07:
+                    # Tightened: 0.07 fired on ordinary forward-lean-to-work-
+                    # controls posture, not just drowsy chin-drop.
+                    if ratio_forward > 0.12:
                         fallback_forward = True
 
-        # ✅ KEEP YOUR EXISTING BACK LOGIC
                     if ratio_back > 0.15 and motion < 25:
                         fallback_back = True
                 final_forward = head_forward_this_frame or fallback_forward
                 final_back = head_backward_this_frame or fallback_back
-    # ✅ append once (VERY IMPORTANT)
-                state.droop_window.append(final_forward)
-                state.back_droop_window.append(final_back)
+
+                # Only accumulate when torso is still — mirrors STEP B's
+                # face-detected path. Without this gate, leaning forward to
+                # work the controls (torso actively moving, face mesh lost
+                # due to head angle) still got counted toward the droop
+                # score, eventually crossing HEAD_DROOP_SCORE_THRESHOLD and
+                # firing a false "FORWARD" drowsiness alert.
+                if torso_still:
+                    state.droop_window.append(final_forward)
+                    state.back_droop_window.append(final_back)
 
         
 
@@ -1698,7 +1726,7 @@ class HeadDroopDetector:
 
             forward_score  = state.forward_droop_score()
             backward_score = state.backward_tilt_score()           # NEW v5
-            #print(f"[PID {pid}] still={torso_still} | face={face_detected} | fwd_score={forward_score:.2f} | back_score={backward_score:.2f} | eye_streak={state.eye_closed_streak}")
+            #print(f"[PID {pid}] still={torso_still} | face={face_detected} | fwd_score={forward_score:.2f} | back_score={backward_score:.2f} | eye_streak={state.eye_closed_streak} | torso_angle={torso_angle}")
             half_window = HEAD_SCORE_WINDOW // 2
 
             high_forward_droop = (
@@ -1706,9 +1734,22 @@ class HeadDroopDetector:
                 and forward_score >= HEAD_DROOP_SCORE_THRESHOLD
             )
 
+            # Torso must show genuine recline (angle ≥ TORSO_RECLINE_MIN)
+            # for the latest reading, on top of the sustained head-offset
+            # score. Without this, a normally-seated pilot whose head/ear
+            # offset alone crosses the threshold (camera angle, looking up,
+            # just sat back down) gets misread as recline-sleep — this was
+            # firing "drowsy (BACKWARD)" within seconds of a pilot simply
+            # returning to and settling into their seat.
+            torso_reclined = (
+                torso_angle is not None
+                and torso_angle >= TORSO_RECLINE_MIN
+            )
+
             high_backward_tilt = (                                  # NEW v5
                 len(state.back_droop_window) >= half_window
                 and backward_score >= HEAD_BACK_SCORE_THRESHOLD
+                and torso_reclined
             )
 
             eyes_long_shut = (state.eye_closed_streak >= EYE_CLOSED_FRAMES)
