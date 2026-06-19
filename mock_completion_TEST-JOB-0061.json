@@ -1,0 +1,21 @@
+{
+  "jobId": "TEST-JOB-0061",
+  "journeyId": 21,
+  "batchId": "BATCH-TEST-JOB-0061",
+  "trainDetailId": 8,
+  "folderName": "journeys/5/2026-06-19/JRN-20260619-3-keshika",
+  "processingTime": 470356,
+  "videoResults": [
+    {
+      "videoId": "10010",
+      "sequenceNo": 9,
+      "videoName": "001_xyz 1.mp4 ",
+      "durationSeconds": 2497.4,
+      "durationFormatted": "0:41:37",
+      "fps": 25.0,
+      "sizeMb": 264.23,
+      "originalS3Key": "journeys/91/2026-06-16/JRN-20260616-91-135C3C/original/001_xyz 1.mp4 ",
+      "violations": []
+    }
+  ]
+}

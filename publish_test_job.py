@@ -131,17 +131,17 @@ ROUTING_KEY   = os.environ.get("ANALYSIS_ROUTING",  "analysis.job.created")
 
 # ── Edit this to match your test scenario ────────────────────────────────────
 JOB_MESSAGE = {
-    "jobId":         "TEST-JOB-001",
-    "journeyId":     10,
-    "trainDetailId": 1,
-    "folderName":    "journeys/1/2026-06-10/JRN-20260610-1-ABC123",
+    "jobId":         "TEST-JOB-0061",
+    "journeyId":     21,
+    "trainDetailId": 8,
+    "folderName":    "journeys/5/2026-06-19/JRN-20260619-3-keshika",
     "priority":      "NORMAL",
     "videos": [
         {
-            "videoId":          1001,
-            "sequenceNo":       1,
-            "originalFileName": "front_cabin.mp4",
-            "s3Key":            "journeys/1/2026-06-10/JRN-20260610-1-ABC123/original/001_front_cabin.mp4",
+            "videoId":          10010,
+            "sequenceNo":       9,
+            "originalFileName": "changescheck.mp4",
+            "s3Key":            "journeys/91/2026-06-16/JRN-20260616-91-135C3C/original/001_xyz 1.mp4 ",
         },
         # Uncomment to test multi-video offset continuity:
         # {
@@ -165,7 +165,7 @@ def main() -> None:
         exchange_type = "direct",
         durable       = True,
     )
-    channel.queue_declare(queue=QUEUE_NAME, durable=True)
+    #channel.queue_declare(queue=QUEUE_NAME, durable=True)
     channel.queue_bind(
         queue       = QUEUE_NAME,
         exchange    = EXCHANGE_NAME,

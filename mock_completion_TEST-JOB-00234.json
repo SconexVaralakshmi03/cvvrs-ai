@@ -1,0 +1,21 @@
+{
+  "jobId": "TEST-JOB-00234",
+  "journeyId": 11,
+  "batchId": "BATCH-TEST-JOB-00234",
+  "trainDetailId": 2,
+  "folderName": "journeys/1/2026-06-11/JRN-20260611-1-ANNIC223",
+  "processingTime": 112851,
+  "videoResults": [
+    {
+      "videoId": "1002",
+      "sequenceNo": 3,
+      "videoName": "003_Copy of ch04_20250330022333_20250330030659.mp4",
+      "durationSeconds": 2606.44,
+      "durationFormatted": "0:43:26",
+      "fps": 25.0,
+      "sizeMb": 264.11,
+      "originalS3Key": "journeys/95/2026-06-18/JRN-20260618-95-089ACA/original/003_Copy of ch04_20250330022333_20250330030659.mp4",
+      "violations": []
+    }
+  ]
+}
