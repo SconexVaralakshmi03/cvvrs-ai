@@ -22,7 +22,7 @@ if not logger.handlers:
     _h.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
     logger.addHandler(_h)
 logger.setLevel(logging.WARNING)  # default: quiet. Flip to DEBUG to trace.
-print("✅ GADGET DETECTOR FILE LOADED")
+print("GADGET DETECTOR FILE LOADED")
 logger.setLevel(logging.DEBUG)
 from config.settings import (
     YOLO_MODEL,
@@ -78,7 +78,7 @@ _MOUTH_EXCLUSION_OFFSET_PX = 65
 # At least one visible wrist must be within this many pixels of the phone
 # centre to confirm the pilot is physically holding something.
 # Wrist landmark → phone centre when gripping ≈ 60–100 px; 120 px is safe.
-_WRIST_TO_OBJ_PX = 120
+_WRIST_TO_OBJ_PX = 180
 
 # ── Fallback (no landmarks available) ────────────────────────────────────────
 # When MediaPipe landmarks are absent for a frame we fall back to a simple
@@ -98,8 +98,19 @@ _model = None
 def _get_model():
     global _model
     if _model is None:
+        import torch
         from ultralytics import YOLO
+        
+        # Patch torch.load to bypass PyTorch 2.6 weights_only restriction
+        _original_load = torch.load
+        def _patched_load(*args, **kwargs):
+            kwargs['weights_only'] = False
+            return _original_load(*args, **kwargs)
+            
+        torch.load = _patched_load
         _model = YOLO(YOLO_MODEL)
+        torch.load = _original_load
+        
     return _model
 
 
@@ -364,6 +375,7 @@ def _wrist_confirms_object(
     landmarks: list,
     frame_w:   int,
     frame_h:   int,
+    confidence: float,
 ) -> bool:
     """
     Returns True if at least one VISIBLE wrist landmark is within
@@ -382,8 +394,11 @@ def _wrist_confirms_object(
     )
     if not visible_wrists:
         # No visible wrist landmarks — cannot confirm but also cannot deny.
-        # Return True so we don't silently block real detections.
-        logger.debug("WRIST_CHECK pass (no visible wrist landmarks — conservative pass)")
+        # Guard against blurry-hand hallucinations: require high confidence.
+        if confidence < 0.55:
+            logger.debug("WRIST_CHECK reject: no visible wrists and conf %.2f < 0.55 (hallucination guard)", confidence)
+            return False
+        logger.debug("WRIST_CHECK pass: no visible wrists, but conf %.2f >= 0.55", confidence)
         return True
 
     for wx, wy in visible_wrists:
@@ -603,6 +618,7 @@ class GadgetDetector:
         frame:          np.ndarray,
         video_time:     float,
         pose_landmarks: Optional[Dict[int, list]] = None,
+        zone_manager:   Optional[Any] = None,
     ) -> Tuple[List[PilotResult], List[Tuple[int, str]]]:
         """
         Process one video frame.
@@ -616,23 +632,44 @@ class GadgetDetector:
                          ear-proximity and wrist-confirmation checks use
                          real landmark coordinates; otherwise the fallback
                          bbox-zone check is used.
+        zone_manager   : DynamicZoneManager instance to handle pilot assignment.
 
         Returns
         -------
         results    : List[PilotResult] — one entry per detected pilot.
         log_events : List[(pilot_id, event_str)] — violations ready to log.
         """
+        from typing import Any
+        
         enhanced = _smart_enhance(frame)
         raw_boxes, raw_gadgets = self._run_yolo(enhanced, frame)
 
         frame_h, frame_w = frame.shape[:2]
-        split_y = int(frame_h * GREEN_LINE_RATIO)
 
-        # ── Assign persons to pilot zones ─────────────────────────────────────
-        pilot_boxes = _assign_pilots_by_zone(raw_boxes, split_y)
+        # ── Update Calibration & Assign Persons ──────────────────────────────
         bbox_by_pid: Dict[int, Optional[Tuple[int, int, int, int]]] = {1: None, 2: None}
-        for pid, pbox in pilot_boxes:
-            bbox_by_pid[pid] = pbox
+        split_y = int(frame_h * GREEN_LINE_RATIO)  # Default fallback
+        pilot_boxes = []
+
+        if zone_manager is not None:
+            is_calibrated = zone_manager.update(raw_boxes)
+            if is_calibrated:
+                pilot_boxes_dict = zone_manager.assign_pilots(raw_boxes)
+                for pid in [1, 2]:
+                    pbox = pilot_boxes_dict.get(pid)
+                    bbox_by_pid[pid] = pbox
+                    if pbox is not None:
+                        pilot_boxes.append((pid, pbox))
+                
+                # If we're side-by-side, split_y doesn't make sense, but we keep it
+                # as a fallback. If top-bottom, use the calibrated split.
+                if zone_manager.layout_type == 'TOP_BOTTOM':
+                    split_y = int(zone_manager.split_val)
+        else:
+            # Fallback to old hardcoded logic if no zone_manager provided
+            pilot_boxes = _assign_pilots_by_zone(raw_boxes, split_y)
+            for pid, pbox in pilot_boxes:
+                bbox_by_pid[pid] = pbox
 
         # ── Update bbox cache (survives YOLO skip frames) ─────────────────────
         for pid in [1, 2]:
@@ -820,13 +857,14 @@ class GadgetDetector:
                         continue
 
                     # W: wrist confirmation
-                    if not _wrist_confirms_object(gcx, gcy, lms, frame_w, frame_h):
+                    if not _wrist_confirms_object(gcx, gcy, lms, frame_w, frame_h, g.confidence):
                         continue
 
                     g.validation_path = "landmark"
 
                 else:
                     # Fallback path: no landmarks — use tight bbox zone
+                    # (DISABLED: User requested to flag phone usage anywhere in the pilot's zone)
                     logger.debug(
                         "pid=%d gadget=%s conf=%.2f bbox=%s -> FALLBACK path "
                         "(landmarks=%s)",
@@ -895,9 +933,10 @@ class GadgetDetector:
                     continue
                 # Filter D — edge variance (run on original, not enhanced,
                 # to avoid artefact-induced false sharpness)
-                if not _has_phone_like_edges(original_frame, bbox):
-                    logger.debug("  -> REJECTED by edge-variance filter (Filter D)")
-                    continue
+                # (DISABLED for testing)
+                # if not _has_phone_like_edges(original_frame, bbox):
+                #     logger.debug("  -> REJECTED by edge-variance filter (Filter D)")
+                #     continue
                 gadgets.append(GadgetHit(name, conf, bbox))
 
         # Sort persons by area descending; keep at most MAX_PILOTS

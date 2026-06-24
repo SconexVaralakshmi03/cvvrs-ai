@@ -2515,15 +2515,22 @@ def _handle_job(
             send_progress(job_id, journey_id, 5, "Downloading videos")
 
             for vj in sorted(msg.videos, key=lambda v: v.sequence_no):
-                suffix   = os.path.splitext(vj.s3_key)[1] or ".mp4"
-                fd, path = tempfile.mkstemp(suffix=suffix)
-                os.close(fd)
-                download_video(vj.s3_key, path)
-                tmp_paths[vj.video_id] = path
-                log.info(
-                    "[Job %s]  Downloaded video_id=%d  seq=%d  → %s",
-                    job_id, vj.video_id, vj.sequence_no, path,
-                )
+                if os.path.isfile(vj.s3_key):
+                    tmp_paths[vj.video_id] = vj.s3_key
+                    log.info(
+                        "[Job %s]  Using local video_id=%d  seq=%d  → %s",
+                        job_id, vj.video_id, vj.sequence_no, vj.s3_key,
+                    )
+                else:
+                    suffix   = os.path.splitext(vj.s3_key)[1] or ".mp4"
+                    fd, path = tempfile.mkstemp(suffix=suffix)
+                    os.close(fd)
+                    download_video(vj.s3_key, path)
+                    tmp_paths[vj.video_id] = path
+                    log.info(
+                        "[Job %s]  Downloaded video_id=%d  seq=%d  → %s",
+                        job_id, vj.video_id, vj.sequence_no, path,
+                    )
 
             # ── Step 3: Progress after download ──────────────────────────────
             try:
@@ -2607,9 +2614,11 @@ def _handle_job(
 
 
 def _cleanup(tmp_paths: Dict[int, str]) -> None:
+    temp_dir = tempfile.gettempdir()
     for path in tmp_paths.values():
         try:
-            if os.path.isfile(path):
+            # ONLY delete the file if it is actually inside the system's temp directory!
+            if os.path.isfile(path) and path.startswith(temp_dir):
                 os.remove(path)
         except OSError as exc:
             log.warning("Could not remove temp file %s: %s", path, exc)

@@ -128,9 +128,9 @@ class SeatAbsenceDetector:
         video_time:   float,
         frame_width:  int = 848,
         frame_height: int = 480,
+        zone_manager: Optional[Any] = None,
     ) -> Tuple[List[AbsenceResult], List[Tuple[int, str]]]:
-
-        split_y = int(frame_height * GREEN_LINE_RATIO)
+        from typing import Any
 
         # Build bbox lookup by pilot_id
         bbox_by_pid: Dict[int, Optional[Tuple[int, int, int, int]]] = {
@@ -139,11 +139,24 @@ class SeatAbsenceDetector:
         for pid, bbox in pilot_boxes:
             bbox_by_pid[pid] = bbox
 
-        # Fixed yellow seat zones — upper half for P2, lower half for P1
-        seat_zones: Dict[int, Tuple[int, int, int, int]] = {
-            2: (0, 0,        frame_width, split_y),
-            1: (0, split_y,  frame_width, frame_height),
-        }
+        # If using a dynamic zone manager, suppress seat absence checks entirely
+        # until the camera layout has been successfully calibrated. This acts as
+        # a warmup phase and prevents false outliers while pilots are entering
+        # the engine or standing around before settling into their seats.
+        if zone_manager is not None and not zone_manager.is_calibrated:
+            return [], []
+
+        # Fetch dynamic seat zones from manager, fallback to hardcoded if not present
+        seat_zones: Dict[int, Tuple[int, int, int, int]] = {}
+        if zone_manager is not None and zone_manager.is_calibrated:
+            for pid in [1, 2]:
+                seat_zones[pid] = zone_manager.get_zone(pid, frame_width, frame_height)
+        else:
+            split_y = int(frame_height * GREEN_LINE_RATIO)
+            seat_zones = {
+                2: (0, 0,        frame_width, split_y),
+                1: (0, split_y,  frame_width, frame_height),
+            }
 
         results:    List[AbsenceResult]   = []
         log_events: List[Tuple[int, str]] = []
@@ -153,7 +166,7 @@ class SeatAbsenceDetector:
             seat_zone = seat_zones[pid]
             bbox      = bbox_by_pid.get(pid)
 
-            in_seat = self._pilot_in_seat(bbox, pid, split_y)
+            in_seat = self._pilot_in_seat(bbox, seat_zone)
 
             if in_seat:
                 timer.reset()
@@ -191,32 +204,21 @@ class SeatAbsenceDetector:
 
     @staticmethod
     def _pilot_in_seat(
-        bbox:    Optional[Tuple[int, int, int, int]],
-        pid:     int,
-        split_y: int,
+        bbox:      Optional[Tuple[int, int, int, int]],
+        seat_zone: Tuple[int, int, int, int],
     ) -> bool:
         """
-        Pilot 2 (upper zone):
-            IN SEAT  → box centre is ABOVE split_y
-            ABSENT   → box centre is BELOW split_y OR no detection
-
-        Pilot 1 (lower zone):
-            IN SEAT  → box CENTRE is in the lower zone (>= split_y)
-            ABSENT   → box centre is above split_y OR no detection
-
-        FIX (Bug #3): Previously Pilot 1 used `y2 >= split_y` which
-        allowed a standing pilot whose feet were still visible to be
-        counted as seated. Now uses the bbox centre, consistent with
-        the Pilot 2 logic.
+        Dynamically checks if the center of the person's bounding box
+        falls inside their dynamically calibrated Seat Zone.
+        
+        This perfectly adapts to both Side-by-Side and Top-and-Bottom
+        seating arrangements.
         """
         if bbox is None:
             return False
 
-        x1, y1, x2, y2 = bbox
-        cy = (y1 + y2) / 2  # use centre for both pilots — consistent & robust
-
-        if pid == 2:
-            return cy < split_y
-        else:
-            # FIX: was `y2 >= split_y`; now uses centre
-            return cy >= split_y
+        cx = (bbox[0] + bbox[2]) / 2.0
+        cy = (bbox[1] + bbox[3]) / 2.0
+        
+        zx1, zy1, zx2, zy2 = seat_zone
+        return (zx1 <= cx <= zx2) and (zy1 <= cy <= zy2)

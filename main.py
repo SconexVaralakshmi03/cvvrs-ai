@@ -4178,52 +4178,6 @@
 #                 if DRAW:
 #                     _draw_distraction_label(annotated, current_bbox, last_droop_severity,
 #                                             dr.timer_value*(38/25.0),
-#                                             color=(0,200,255) if last_droop_severity=="DROWSINESS" else (0,80,200))
-
-#         if DRAW:
-#             if any_gadget_distracted  and last_gadget_pilot  is not None: draw_alert_banner(annotated, last_gadget_pilot,  last_gadget_name)
-#             if any_absence_distracted and last_absent_pilot  is not None: draw_absence_banner(annotated, last_absent_pilot, last_absent_duration)
-#             if any_droop_distracted   and last_droop_pilot   is not None: draw_droop_banner(annotated,  last_droop_pilot,  last_droop_duration, severity=last_droop_severity)
-#             for dr in droop_results:
-#                 if not dr.drooping: continue
-#                 if any(ar.absent and ar.pilot_id == dr.pilot_id for ar in absence_results):
-#                     _draw_distraction_label(annotated, bbox_by_pid.get(dr.pilot_id), "SLEEPING / ABSENT", dr.timer_value, color=(0,50,200))
-#             draw_hud(annotated, global_time, global_frame, len(results))
-
-#         # ── Record violations ─────────────────────────────────────────────────
-#         # video_time      = local time within THIS file  → local_video_time param
-#         # global_time     = video_time + time_offset     → video_time param (→ "timestamp")
-#         # global_frame    = raw_frame_no + frame_offset  → frame_index param
-#         # source_filename = DB filename                  → shown in original_video_timestamp
-
-#         if log_events:
-#             r_ref        = next((r for r in results if r.distracted), None)
-#             conf         = r_ref.gadgets[0].confidence if (r_ref and r_ref.gadgets) else 0.9
-#             dur          = r_ref.timer_value if r_ref else 0.0
-#             event_global = max(0.0, global_time - GADGET_ALLOWED_DURATION)
-#             event_local  = max(0.0, video_time  - GADGET_ALLOWED_DURATION)
-#             self.vstore.record_violation(
-#                 annotated_frame=annotated, original_frame=frame,
-#                 video_time=event_global, frame_index=global_frame,
-#                 event_type="phone_use", severity="CRITICAL",
-#                 confidence=conf, risk_score=80, risk_level="CRITICAL",
-#                 factors=["phone_use", "distraction"], duration=dur,
-#                 source_filename=self.source_filename, local_video_time=event_local,
-#             )
-#             log_distraction(self.logger, event_global, event="One of the pilots is using a mobile phone", severity="CRITICAL", frame=annotated)
-
-#         if absence_log_events:
-#             ar_ref       = next((ar for ar in absence_results if ar.absent), None)
-#             dur_abs      = ar_ref.timer_value if ar_ref else 0.0
-#             event_global = max(0.0, global_time - ABSENCE_ALLOWED_DURATION)
-#             event_local  = max(0.0, video_time  - ABSENCE_ALLOWED_DURATION)
-#             self.vstore.record_violation(
-#                 annotated_frame=annotated, original_frame=frame,
-#                 video_time=event_global, frame_index=global_frame,
-#                 event_type="seat_absence", severity="CRITICAL",
-#                 confidence=1.0, risk_score=70, risk_level="CRITICAL",
-#                 factors=["seat_absence"], duration=dur_abs,
-#                 source_filename=self.source_filename, local_video_time=event_local,
 #             )
 #             log_distraction(self.logger, event_global, event="One of the pilots is away from the seat", severity="CRITICAL", frame=annotated)
 
@@ -4385,7 +4339,7 @@ import warnings
 import cv2
 import numpy as np
 
-print("[main] ✅ NEW main.py loaded — v6 (merged: mediapipe ear-check, mouth-exclusion, "
+print("[main] NEW main.py loaded — v6 (merged: mediapipe ear-check, mouth-exclusion, "
       "wrist-confirm, self-calibrating drowsiness, phone-exclusion + droop_type + "
       "absence-overlap messaging)")
 
@@ -4393,7 +4347,7 @@ DRAW           = False
 RAW_FRAME_SKIP = 3
 GADGET_EVERY   = 6
 ABSENCE_EVERY  = 4
-DROOP_EVERY    = 15
+DROOP_EVERY    = 3
 
 # ── MediaPipe pose (optional — graceful degradation if not installed) ─────────
 try:
@@ -4417,6 +4371,7 @@ from utils.draw import (
 from detector.gadget_detector import GadgetDetector
 from detector.seat_absence_detector import SeatAbsenceDetector
 from detector.head_drop_detector import HeadDroopDetector
+from detector.zone_manager import DynamicZoneManager
 
 _STOP = object()
 READ_QUEUE_MAXSIZE  = 8
@@ -4472,7 +4427,9 @@ class GadgetDetectionPipeline:
         self.shared_vstore   = shared_vstore
         self.time_offset     = time_offset
         self.frame_offset    = frame_offset
-        self.source_filename = source_filename
+        self.source_filename = source_filename or (
+            os.path.basename(source) if isinstance(source, str) else "webcam"
+        )
 
         if analysis_id:
             self.analysis_id = analysis_id
@@ -4483,6 +4440,7 @@ class GadgetDetectionPipeline:
             self.analysis_id = uuid.uuid4().hex[:8]
 
         self.logger           = setup_logger()
+        self.zone_manager     = DynamicZoneManager(calibration_frames=60, stability_threshold_px=30.0)
         self.detector         = GadgetDetector()
         self.absence_detector = SeatAbsenceDetector()
         self.droop_detector   = HeadDroopDetector()
@@ -4509,6 +4467,11 @@ class GadgetDetectionPipeline:
         self._processed_frame_no    = 0
         self._absence_pilot_boxes: list = []
         self._yolo_empty_run_count: int = 0
+
+        # RAW absence tracking — bypasses gadget detector's bbox cache
+        # so that when a pilot physically leaves, their slot goes to None
+        self._raw_absence_boxes: list = []          # [(pid, bbox)] from zone_manager directly
+        self._raw_absence_miss_count: int = 0       # consecutive YOLO frames with <2 pilots
 
         self._read_queue:  queue.Queue = queue.Queue(maxsize=READ_QUEUE_MAXSIZE)
         self._write_queue: queue.Queue = queue.Queue(maxsize=WRITE_QUEUE_MAXSIZE)
@@ -4691,28 +4654,20 @@ class GadgetDetectionPipeline:
         # ── Build per-pilot MediaPipe landmarks for gadget detector ───────────
         pose_landmarks_by_pilot = self._get_pose_landmarks(frame) if run_gadget else None
 
-        future_gadget  = self.executor.submit(self.detector.process, frame, round(global_time, 3), pose_landmarks_by_pilot) if run_gadget  else None
-        future_absence = self.executor.submit(self.absence_detector.process, self._absence_pilot_boxes, global_time, frame.shape[1], frame.shape[0]) if run_absence else None
-        future_droop   = self.executor.submit(self.droop_detector.process, frame, global_time, prev_frame_detection) if run_droop else None
-
-        results,         log_events         = [], []
-        absence_results, absence_log_events = [], []
-        droop_results,   droop_log_events   = [], []
-
-        try:
-            if future_gadget  is not None: results,         log_events         = future_gadget.result()
-        except Exception as exc:
-            self.logger.error(f"Gadget error frame {global_frame}: {exc}", exc_info=True)
-        try:
-            if future_absence is not None: absence_results, absence_log_events = future_absence.result()
-        except Exception as exc:
-            self.logger.error(f"Absence error frame {global_frame}: {exc}", exc_info=True)
-        try:
-            if future_droop   is not None: droop_results,   droop_log_events   = future_droop.result()
-        except Exception as exc:
-            self.logger.error(f"Droop error frame {global_frame}: {exc}", exc_info=True)
-
+        # ── Run gadget detector FIRST (synchronously) so we can extract raw
+        #    person boxes from its YOLO pass for absence detection. ─────────────
+        results:    List = []
+        log_events: List = []
         if run_gadget:
+            try:
+                results, log_events = self.detector.process(
+                    frame, round(global_time, 3), pose_landmarks_by_pilot, self.zone_manager
+                )
+            except Exception as exc:
+                self.logger.error(f"Gadget error frame {global_frame}: {exc}", exc_info=True)
+
+            # Extract RAW person boxes from the gadget detector's YOLO results.
+            # These are the UNCACHED current-frame detections.
             new_boxes = [(r.pilot_id, r.bbox) for r in results]
             self._prev_pilot_boxes      = new_boxes
             self._prev_frame_detections = self.detector.last_frame_detections
@@ -4723,6 +4678,35 @@ class GadgetDetectionPipeline:
                 self._yolo_empty_run_count += 1
                 if self._yolo_empty_run_count >= 3:
                     self._absence_pilot_boxes = []
+
+            # Build RAW absence boxes from zone_manager using the YOLO person
+            # boxes that the gadget detector just produced — NOT the gadget
+            # detector's cached/enriched results. This ensures that when a
+            # pilot physically leaves, their slot is correctly None.
+            if self.zone_manager.is_calibrated and self.detector.last_frame_detections is not None:
+                raw_person_boxes = [b for b, _ in self.detector.last_frame_detections.person_boxes]
+                raw_assigned = self.zone_manager.assign_pilots(raw_person_boxes)
+                raw_boxes_for_absence = []
+                for pid in [1, 2]:
+                    pbox = raw_assigned.get(pid)
+                    raw_boxes_for_absence.append((pid, pbox))  # pbox is None if pilot missing
+                self._raw_absence_boxes = raw_boxes_for_absence
+
+        # ── Now run absence and droop detectors (can be parallel) ──────────────
+        future_absence = self.executor.submit(self.absence_detector.process, self._raw_absence_boxes, global_time, frame.shape[1], frame.shape[0], self.zone_manager) if run_absence else None
+        future_droop   = self.executor.submit(self.droop_detector.process, frame, global_time, self._prev_frame_detections) if run_droop else None
+
+        absence_results, absence_log_events = [], []
+        droop_results,   droop_log_events   = [], []
+
+        try:
+            if future_absence is not None: absence_results, absence_log_events = future_absence.result()
+        except Exception as exc:
+            self.logger.error(f"Absence error frame {global_frame}: {exc}", exc_info=True)
+        try:
+            if future_droop   is not None: droop_results,   droop_log_events   = future_droop.result()
+        except Exception as exc:
+            self.logger.error(f"Droop error frame {global_frame}: {exc}", exc_info=True)
 
         # ── Draw (only when DRAW=True) ────────────────────────────────────────
         if DRAW:
@@ -4871,11 +4855,11 @@ class GadgetDetectionPipeline:
                 also_absent = bool(droop_pids & absent_pids)
 
                 if also_absent:
-                    etype     = "sleeping_absent"
-                    event_msg = "One of the pilots is sleeping / slumped in seat"
+                    etype     = "drowsy"
+                    event_msg = "One of the pilots is drowsy / slumped in seat"
                 elif is_sleeping:
-                    etype     = "sleeping"
-                    event_msg = "One of the pilots is sleeping"
+                    etype     = "drowsy"
+                    event_msg = "One of the pilots is drowsy (EYES)"
                 else:
                     etype     = "drowsy"
                     event_msg = f"One of the pilots is drowsy ({dtype})"
@@ -4905,9 +4889,8 @@ class GadgetDetectionPipeline:
         Run MediaPipe Pose on the full frame and return a dict:
             { pilot_id: [landmark_0, ..., landmark_32] }
 
-        The frame is split at split_y (57 % of height) to assign each
-        detected person's landmarks to Pilot 1 or Pilot 2 independently,
-        using the same zone logic as the YOLO pilot assignment.
+        The frame is split dynamically using zone_manager to assign each
+        detected person's landmarks to Pilot 1 or Pilot 2 independently.
 
         MediaPipe processes the full frame in one call (it detects up to 1
         person by default). For a two-person frame we crop each pilot's half
@@ -4921,19 +4904,21 @@ class GadgetDetectionPipeline:
         try:
             h = self._frame_height
             w = self._frame_width
-            split_y = int(h * 0.57)
-
-            # Crop each pilot zone and run MediaPipe independently.
-            # Pilot 2 = top half (y: 0 → split_y)
-            # Pilot 1 = bottom half (y: split_y → h)
-            zones = {
-                2: frame[0:split_y, 0:w],
-                1: frame[split_y:h,  0:w],
-            }
+            
+            zones = {}
+            if self.zone_manager.is_calibrated:
+                for pid in [1, 2]:
+                    x1, y1, x2, y2 = self.zone_manager.get_zone(pid, w, h)
+                    zones[pid] = (frame[y1:y2, x1:x2], x1, y1)
+            else:
+                # Fallback to old behavior if not yet calibrated
+                split_y = int(h * 0.57)
+                zones[2] = (frame[0:split_y, 0:w], 0, 0)
+                zones[1] = (frame[split_y:h, 0:w], 0, split_y)
 
             result: dict = {}
-            for pid, crop in zones.items():
-                if crop.size == 0:
+            for pid, (crop, x_offset, y_offset) in zones.items():
+                if crop.size == 0 or crop.shape[0] == 0 or crop.shape[1] == 0:
                     continue
                 rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
                 mp_result = self._pose.process(rgb)
@@ -4941,23 +4926,13 @@ class GadgetDetectionPipeline:
                     continue
 
                 lms = mp_result.pose_landmarks.landmark
-
-                # Adjust Y coordinates back to full-frame pixel space.
-                # Pilot 1 crop starts at split_y in the full frame.
-                y_offset = split_y if pid == 1 else 0
-
-                # We store the raw landmark objects but patch their .y so
-                # that downstream code using lm.y * frame_h gives the
-                # correct FULL-FRAME pixel coordinate.
                 patched = []
                 for lm in lms:
-                    crop_h = crop.shape[0]
-                    # lm.y is normalised to the crop height; convert to
-                    # normalised full-frame Y.
+                    crop_h, crop_w = crop.shape[:2]
+                    full_x = (lm.x * crop_w + x_offset) / w
                     full_y = (lm.y * crop_h + y_offset) / h
-                    # Build a simple namespace so downstream can use lm.x / lm.y
                     patched.append(_PatchedLandmark(
-                        x          = lm.x,          # X is same (full width used)
+                        x          = full_x,
                         y          = full_y,
                         visibility = getattr(lm, "visibility", 1.0),
                     ))
@@ -4965,7 +4940,8 @@ class GadgetDetectionPipeline:
 
             return result if result else None
 
-        except Exception:
+        except Exception as e:
+            self.logger.error(f"Pose processing error: {e}", exc_info=True)
             return None
 
     def _print_banner(self, fps, w, h, total):

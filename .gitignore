@@ -1,5 +1,6 @@
 # 🔹 Virtual environments (VERY IMPORTANT)
 venv/
+.venv/
 railways/
 
 # 🔹 Python cache
@@ -31,3 +32,7 @@ data/
 # 🔹 OS
 .DS_Store
 Thumbs.db
+
+# local test-videos folder
+test-videos/
+claude-ollama.ps1
