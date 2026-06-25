@@ -4661,7 +4661,7 @@ class GadgetDetectionPipeline:
         if run_gadget:
             try:
                 results, log_events = self.detector.process(
-                    frame, round(global_time, 3), pose_landmarks_by_pilot, self.zone_manager
+                    frame, round(global_time, 3), pose_landmarks_by_pilot
                 )
             except Exception as exc:
                 self.logger.error(f"Gadget error frame {global_frame}: {exc}", exc_info=True)
@@ -4683,6 +4683,10 @@ class GadgetDetectionPipeline:
             # boxes that the gadget detector just produced — NOT the gadget
             # detector's cached/enriched results. This ensures that when a
             # pilot physically leaves, their slot is correctly None.
+            if self.detector.last_frame_detections is not None:
+                raw_person_boxes = [b for b, _ in self.detector.last_frame_detections.person_boxes]
+                self.zone_manager.update(raw_person_boxes)
+                
             if self.zone_manager.is_calibrated and self.detector.last_frame_detections is not None:
                 raw_person_boxes = [b for b, _ in self.detector.last_frame_detections.person_boxes]
                 raw_assigned = self.zone_manager.assign_pilots(raw_person_boxes)
