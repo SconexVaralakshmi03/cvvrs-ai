@@ -36,3 +36,5 @@ Thumbs.db
 # local test-videos folder
 test-videos/
 claude-ollama.ps1
+side_camera_test_videos/
+top_camera_test_videos/

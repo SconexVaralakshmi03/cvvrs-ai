@@ -37,7 +37,10 @@ from config.settings import (
     GADGET_MIN_WIDTH_PX,
     GADGET_MIN_HEIGHT_PX,
     GADGET_MIN_EDGE_VARIANCE,
+    FRONT_VIEW_TORSO_ZONE_FRACTION,
+    GADGET_CONFIDENCE_BACK_VIEW,
 )
+from detector.enums import CameraView
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MODULE-LEVEL CONSTANTS
@@ -139,7 +142,8 @@ class FrameDetections:
     person_boxes: List[Tuple[Tuple[int, int, int, int], float]]
     gadgets:      List[GadgetHit]
     pilot_crops:  Dict[int, Tuple[np.ndarray, int, int, int, int]]
-    split_y:      int
+    layout_type:  str  # 'SIDE_BY_SIDE' or 'TOP_BOTTOM'
+    split_val:    float
     frame_shape:  Tuple[int, int, int]
 
 
@@ -631,6 +635,8 @@ class GadgetDetector:
         self,
         frame:          np.ndarray,
         video_time:     float,
+        zone_manager:   'DynamicZoneManager',
+        current_view:   CameraView,
         pose_landmarks: Optional[Dict[int, list]] = None,
     ) -> Tuple[List[PilotResult], List[Tuple[int, str]]]:
         """
@@ -652,13 +658,22 @@ class GadgetDetector:
         log_events : List[(pilot_id, event_str)] — violations ready to log.
         """
         enhanced = _smart_enhance(frame)
-        raw_boxes, raw_gadgets = self._run_yolo(enhanced, frame)
+        raw_boxes, raw_gadgets = self._run_yolo(enhanced, frame, current_view)
 
         frame_h, frame_w = frame.shape[:2]
-        split_y = int(frame_h * GREEN_LINE_RATIO)
 
         # ── Assign persons to pilot zones ─────────────────────────────────────
-        pilot_boxes = _assign_pilots_by_zone(raw_boxes, split_y)
+        if zone_manager.is_calibrated and current_view != CameraView.UNKNOWN:
+            bbox_by_pid_raw = zone_manager.assign_pilots(raw_boxes)
+            pilot_boxes = [(pid, box) for pid, box in bbox_by_pid_raw.items()]
+            layout_type = zone_manager.layout_type
+            split_val = zone_manager.split_val
+        else:
+            split_y = int(frame_h * 0.57) # Fallback GREEN_LINE_RATIO
+            pilot_boxes = _assign_pilots_by_zone(raw_boxes, split_y)
+            layout_type = 'TOP_BOTTOM'
+            split_val = float(split_y)
+
         bbox_by_pid: Dict[int, Optional[Tuple[int, int, int, int]]] = {1: None, 2: None}
         for pid, pbox in pilot_boxes:
             bbox_by_pid[pid] = pbox
@@ -679,6 +694,7 @@ class GadgetDetector:
             frame          = frame,
             frame_w        = frame_w,
             frame_h        = frame_h,
+            current_view   = current_view,
         )
 
         # ── Per-pilot timer logic ─────────────────────────────────────────────
@@ -721,11 +737,12 @@ class GadgetDetector:
             if pbox is not None or matched:
                 if pbox is None:
                     # Placeholder bbox when person is temporarily missed
-                    pbox = (
-                        (frame_w // 4, 0,       3 * frame_w // 4, split_y)
-                        if pid == 2
-                        else (frame_w // 4, split_y, 3 * frame_w // 4, frame_h)
-                    )
+                    if layout_type == 'SIDE_BY_SIDE':
+                        sv = int(split_val)
+                        pbox = (0, frame_h//4, sv, 3*frame_h//4) if pid == 1 else (sv, frame_h//4, frame_w, 3*frame_h//4)
+                    else:
+                        sv = int(split_val)
+                        pbox = (frame_w//4, 0, 3*frame_w//4, sv) if pid == 2 else (frame_w//4, sv, 3*frame_w//4, frame_h)
                 results.append(PilotResult(
                     pilot_id    = pid,
                     bbox        = pbox,
@@ -749,7 +766,8 @@ class GadgetDetector:
             person_boxes = [(b, 1.0) for b in raw_boxes],
             gadgets      = raw_gadgets,
             pilot_crops  = pilot_crops,
-            split_y      = split_y,
+            layout_type  = layout_type,
+            split_val    = split_val,
             frame_shape  = frame.shape,
         )
 
@@ -768,6 +786,7 @@ class GadgetDetector:
         frame:          np.ndarray,
         frame_w:        int,
         frame_h:        int,
+        current_view:   CameraView,
     ) -> Dict[int, List[GadgetHit]]:
         """
         For each YOLO gadget hit, determine which pilot (if any) it belongs to
@@ -833,6 +852,27 @@ class GadgetDetector:
                     )
                     continue
 
+                if current_view == CameraView.BACK:
+                    # BACK view: YOLO confidence (already checked) is sufficient. Bypass C and W.
+                    logger.debug(
+                        "pid=%d gadget=%s conf=%.2f -> BACK_VIEW path (bypass C/W)",
+                        pid, g.class_name, g.confidence
+                    )
+                    g.validation_path = "back_view_bypass"
+                    g.near_ear = True
+                    by_pilot[pid].append(g)
+                    continue
+
+                if current_view == CameraView.FRONT:
+                    # FRONT view: Phone must be in the lower portion of the torso.
+                    torso_y_threshold = py1 + p_h * FRONT_VIEW_TORSO_ZONE_FRACTION
+                    if gcy < torso_y_threshold:
+                        logger.debug(
+                            "pid=%d gadget=%s REJECTED: above FRONT view torso threshold",
+                            pid, g.class_name
+                        )
+                        continue
+
                 # ── Filter C + W: landmark-based checks ───────────────────────
                 lms = (pose_landmarks or {}).get(pid)
 
@@ -885,6 +925,7 @@ class GadgetDetector:
         self,
         enhanced_frame: np.ndarray,
         original_frame: np.ndarray,
+        current_view:   CameraView,
     ) -> Tuple[List[Tuple[int, int, int, int]], List[GadgetHit]]:
         """
         Run YOLOv8 on the (possibly enhanced) frame.
@@ -913,7 +954,11 @@ class GadgetDetector:
             if name == "person" and conf > PILOT_CONFIDENCE_THRESHOLD:
                 persons.append((bbox, conf))
 
-            elif name in GADGET_CLASSES and conf > GADGET_CONFIDENCE_THRESHOLD:
+            elif name in GADGET_CLASSES:
+                req_conf = GADGET_CONFIDENCE_BACK_VIEW if current_view == CameraView.BACK else GADGET_CONFIDENCE_THRESHOLD
+                if conf <= req_conf:
+                    continue
+                
                 logger.debug(
                     "YOLO raw candidate: class=%s conf=%.2f bbox=%s",
                     name, conf, bbox,
