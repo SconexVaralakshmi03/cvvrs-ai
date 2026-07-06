@@ -1,1301 +1,4 @@
-# # # # # # # """
-# # # # # # # consumer.py
-# # # # # # # ───────────
-# # # # # # # RabbitMQ consumer for the Journey-based analysis workflow.
-
-# # # # # # # Processing flow (Step numbers match the spec)
-# # # # # # # ─────────────────────────────────────────────
-# # # # # # #  1. Consume message from 'analysis.jobs'.
-# # # # # # #  2. Download all videos from S3.
-# # # # # # #  3. Send PROCESSING progress (10 %).
-# # # # # # #  4. Analyze videos via the existing AI pipeline (analyzer.py).
-# # # # # # #  5. Violation frames are uploaded inside analyzer.py (S3 keys returned).
-# # # # # # #  6-7. VideoResult / ViolationResult objects built inside analyzer.py.
-# # # # # # #  8. Calculate overall processing time (wall-clock ms).
-# # # # # # #  9. Send completion callback.
-# # # # # # # 10. Acknowledge RabbitMQ message ONLY after successful completion callback.
-
-# # # # # # # On any unhandled exception:
-# # # # # # #     • Log the full traceback.
-# # # # # # #     • Send a failure callback to Spring Boot.
-# # # # # # #     • Nack the message (do not requeue — leave it for the dead-letter exchange).
-# # # # # # # """
-
-# # # # # # # from __future__ import annotations
-
-# # # # # # # import json
-# # # # # # # import logging
-# # # # # # # import os
-# # # # # # # import tempfile
-# # # # # # # import traceback
-# # # # # # # import time
-# # # # # # # from typing import Dict, List
-
-# # # # # # # import pika
-# # # # # # # from dotenv import load_dotenv
-
-# # # # # # # from analyzer import analyze_journey
-# # # # # # # from callback_client import send_completed, send_failed, send_progress
-# # # # # # # from models import AnalysisJobMessage, CompletionPayload, VideoJob
-# # # # # # # from s3_service import download_video
-
-# # # # # # # # ── Config / credentials ─────────────────────────────────────────────────────
-# # # # # # # _ENV_PATH = os.path.join(
-# # # # # # #     os.path.dirname(os.path.abspath(__file__)),
-# # # # # # #     "config", "credentials.env",
-# # # # # # # )
-# # # # # # # load_dotenv(_ENV_PATH)
-
-# # # # # # # RABBITMQ_URL   = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
-# # # # # # # QUEUE_NAME     = os.environ.get("ANALYSIS_QUEUE", "analysis.jobs")
-# # # # # # # PREFETCH_COUNT = int(os.environ.get("RABBITMQ_PREFETCH", "1"))
-
-# # # # # # # logging.basicConfig(
-# # # # # # #     level   = logging.INFO,
-# # # # # # #     format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-# # # # # # # )
-# # # # # # # log = logging.getLogger("consumer")
-
-
-# # # # # # # # ── Job handler ───────────────────────────────────────────────────────────────
-
-# # # # # # # def _handle_job(msg: AnalysisJobMessage, channel, method) -> None:
-# # # # # # #     """
-# # # # # # #     Full processing flow for one AnalysisJobMessage.
-# # # # # # #     Acks on success, nacks (no requeue) on failure.
-# # # # # # #     """
-# # # # # # #     job_id     = msg.job_id
-# # # # # # #     journey_id = msg.journey_id
-# # # # # # #     tmp_paths: Dict[int, str] = {}
-
-# # # # # # #     log.info("[Job %s]  journey=%d  videos=%d", job_id, journey_id, len(msg.videos))
-
-# # # # # # #     try:
-# # # # # # #         # ── Step 2: Download all videos from S3 ──────────────────────────────
-# # # # # # #         log.info("[Job %s]  Downloading %d video(s)…", job_id, len(msg.videos))
-# # # # # # #         send_progress(job_id, journey_id, 5, "Downloading videos")
-
-# # # # # # #         for vj in sorted(msg.videos, key=lambda v: v.sequence_no):
-# # # # # # #             suffix   = os.path.splitext(vj.s3_key)[1] or ".mp4"
-# # # # # # #             fd, path = tempfile.mkstemp(suffix=suffix)
-# # # # # # #             os.close(fd)
-# # # # # # #             download_video(vj.s3_key, path)
-# # # # # # #             tmp_paths[vj.video_id] = path
-# # # # # # #             log.info("[Job %s]  Downloaded video_id=%d  seq=%d  → %s",
-# # # # # # #                      job_id, vj.video_id, vj.sequence_no, path)
-
-# # # # # # #         # ── Step 3: Progress callback after download ──────────────────────────
-# # # # # # #         send_progress(job_id, journey_id, 10, "Downloading videos complete — starting analysis")
-
-# # # # # # #         # ── Steps 4-7: Analyze + upload frames + build results ────────────────
-# # # # # # #         def _progress(pct: int, message: str) -> None:
-# # # # # # #             try:
-# # # # # # #                 send_progress(job_id, journey_id, pct, message)
-# # # # # # #             except Exception as exc:
-# # # # # # #                 log.warning("[Job %s]  progress callback failed (non-fatal): %s", job_id, exc)
-
-# # # # # # #         video_results, wall_seconds = analyze_journey(
-# # # # # # #             job_id     = job_id,
-# # # # # # #             journey_id = journey_id,
-# # # # # # #             video_jobs = msg.videos,
-# # # # # # #             tmp_paths  = tmp_paths,
-# # # # # # #             progress_cb = _progress,
-# # # # # # #         )
-
-# # # # # # #         # ── Step 8: Calculate processing time (ms) ────────────────────────────
-# # # # # # #         processing_time_ms = int(wall_seconds * 1000)
-# # # # # # #         log.info("[Job %s]  Analysis complete.  videos=%d  violations=%d  time=%dms",
-# # # # # # #                  job_id,
-# # # # # # #                  len(video_results),
-# # # # # # #                  sum(len(vr.violations) for vr in video_results),
-# # # # # # #                  processing_time_ms)
-
-# # # # # # #         # ── Step 9: Send completion callback ─────────────────────────────────
-# # # # # # #         send_progress(job_id, journey_id, 95, "Sending results to backend")
-
-# # # # # # #         completion = CompletionPayload(
-# # # # # # #             job_id          = job_id,
-# # # # # # #             journey_id      = journey_id,
-# # # # # # #             processing_time = processing_time_ms,
-# # # # # # #             video_results   = video_results,
-# # # # # # #         )
-# # # # # # #         send_completed(completion.to_dict())
-# # # # # # #         log.info("[Job %s]  Completion callback sent.", job_id)
-
-# # # # # # #         # ── Step 10: Acknowledge RabbitMQ message ─────────────────────────────
-# # # # # # #         channel.basic_ack(delivery_tag=method.delivery_tag)
-# # # # # # #         log.info("[Job %s]  Message acknowledged.", job_id)
-
-# # # # # # #     except Exception as exc:
-# # # # # # #         # ── Error handling ────────────────────────────────────────────────────
-# # # # # # #         err_detail = traceback.format_exc()
-# # # # # # #         log.error("[Job %s]  FAILED:\n%s", job_id, err_detail)
-
-# # # # # # #         send_failed(job_id, journey_id, f"{exc}\n\n{err_detail}")
-
-# # # # # # #         # Nack without requeue — failed jobs go to the dead-letter exchange.
-# # # # # # #         # Change requeue=True if you want automatic retry.
-# # # # # # #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-# # # # # # #         log.warning("[Job %s]  Message nacked (no requeue).", job_id)
-
-# # # # # # #     finally:
-# # # # # # #         # Always clean up temp files
-# # # # # # #         _cleanup(tmp_paths)
-
-
-# # # # # # # def _cleanup(tmp_paths: Dict[int, str]) -> None:
-# # # # # # #     for path in tmp_paths.values():
-# # # # # # #         try:
-# # # # # # #             if os.path.isfile(path):
-# # # # # # #                 os.remove(path)
-# # # # # # #         except OSError as exc:
-# # # # # # #             log.warning("Could not remove temp file %s: %s", path, exc)
-
-
-# # # # # # # # ── RabbitMQ callback ─────────────────────────────────────────────────────────
-
-# # # # # # # def _on_message(channel, method, properties, body):
-# # # # # # #     try:
-# # # # # # #         data = json.loads(body)
-# # # # # # #         msg  = AnalysisJobMessage.from_dict(data)
-# # # # # # #     except Exception as exc:
-# # # # # # #         log.error("Failed to parse RabbitMQ message: %s\nBody: %s", exc, body[:500])
-# # # # # # #         # Malformed messages are nacked without requeue
-# # # # # # #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-# # # # # # #         return
-
-# # # # # # #     _handle_job(msg, channel, method)
-
-
-# # # # # # # # ── Consumer startup ──────────────────────────────────────────────────────────
-
-# # # # # # # def start() -> None:
-# # # # # # #     """
-# # # # # # #     Connect to RabbitMQ and start consuming from the analysis.jobs queue.
-# # # # # # #     Blocks forever (until interrupted).
-# # # # # # #     """
-# # # # # # #     log.info("[Consumer]  Connecting to RabbitMQ:  %s", RABBITMQ_URL)
-# # # # # # #     params     = pika.URLParameters(RABBITMQ_URL)
-# # # # # # #     connection = pika.BlockingConnection(params)
-# # # # # # #     channel    = connection.channel()
-
-# # # # # # #     channel.queue_declare(queue=QUEUE_NAME, durable=True)
-# # # # # # #     channel.basic_qos(prefetch_count=PREFETCH_COUNT)
-# # # # # # #     channel.basic_consume(queue=QUEUE_NAME, on_message_callback=_on_message)
-
-# # # # # # #     log.info("[Consumer]  Waiting for messages on queue '%s'…", QUEUE_NAME)
-# # # # # # #     try:
-# # # # # # #         channel.start_consuming()
-# # # # # # #     except KeyboardInterrupt:
-# # # # # # #         log.info("[Consumer]  Interrupted — shutting down.")
-# # # # # # #         channel.stop_consuming()
-# # # # # # #     finally:
-# # # # # # #         connection.close()
-
-
-# # # # # # # if __name__ == "__main__":
-# # # # # # #     start()
-# # # # # # """
-# # # # # # consumer.py
-# # # # # # ───────────
-# # # # # # RabbitMQ consumer for the Journey-based analysis workflow.
-
-# # # # # # Processing flow (Step numbers match the spec)
-# # # # # # ─────────────────────────────────────────────
-# # # # # #  1. Consume message from 'analysis.jobs'.
-# # # # # #  2. Download all videos from S3.
-# # # # # #  3. Send PROCESSING progress (10 %).
-# # # # # #  4. Analyze videos via the existing AI pipeline (analyzer.py).
-# # # # # #  5. Violation frames are uploaded inside analyzer.py (S3 keys returned).
-# # # # # #  6-7. VideoResult / ViolationResult objects built inside analyzer.py.
-# # # # # #  8. Calculate overall processing time (wall-clock ms).
-# # # # # #  9. Send completion callback.
-# # # # # # 10. Acknowledge RabbitMQ message ONLY after successful completion callback.
-
-# # # # # # On any unhandled exception:
-# # # # # #     • Log the full traceback.
-# # # # # #     • Send a failure callback to Spring Boot.
-# # # # # #     • Nack the message (do not requeue — leave it for the dead-letter exchange).
-# # # # # # """
-
-# # # # # # from __future__ import annotations
-
-# # # # # # import json
-# # # # # # import logging
-# # # # # # import os
-# # # # # # import tempfile
-# # # # # # import traceback
-# # # # # # import time
-# # # # # # from typing import Dict, List
-
-# # # # # # import pika
-# # # # # # from dotenv import load_dotenv
-
-# # # # # # from analyzer import analyze_journey
-# # # # # # from callback_client import send_completed, send_failed, send_progress
-# # # # # # from models import AnalysisJobMessage, CompletionPayload, VideoJob
-# # # # # # from s3_service import download_video
-
-# # # # # # # ── Config / credentials ─────────────────────────────────────────────────────
-# # # # # # _ENV_PATH = os.path.join(
-# # # # # #     os.path.dirname(os.path.abspath(__file__)),
-# # # # # #     "config", "credentials.env",
-# # # # # # )
-# # # # # # load_dotenv(_ENV_PATH)
-
-# # # # # # RABBITMQ_URL   = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
-# # # # # # QUEUE_NAME     = os.environ.get("ANALYSIS_QUEUE", "analysis.jobs")
-# # # # # # PREFETCH_COUNT = int(os.environ.get("RABBITMQ_PREFETCH", "1"))
-
-# # # # # # logging.basicConfig(
-# # # # # #     level   = logging.INFO,
-# # # # # #     format  = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-# # # # # # )
-# # # # # # log = logging.getLogger("consumer")
-
-
-# # # # # # # ── Job handler ───────────────────────────────────────────────────────────────
-
-# # # # # # def _handle_job(msg: AnalysisJobMessage, channel, method) -> None:
-# # # # # #     """
-# # # # # #     Full processing flow for one AnalysisJobMessage.
-# # # # # #     Acks on success, nacks (no requeue) on failure.
-# # # # # #     """
-# # # # # #     job_id     = msg.job_id
-# # # # # #     journey_id = msg.journey_id
-# # # # # #     tmp_paths: Dict[int, str] = {}
-
-# # # # # #     log.info("[Job %s]  journey=%d  videos=%d", job_id, journey_id, len(msg.videos))
-
-# # # # # #     try:
-# # # # # #         # ── Step 2: Download all videos from S3 ──────────────────────────────
-# # # # # #         log.info("[Job %s]  Downloading %d video(s)…", job_id, len(msg.videos))
-# # # # # #         send_progress(job_id, journey_id, 5, "Downloading videos")
-
-# # # # # #         for vj in sorted(msg.videos, key=lambda v: v.sequence_no):
-# # # # # #             suffix   = os.path.splitext(vj.s3_key)[1] or ".mp4"
-# # # # # #             fd, path = tempfile.mkstemp(suffix=suffix)
-# # # # # #             os.close(fd)
-# # # # # #             download_video(vj.s3_key, path)
-# # # # # #             tmp_paths[vj.video_id] = path
-# # # # # #             log.info("[Job %s]  Downloaded video_id=%d  seq=%d  → %s",
-# # # # # #                      job_id, vj.video_id, vj.sequence_no, path)
-
-# # # # # #         # ── Step 3: Progress callback after download ──────────────────────────
-# # # # # #         send_progress(job_id, journey_id, 10, "Downloading videos complete — starting analysis")
-
-# # # # # #         # ── Steps 4-7: Analyze + upload frames + build results ────────────────
-# # # # # #         def _progress(pct: int, message: str) -> None:
-# # # # # #             try:
-# # # # # #                 send_progress(job_id, journey_id, pct, message)
-# # # # # #             except Exception as exc:
-# # # # # #                 log.warning("[Job %s]  progress callback failed (non-fatal): %s", job_id, exc)
-
-# # # # # #         video_results, wall_seconds = analyze_journey(
-# # # # # #             job_id     = job_id,
-# # # # # #             journey_id = journey_id,
-# # # # # #             video_jobs = msg.videos,
-# # # # # #             tmp_paths  = tmp_paths,
-# # # # # #             progress_cb = _progress,
-# # # # # #         )
-
-# # # # # #         # ── Step 8: Calculate processing time (ms) ────────────────────────────
-# # # # # #         processing_time_ms = int(wall_seconds * 1000)
-# # # # # #         log.info("[Job %s]  Analysis complete.  videos=%d  violations=%d  time=%dms",
-# # # # # #                  job_id,
-# # # # # #                  len(video_results),
-# # # # # #                  sum(len(vr.violations) for vr in video_results),
-# # # # # #                  processing_time_ms)
-
-# # # # # #         # ── Step 9: Send completion callback ─────────────────────────────────
-# # # # # #         send_progress(job_id, journey_id, 95, "Sending results to backend")
-
-# # # # # #         completion = CompletionPayload(
-# # # # # #             job_id          = job_id,
-# # # # # #             journey_id      = journey_id,
-# # # # # #             processing_time = processing_time_ms,
-# # # # # #             video_results   = video_results,
-# # # # # #         )
-# # # # # #         send_completed(completion.to_dict())
-# # # # # #         log.info("[Job %s]  Completion callback sent.", job_id)
-
-# # # # # #         # ── Step 10: Acknowledge RabbitMQ message ─────────────────────────────
-# # # # # #         channel.basic_ack(delivery_tag=method.delivery_tag)
-# # # # # #         log.info("[Job %s]  Message acknowledged.", job_id)
-
-# # # # # #     except Exception as exc:
-# # # # # #         # ── Error handling ────────────────────────────────────────────────────
-# # # # # #         err_detail = traceback.format_exc()
-# # # # # #         log.error("[Job %s]  FAILED:\n%s", job_id, err_detail)
-
-# # # # # #         send_failed(job_id, journey_id, f"{exc}\n\n{err_detail}")
-
-# # # # # #         # Nack without requeue — failed jobs go to the dead-letter exchange.
-# # # # # #         # Change requeue=True if you want automatic retry.
-# # # # # #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-# # # # # #         log.warning("[Job %s]  Message nacked (no requeue).", job_id)
-
-# # # # # #     finally:
-# # # # # #         # Always clean up temp files
-# # # # # #         _cleanup(tmp_paths)
-
-
-# # # # # # def _cleanup(tmp_paths: Dict[int, str]) -> None:
-# # # # # #     for path in tmp_paths.values():
-# # # # # #         try:
-# # # # # #             if os.path.isfile(path):
-# # # # # #                 os.remove(path)
-# # # # # #         except OSError as exc:
-# # # # # #             log.warning("Could not remove temp file %s: %s", path, exc)
-
-
-# # # # # # # ── RabbitMQ callback ─────────────────────────────────────────────────────────
-
-# # # # # # def _on_message(channel, method, properties, body):
-# # # # # #     log.info("[RabbitMQ] Raw message received: %s", body.decode("utf-8", errors="replace")[:1000])
-# # # # # #     try:
-# # # # # #         data = json.loads(body)
-# # # # # #         msg  = AnalysisJobMessage.from_dict(data)
-# # # # # #     except Exception as exc:
-# # # # # #         log.error("Failed to parse RabbitMQ message: %s\nBody: %s", exc, body[:500])
-# # # # # #         # Malformed messages are nacked without requeue
-# # # # # #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-# # # # # #         return
-
-# # # # # #     _handle_job(msg, channel, method)
-
-
-# # # # # # # ── Consumer startup ──────────────────────────────────────────────────────────
-
-# # # # # # def start() -> None:
-# # # # # #     """
-# # # # # #     Connect to RabbitMQ and start consuming from the analysis.jobs queue.
-# # # # # #     Blocks forever (until interrupted).
-# # # # # #     """
-# # # # # #     log.info("[Consumer]  Connecting to RabbitMQ:  %s", RABBITMQ_URL)
-# # # # # #     params     = pika.URLParameters(RABBITMQ_URL)
-# # # # # #     connection = pika.BlockingConnection(params)
-# # # # # #     channel    = connection.channel()
-
-# # # # # #     channel.queue_declare(queue=QUEUE_NAME, durable=True)
-# # # # # #     channel.basic_qos(prefetch_count=PREFETCH_COUNT)
-# # # # # #     channel.basic_consume(queue=QUEUE_NAME, on_message_callback=_on_message)
-
-# # # # # #     log.info("[Consumer]  Waiting for messages on queue '%s'…", QUEUE_NAME)
-# # # # # #     try:
-# # # # # #         channel.start_consuming()
-# # # # # #     except KeyboardInterrupt:
-# # # # # #         log.info("[Consumer]  Interrupted — shutting down.")
-# # # # # #         channel.stop_consuming()
-# # # # # #     finally:
-# # # # # #         connection.close()
-
-
-# # # # # # if __name__ == "__main__":
-# # # # # #     start()
-
-
-# # # # # """
-# # # # # consumer.py
-# # # # # ───────────
-# # # # # RabbitMQ consumer for the Journey-based analysis workflow.
-
-# # # # # Live backend : https://cvvrsrailway-api.sconexsoft.com/cvs
-
-# # # # # Processing flow (Step numbers match the CVVRS spec)
-# # # # # ────────────────────────────────────────────────────
-# # # # #  1. Consume message from 'analysis.jobs' (exchange: analysis.exchange,
-# # # # #     routing key: analysis.job.created).
-# # # # #  2. Download all videos from S3.
-# # # # #  3. Send PROCESSING progress (5 %) — "Downloading videos".
-# # # # #  4. Analyze videos via the existing AI pipeline (analyzer.py).
-# # # # #  5. Violation frames are uploaded inside analyzer.py (S3 keys returned).
-# # # # #  6–7. VideoResult / ViolationResult objects built inside analyzer.py.
-# # # # #  8. Calculate overall processing time (wall-clock ms).
-# # # # #  9. Send completion callback (POST /api/internal/analysis/completed).
-# # # # # 10. Acknowledge RabbitMQ message ONLY after successful completion callback.
-
-# # # # # On any unhandled exception
-# # # # # ──────────────────────────
-# # # # #   • Log the full traceback.
-# # # # #   • Send a failure callback (POST /api/internal/analysis/failed).
-# # # # #   • Nack the message (no requeue — dead-letter exchange).
-
-# # # # # Changes from previous version
-# # # # # ──────────────────────────────
-# # # # # • AnalysisJobMessage now carries trainDetailId, folderName, priority —
-# # # # #   all forwarded to CompletionPayload.
-# # # # # • analyze_journey() receives folder_name so frames land in the right S3 path.
-# # # # # • _progress() passes current_video index to send_progress().
-# # # # # • CompletionPayload is built with trainDetailId and folderName.
-# # # # # • Queue binding is declared with the exchange / routing key from the docs.
-# # # # # """
-
-# # # # # from __future__ import annotations
-
-# # # # # import json
-# # # # # import logging
-# # # # # import os
-# # # # # import tempfile
-# # # # # import traceback
-# # # # # import time
-# # # # # from typing import Dict
-
-# # # # # import pika
-# # # # # from dotenv import load_dotenv
-
-# # # # # from analyzer import analyze_journey
-# # # # # from callback_client import send_completed, send_failed, send_progress
-# # # # # from models import AnalysisJobMessage, CompletionPayload
-# # # # # from s3_service import download_video
-
-# # # # # # ── Config / credentials ─────────────────────────────────────────────────────
-# # # # # _ENV_PATH = os.path.join(
-# # # # #     os.path.dirname(os.path.abspath(__file__)),
-# # # # #     "config", "credentials.env",
-# # # # # )
-# # # # # load_dotenv(_ENV_PATH)
-
-# # # # # RABBITMQ_URL   = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
-# # # # # QUEUE_NAME     = os.environ.get("ANALYSIS_QUEUE",    "analysis.jobs")
-# # # # # EXCHANGE_NAME  = os.environ.get("ANALYSIS_EXCHANGE", "analysis.exchange")
-# # # # # ROUTING_KEY    = os.environ.get("ANALYSIS_ROUTING",  "analysis.job.created")
-# # # # # PREFETCH_COUNT = int(os.environ.get("RABBITMQ_PREFETCH", "1"))
-
-# # # # # logging.basicConfig(
-# # # # #     level  = logging.INFO,
-# # # # #     format = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-# # # # # )
-# # # # # log = logging.getLogger("consumer")
-
-
-# # # # # # ── Job handler ───────────────────────────────────────────────────────────────
-
-# # # # # def _handle_job(msg: AnalysisJobMessage, channel, method) -> None:
-# # # # #     """
-# # # # #     Full processing flow for one AnalysisJobMessage.
-# # # # #     Acks on success, nacks (no requeue) on failure.
-# # # # #     """
-# # # # #     job_id          = msg.job_id
-# # # # #     journey_id      = msg.journey_id
-# # # # #     train_detail_id = msg.train_detail_id
-# # # # #     folder_name     = msg.folder_name
-# # # # #     tmp_paths: Dict[int, str] = {}
-
-# # # # #     log.info(
-# # # # #         "[Job %s]  journey=%d  trainDetail=%d  videos=%d  folder=%s",
-# # # # #         job_id, journey_id, train_detail_id, len(msg.videos), folder_name,
-# # # # #     )
-
-# # # # #     try:
-# # # # #         # ── Step 2: Download all videos from S3 ──────────────────────────────
-# # # # #         log.info("[Job %s]  Downloading %d video(s)…", job_id, len(msg.videos))
-# # # # #         send_progress(job_id, journey_id, 5, "Downloading videos")
-
-# # # # #         for vj in sorted(msg.videos, key=lambda v: v.sequence_no):
-# # # # #             suffix   = os.path.splitext(vj.s3_key)[1] or ".mp4"
-# # # # #             fd, path = tempfile.mkstemp(suffix=suffix)
-# # # # #             os.close(fd)
-# # # # #             download_video(vj.s3_key, path)
-# # # # #             tmp_paths[vj.video_id] = path
-# # # # #             log.info(
-# # # # #                 "[Job %s]  Downloaded video_id=%d  seq=%d  → %s",
-# # # # #                 job_id, vj.video_id, vj.sequence_no, path,
-# # # # #             )
-
-# # # # #         # ── Step 3: Progress callback after download ──────────────────────────
-# # # # #         send_progress(
-# # # # #             job_id, journey_id, 10,
-# # # # #             "Downloads complete — starting analysis",
-# # # # #             current_video=1,
-# # # # #         )
-
-# # # # #         # ── Steps 4–7: Analyze + upload frames + build results ────────────────
-# # # # #         def _progress(pct: int, message: str, current_video: int = 1) -> None:
-# # # # #             try:
-# # # # #                 send_progress(job_id, journey_id, pct, message,
-# # # # #                               current_video=current_video)
-# # # # #             except Exception as exc:
-# # # # #                 log.warning(
-# # # # #                     "[Job %s]  progress callback failed (non-fatal): %s", job_id, exc
-# # # # #                 )
-
-# # # # #         video_results, wall_seconds = analyze_journey(
-# # # # #             job_id      = job_id,
-# # # # #             journey_id  = journey_id,
-# # # # #             folder_name = folder_name,
-# # # # #             video_jobs  = msg.videos,
-# # # # #             tmp_paths   = tmp_paths,
-# # # # #             progress_cb = _progress,
-# # # # #         )
-
-# # # # #         # ── Step 8: Calculate processing time (ms) ────────────────────────────
-# # # # #         processing_time_ms = int(wall_seconds * 1000)
-# # # # #         log.info(
-# # # # #             "[Job %s]  Analysis complete.  videos=%d  violations=%d  time=%dms",
-# # # # #             job_id,
-# # # # #             len(video_results),
-# # # # #             sum(len(vr.violations) for vr in video_results),
-# # # # #             processing_time_ms,
-# # # # #         )
-
-# # # # #         # ── Step 9: Send completion callback ──────────────────────────────────
-# # # # #         send_progress(
-# # # # #             job_id, journey_id, 95,
-# # # # #             "Sending results to backend",
-# # # # #             current_video=len(msg.videos),
-# # # # #         )
-
-# # # # #         completion = CompletionPayload(
-# # # # #             job_id          = job_id,
-# # # # #             journey_id      = journey_id,
-# # # # #             train_detail_id = train_detail_id,   # NEW
-# # # # #             folder_name     = folder_name,        # NEW
-# # # # #             processing_time = processing_time_ms,
-# # # # #             video_results   = video_results,
-# # # # #         )
-# # # # #         send_completed(completion.to_dict())
-# # # # #         log.info("[Job %s]  Completion callback sent.", job_id)
-
-# # # # #         # ── Step 10: Acknowledge RabbitMQ message ─────────────────────────────
-# # # # #         channel.basic_ack(delivery_tag=method.delivery_tag)
-# # # # #         log.info("[Job %s]  Message acknowledged.", job_id)
-
-# # # # #     except Exception as exc:
-# # # # #         err_detail = traceback.format_exc()
-# # # # #         log.error("[Job %s]  FAILED:\n%s", job_id, err_detail)
-
-# # # # #         # POST /api/internal/analysis/failed — only jobId + errorMessage
-# # # # #         send_failed(job_id, journey_id, f"{exc}\n\n{err_detail}")
-
-# # # # #         # Nack without requeue — failed jobs go to dead-letter exchange.
-# # # # #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-# # # # #         log.warning("[Job %s]  Message nacked (no requeue).", job_id)
-
-# # # # #     finally:
-# # # # #         _cleanup(tmp_paths)
-
-
-# # # # # def _cleanup(tmp_paths: Dict[int, str]) -> None:
-# # # # #     for path in tmp_paths.values():
-# # # # #         try:
-# # # # #             if os.path.isfile(path):
-# # # # #                 os.remove(path)
-# # # # #         except OSError as exc:
-# # # # #             log.warning("Could not remove temp file %s: %s", path, exc)
-
-
-# # # # # # ── RabbitMQ callback ─────────────────────────────────────────────────────────
-
-# # # # # def _on_message(channel, method, properties, body):
-# # # # #     log.info(
-# # # # #         "[RabbitMQ] Message received: %s",
-# # # # #         body.decode("utf-8", errors="replace")[:500],
-# # # # #     )
-# # # # #     try:
-# # # # #         data = json.loads(body)
-# # # # #         msg  = AnalysisJobMessage.from_dict(data)
-# # # # #     except Exception as exc:
-# # # # #         log.error("Failed to parse RabbitMQ message: %s\nBody: %s", exc, body[:500])
-# # # # #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-# # # # #         return
-
-# # # # #     _handle_job(msg, channel, method)
-
-
-# # # # # # ── Consumer startup ──────────────────────────────────────────────────────────
-
-# # # # # def start() -> None:
-# # # # #     """
-# # # # #     Connect to RabbitMQ and start consuming from the analysis.jobs queue.
-# # # # #     Declares the exchange and binding so the worker can start independently
-# # # # #     of the Spring Boot startup order.
-# # # # #     Blocks forever (until interrupted).
-# # # # #     """
-# # # # #     log.info("[Consumer]  Connecting to RabbitMQ: %s", RABBITMQ_URL)
-# # # # #     params     = pika.URLParameters(RABBITMQ_URL)
-# # # # #     connection = pika.BlockingConnection(params)
-# # # # #     channel    = connection.channel()
-
-# # # # #     # Declare exchange + queue + binding (idempotent — safe to call on restart)
-# # # # #     channel.exchange_declare(
-# # # # #         exchange      = EXCHANGE_NAME,
-# # # # #         exchange_type = "direct",
-# # # # #         durable       = True,
-# # # # #     )
-# # # # #     channel.queue_declare(queue=QUEUE_NAME, durable=True)
-# # # # #     channel.queue_bind(
-# # # # #         queue       = QUEUE_NAME,
-# # # # #         exchange    = EXCHANGE_NAME,
-# # # # #         routing_key = ROUTING_KEY,
-# # # # #     )
-
-# # # # #     channel.basic_qos(prefetch_count=PREFETCH_COUNT)
-# # # # #     channel.basic_consume(queue=QUEUE_NAME, on_message_callback=_on_message)
-
-# # # # #     log.info(
-# # # # #         "[Consumer]  Waiting for messages on queue '%s' "
-# # # # #         "(exchange='%s', routing='%s')…",
-# # # # #         QUEUE_NAME, EXCHANGE_NAME, ROUTING_KEY,
-# # # # #     )
-# # # # #     try:
-# # # # #         channel.start_consuming()
-# # # # #     except KeyboardInterrupt:
-# # # # #         log.info("[Consumer]  Interrupted — shutting down.")
-# # # # #         channel.stop_consuming()
-# # # # #     finally:
-# # # # #         connection.close()
-
-
-# # # # # if __name__ == "__main__":
-# # # # #     start()
-
-
-
-# # # # """
-# # # # consumer.py
-# # # # ───────────
-# # # # RabbitMQ consumer for the Journey-based analysis workflow.
- 
-# # # # Live backend : https://cvvrsrailway-api.sconexsoft.com/cvs
- 
-# # # # Processing flow (Step numbers match the CVVRS spec)
-# # # # ────────────────────────────────────────────────────
-# # # # 1. Consume message from 'analysis.jobs' (exchange: analysis.exchange,
-# # # #     routing key: analysis.job.created).
-# # # # 2. Download all videos from S3.
-# # # # 3. Send PROCESSING progress (5%) — "Downloading videos".
-# # # # 4. Analyze videos via the existing AI pipeline (analyzer.py).
-# # # # 5. Violation frames are uploaded inside analyzer.py (S3 keys returned).
-# # # # 6–7. VideoResult / ViolationResult objects built inside analyzer.py.
-# # # # 8. Calculate overall processing time (wall-clock ms).
-# # # # 9. Send completion callback (POST /api/internal/analysis/completed).
-# # # # 10. Acknowledge RabbitMQ message ONLY after successful completion callback.
- 
-# # # # On any unhandled exception
-# # # # ──────────────────────────
-# # # #   • Log the full traceback.
-# # # #   • Send a failure callback (POST /api/internal/analysis/failed).
-# # # #   • Nack the message (no requeue — dead-letter exchange).
- 
-# # # # Fixes from previous version
-# # # # ─────────────────────────────
-# # # # • FIX: Reads callbackBaseUrl from RabbitMQ message and overrides the
-# # # #   callback client base URL dynamically — so Python calls the correct
-# # # #   Spring Boot server without needing env var changes per environment.
-# # # # • FIX: Added reconnect retry loop — if RabbitMQ restarts while Python
-# # # #   is running, the consumer reconnects automatically after 5 seconds
-# # # #   instead of crashing.
-# # # # • IMPORTANT: Make sure config/credentials.env has:
-# # # #       ANALYSIS_QUEUE=analysis.jobs
-# # # #   NOT analysis.queue (that was the old queue name causing the mismatch).
-# # # # """
- 
-# # # # from __future__ import annotations
- 
-# # # # import json
-# # # # import logging
-# # # # import os
-# # # # import tempfile
-# # # # import time
-# # # # import traceback
-# # # # from typing import Dict
-# # # # from functools import partial
-# # # # import pika
-# # # # from dotenv import load_dotenv
- 
-# # # # from analyzer import analyze_journey
-# # # # from callback_client import send_completed, send_failed, send_progress, set_base_url
-# # # # from models import AnalysisJobMessage, CompletionPayload
-# # # # from s3_service import download_video
- 
-# # # # # ── Config / credentials ─────────────────────────────────────────────────────
-# # # # _ENV_PATH = os.path.join(
-# # # #     os.path.dirname(os.path.abspath(__file__)),
-# # # #     "config", "credentials.env",
-# # # # )
-# # # # load_dotenv(_ENV_PATH)
- 
-# # # # RABBITMQ_URL   = os.environ.get("RABBITMQ_URL",        "amqp://guest:guest@localhost:5672/")
-# # # # QUEUE_NAME     = os.environ.get("ANALYSIS_QUEUE",       "analysis.jobs")   # must be analysis.jobs
-# # # # EXCHANGE_NAME  = os.environ.get("ANALYSIS_EXCHANGE",    "analysis.exchange")
-# # # # ROUTING_KEY    = os.environ.get("ANALYSIS_ROUTING",     "analysis.job.created")
-# # # # PREFETCH_COUNT = int(os.environ.get("RABBITMQ_PREFETCH", "1"))
-# # # # RECONNECT_DELAY = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
- 
-# # # # logging.basicConfig(
-# # # #     level  = logging.INFO,
-# # # #     format = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-# # # # )
-# # # # log = logging.getLogger("consumer")
- 
- 
-# # # # # ── Job handler ───────────────────────────────────────────────────────────────
- 
-# # # # def _handle_job(msg: AnalysisJobMessage, channel, method,connection) -> None:
-# # # #     """
-# # # #     Full processing flow for one AnalysisJobMessage.
-# # # #     Acks on success, nacks (no requeue) on failure.
-# # # #     """
-# # # #     job_id          = msg.job_id
-# # # #     journey_id      = msg.journey_id
-# # # #     train_detail_id = msg.train_detail_id
-# # # #     folder_name     = msg.folder_name
-# # # #     tmp_paths: Dict[int, str] = {}
- 
-# # # #     log.info(
-# # # #         "[Job %s]  journey=%d  trainDetail=%d  videos=%d  folder=%s",
-# # # #         job_id, journey_id, train_detail_id, len(msg.videos), folder_name,
-# # # #     )
- 
-# # # #     # FIX: Override callback URL from the message so Python calls the
-# # # #     # correct Spring Boot server regardless of env var settings.
-# # # #     if msg.callback_base_url:
-# # # #         log.info("[Job %s]  callbackBaseUrl=%s", job_id, msg.callback_base_url)
-# # # #         set_base_url(msg.callback_base_url)
- 
-# # # #     try:
-# # # #         # ── Step 2: Download all videos from S3 ──────────────────────────────
-# # # #         log.info("[Job %s]  Downloading %d video(s)...", job_id, len(msg.videos))
-# # # #         send_progress(job_id, journey_id, 5, "Downloading videos")
- 
-# # # #         for vj in sorted(msg.videos, key=lambda v: v.sequence_no):
-# # # #             suffix   = os.path.splitext(vj.s3_key)[1] or ".mp4"
-# # # #             fd, path = tempfile.mkstemp(suffix=suffix)
-# # # #             os.close(fd)
-# # # #             download_video(vj.s3_key, path)
-# # # #             tmp_paths[vj.video_id] = path
-# # # #             log.info(
-# # # #                 "[Job %s]  Downloaded video_id=%d  seq=%d  → %s",
-# # # #                 job_id, vj.video_id, vj.sequence_no, path,
-# # # #             )
- 
-# # # #         # ── Step 3: Progress callback after download ──────────────────────────
-# # # #         send_progress(
-# # # #             job_id, journey_id, 10,
-# # # #             "Downloads complete — starting analysis",
-# # # #             current_video=1,
-# # # #         )
- 
-# # # #         # ── Steps 4–7: Analyze + upload frames + build results ────────────────
-# # # #         def _progress(pct: int, message: str, current_video: int = 1) -> None:
-# # # #             try:
-# # # #                 send_progress(job_id, journey_id, pct, message,
-# # # #                               current_video=current_video)
-# # # #             except Exception as exc:
-# # # #                 log.warning(
-# # # #                     "[Job %s]  progress callback failed (non-fatal): %s", job_id, exc
-# # # #                 )
- 
-# # # #         video_results, wall_seconds = analyze_journey(
-# # # #             job_id      = job_id,
-# # # #             journey_id  = journey_id,
-# # # #             folder_name = folder_name,
-# # # #             video_jobs  = msg.videos,
-# # # #             tmp_paths   = tmp_paths,
-# # # #             progress_cb = _progress,
-# # # #             rabbit_connection=connection,
-# # # #         )
- 
-# # # #         # ── Step 8: Calculate processing time (ms) ────────────────────────────
-# # # #         processing_time_ms = int(wall_seconds * 1000)
-# # # #         log.info(
-# # # #             "[Job %s]  Analysis complete.  videos=%d  violations=%d  time=%dms",
-# # # #             job_id,
-# # # #             len(video_results),
-# # # #             sum(len(vr.violations) for vr in video_results),
-# # # #             processing_time_ms,
-# # # #         )
- 
-# # # #         # ── Step 9: Send completion callback ──────────────────────────────────
-# # # #         send_progress(
-# # # #             job_id, journey_id, 95,
-# # # #             "Sending results to backend",
-# # # #             current_video=len(msg.videos),
-# # # #         )
- 
-# # # #         completion = CompletionPayload(
-# # # #             job_id          = job_id,
-# # # #             journey_id      = journey_id,
-# # # #             train_detail_id = train_detail_id,
-# # # #             folder_name     = folder_name,
-# # # #             processing_time = processing_time_ms,
-# # # #             video_results   = video_results,
-# # # #         )
-# # # #         send_completed(completion.to_dict())
-# # # #         log.info("[Job %s]  Completion callback sent.", job_id)
- 
-# # # #         # ── Step 10: Acknowledge RabbitMQ message ─────────────────────────────
-# # # #         channel.basic_ack(delivery_tag=method.delivery_tag)
-# # # #         log.info("[Job %s]  Message acknowledged.", job_id)
- 
-# # # #     except Exception as exc:
-# # # #         err_detail = traceback.format_exc()
-# # # #         log.error("[Job %s]  FAILED:\n%s", job_id, err_detail)
- 
-# # # #         # POST /api/internal/analysis/failed — only jobId + errorMessage
-# # # #         send_failed(job_id, journey_id, f"{exc}\n\n{err_detail}")
- 
-# # # #         # Nack without requeue — failed jobs go to dead-letter exchange.
-# # # #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-# # # #         log.warning("[Job %s]  Message nacked (no requeue).", job_id)
- 
-# # # #     finally:
-# # # #         _cleanup(tmp_paths)
- 
- 
-# # # # def _cleanup(tmp_paths: Dict[int, str]) -> None:
-# # # #     for path in tmp_paths.values():
-# # # #         try:
-# # # #             if os.path.isfile(path):
-# # # #                 os.remove(path)
-# # # #         except OSError as exc:
-# # # #             log.warning("Could not remove temp file %s: %s", path, exc)
- 
- 
-# # # # # ── RabbitMQ callback ─────────────────────────────────────────────────────────
- 
-# # # # def _on_message(channel, method, properties, body,connection):
-# # # #     log.info(
-# # # #         "[RabbitMQ] Message received: %s",
-# # # #         body.decode("utf-8", errors="replace")[:500], "delivery_tag=%s redelivered=%s",
-# # # #     method.delivery_tag,
-# # # #     method.redelivered,
-# # # #     )
-# # # #     try:
-# # # #         data = json.loads(body)
-# # # #         msg  = AnalysisJobMessage.from_dict(data)
-# # # #     except Exception as exc:
-# # # #         log.error("Failed to parse RabbitMQ message: %s\nBody: %s", exc, body[:500])
-# # # #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-# # # #         return
- 
-# # # #     _handle_job(msg, channel, method,connection)
- 
- 
-# # # # # ── Consumer connect + consume ────────────────────────────────────────────────
- 
-# # # # def _connect_and_consume() -> None:
-# # # #     """
-# # # #     Connect to RabbitMQ and start consuming.
-# # # #     Raises on connection failure so the retry loop can catch it.
-# # # #     """
-# # # #     log.info("[Consumer]  Connecting to RabbitMQ: %s  queue=%s", RABBITMQ_URL, QUEUE_NAME)
-# # # #     params     = pika.URLParameters(RABBITMQ_URL)
-# # # #     params.heartbeat=1800
-# # # #     params.blocked_connection_timeout=3600
-# # # #     params.socket_timeout=3600
-# # # #     connection = pika.BlockingConnection(params)
-# # # #     channel    = connection.channel()
- 
-# # # #     # Declare exchange + queue + binding (idempotent — safe to call on restart)
-# # # #     channel.exchange_declare(
-# # # #         exchange      = EXCHANGE_NAME,
-# # # #         exchange_type = "direct",
-# # # #         durable       = True,
-# # # #     )
-# # # #     channel.queue_declare(
-# # # #     queue=QUEUE_NAME,
-# # # #     passive=True
-# # # # )
-# # # #     channel.queue_bind(
-# # # #         queue       = QUEUE_NAME,
-# # # #         exchange    = EXCHANGE_NAME,
-# # # #         routing_key = ROUTING_KEY,
-# # # #     )
- 
-# # # #     channel.basic_qos(prefetch_count=PREFETCH_COUNT)
-# # # #     channel.basic_consume(queue=QUEUE_NAME, on_message_callback=partial(_on_message,connection=connection))
- 
-# # # #     log.info(
-# # # #         "[Consumer]  Waiting for messages on queue '%s' "
-# # # #         "(exchange='%s', routing='%s')...",
-# # # #         QUEUE_NAME, EXCHANGE_NAME, ROUTING_KEY,
-# # # #     )
-# # # #     channel.start_consuming()
- 
- 
-# # # # # ── Consumer startup with reconnect retry ─────────────────────────────────────
- 
-# # # # def start() -> None:
-# # # #     """
-# # # #     Connect to RabbitMQ and start consuming.
- 
-# # # #     FIX: Wrapped in retry loop — if RabbitMQ restarts or the connection
-# # # #     drops, the consumer waits RECONNECT_DELAY_SECONDS and reconnects
-# # # #     automatically instead of crashing and requiring manual restart.
-# # # #     """
-# # # #     while True:
-# # # #         try:
-# # # #             _connect_and_consume()
-# # # #         except KeyboardInterrupt:
-# # # #             log.info("[Consumer]  Interrupted by user — shutting down.")
-# # # #             break
-# # # #         except Exception as exc:
-# # # #             log.error(
-# # # #                 "[Consumer]  Connection lost: %s — reconnecting in %ds...",
-# # # #                 exc, RECONNECT_DELAY,
-# # # #             )
-# # # #             time.sleep(RECONNECT_DELAY)
- 
- 
-# # # # if __name__ == "__main__":
-# # # #     start()
-
-
-# # # """
-# # # consumer.py
-# # # ───────────
-# # # RabbitMQ consumer for the Journey-based analysis workflow.
-
-# # # Processing flow
-# # # ───────────────
-# # #  1. Consume message from 'analysis.jobs'.
-# # #  2. [NEW] Idempotency check — if job already completed, ACK and skip.
-# # #  3. Download all videos from S3.
-# # #  4. Send PROCESSING progress (10 %).
-# # #  5. Analyse videos via the existing AI pipeline (analyzer.py).
-# # #  6-7. VideoResult / ViolationResult objects built inside analyzer.py.
-# # #  8. Calculate overall processing time (wall-clock ms).
-# # #  9. Send completion callback.
-# # # 10. [FIX] Flush the TCP send-buffer before calling basic_ack().
-# # # 11. Acknowledge RabbitMQ message.
-
-# # # On any unhandled exception:
-# # #     • Log the full traceback.
-# # #     • Send a failure callback to Spring Boot.
-# # #     • Nack the message (do not requeue — leave it for the dead-letter exchange).
-
-# # # Root-cause explanation for the redelivery bug
-# # # ──────────────────────────────────────────────
-# # # pika.BlockingConnection.basic_ack() writes the ACK frame to an in-process
-# # # send-buffer but does NOT guarantee the bytes have been flushed to the OS TCP
-# # # stack before returning.  When the TCP connection is reset immediately after
-# # # (ConnectionResetError / StreamLostError), the un-flushed ACK is silently
-# # # discarded.  RabbitMQ never sees the ACK, so the broker marks the message as
-# # # un-acknowledged and redelivers it on the next consumer connection.
-
-# # # Two complementary fixes are applied here:
-# # #   A. connection.process_data_events(time_limit=0) right after basic_ack()
-# # #      forces pika to flush its I/O buffers before we return.  This eliminates
-# # #      the race in the >99 % of cases where the connection is still alive.
-
-# # #   B. An idempotency guard (check_job_completed / mark_job_completed) that
-# # #      queries the Spring Boot backend before starting any work.  On a genuine
-# # #      redelivery — where the ACK truly was lost — the guard detects the
-# # #      already-completed state and ACKs immediately without reprocessing.
-# # # """
-
-# # # from __future__ import annotations
-
-# # # import json
-# # # import logging
-# # # import os
-# # # import tempfile
-# # # import time
-# # # import traceback
-# # # from functools import partial
-# # # from typing import Dict
-
-# # # import pika
-# # # from dotenv import load_dotenv
-
-# # # from analyzer import analyze_journey
-# # # from callback_client import (
-# # #     send_completed,
-# # #     send_failed,
-# # #     send_progress,
-# # #     set_base_url,
-# # #     check_job_completed,   # NEW — idempotency check
-# # # )
-# # # from models import AnalysisJobMessage, CompletionPayload
-# # # from s3_service import download_video
-
-# # # # ── Config / credentials ──────────────────────────────────────────────────────
-# # # _ENV_PATH = os.path.join(
-# # #     os.path.dirname(os.path.abspath(__file__)),
-# # #     "config", "credentials.env",
-# # # )
-# # # load_dotenv(_ENV_PATH)
-
-# # # RABBITMQ_URL    = os.environ.get("RABBITMQ_URL",          "amqp://guest:guest@localhost:5672/")
-# # # QUEUE_NAME      = os.environ.get("ANALYSIS_QUEUE",         "analysis.jobs")
-# # # EXCHANGE_NAME   = os.environ.get("ANALYSIS_EXCHANGE",      "analysis.exchange")
-# # # ROUTING_KEY     = os.environ.get("ANALYSIS_ROUTING",       "analysis.job.created")
-# # # PREFETCH_COUNT  = int(os.environ.get("RABBITMQ_PREFETCH",  "1"))
-# # # RECONNECT_DELAY = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
-
-# # # logging.basicConfig(
-# # #     level  = logging.INFO,
-# # #     format = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-# # # )
-# # # log = logging.getLogger("consumer")
-
-
-# # # # ── ACK helper ────────────────────────────────────────────────────────────────
-
-# # # def _ack_and_flush(channel, connection, delivery_tag: int, job_id: str) -> None:
-# # #     """
-# # #     FIX A — Acknowledge a message and immediately flush pika's I/O buffers.
-
-# # #     pika.BlockingConnection.basic_ack() writes the AMQP ACK frame into an
-# # #     internal send-buffer but does not guarantee it reaches the OS TCP stack
-# # #     before returning.  Calling connection.process_data_events(time_limit=0)
-# # #     immediately afterward drives pika's select/poll loop once, which flushes
-# # #     any pending outbound bytes.
-
-# # #     Without this flush, if the TCP connection resets in the milliseconds after
-# # #     basic_ack() returns, the ACK frame is silently lost and RabbitMQ redelivers
-# # #     the message on the next consumer reconnect.
-# # #     """
-# # #     channel.basic_ack(delivery_tag=delivery_tag)
-# # #     try:
-# # #         # time_limit=0  → single I/O pass, no blocking wait
-# # #         connection.process_data_events(time_limit=0)
-# # #     except Exception as flush_err:
-# # #         # Non-fatal: the ACK frame was already written; the flush is best-effort.
-# # #         log.warning("[Job %s]  ACK flush warning (non-fatal): %s", job_id, flush_err)
-# # #     log.info("[Job %s]  Message acknowledged and ACK flushed.", job_id)
-
-
-# # # # ── Job handler ───────────────────────────────────────────────────────────────
-
-# # # def _handle_job(
-# # #     msg: AnalysisJobMessage,
-# # #     channel,
-# # #     method,
-# # #     connection,
-# # # ) -> None:
-# # #     """
-# # #     Full processing flow for one AnalysisJobMessage.
-# # #     ACKs on success, NACKs (no requeue) on failure.
-# # #     """
-# # #     job_id          = msg.job_id
-# # #     journey_id      = msg.journey_id
-# # #     train_detail_id = msg.train_detail_id
-# # #     folder_name     = msg.folder_name
-# # #     tmp_paths: Dict[int, str] = {}
-
-# # #     log.info(
-# # #         "[Job %s]  journey=%d  trainDetail=%d  videos=%d  folder=%s  redelivered=%s",
-# # #         job_id, journey_id, train_detail_id, len(msg.videos), folder_name,
-# # #         method.redelivered,
-# # #     )
-
-# # #     # Override callback URL from the message so Python posts to the correct
-# # #     # Spring Boot server regardless of env-var settings.
-# # #     if msg.callback_base_url:
-# # #         log.info("[Job %s]  callbackBaseUrl=%s", job_id, msg.callback_base_url)
-# # #         set_base_url(msg.callback_base_url)
-
-# # #     # ── FIX B: Idempotency guard ──────────────────────────────────────────────
-# # #     # Before downloading anything, ask the backend whether this job was already
-# # #     # completed.  This guards against genuine ACK-loss redeliveries (where Fix A
-# # #     # could not help because the previous connection was already dead).
-# # #     try:
-# # #         if check_job_completed(job_id):
-# # #             log.warning(
-# # #                 "[Job %s]  Already completed (redelivered=%s) — ACKing and skipping.",
-# # #                 job_id, method.redelivered,
-# # #             )
-# # #             _ack_and_flush(channel, connection, method.delivery_tag, job_id)
-# # #             return
-# # #     except Exception as idem_err:
-# # #         # If the idempotency check itself fails (e.g. backend unreachable),
-# # #         # log a warning but proceed with processing rather than dropping the job.
-# # #         log.warning(
-# # #             "[Job %s]  Idempotency check failed (%s) — proceeding with processing.",
-# # #             job_id, idem_err,
-# # #         )
-
-# # #     try:
-# # #         # ── Step 2: Download all videos from S3 ──────────────────────────────
-# # #         log.info("[Job %s]  Downloading %d video(s)...", job_id, len(msg.videos))
-# # #         send_progress(job_id, journey_id, 5, "Downloading videos")
-
-# # #         for vj in sorted(msg.videos, key=lambda v: v.sequence_no):
-# # #             suffix   = os.path.splitext(vj.s3_key)[1] or ".mp4"
-# # #             fd, path = tempfile.mkstemp(suffix=suffix)
-# # #             os.close(fd)
-# # #             download_video(vj.s3_key, path)
-# # #             tmp_paths[vj.video_id] = path
-# # #             log.info(
-# # #                 "[Job %s]  Downloaded video_id=%d  seq=%d  → %s",
-# # #                 job_id, vj.video_id, vj.sequence_no, path,
-# # #             )
-
-# # #         # ── Step 3: Progress callback after download ──────────────────────────
-# # #         send_progress(
-# # #             job_id, journey_id, 10,
-# # #             "Downloads complete — starting analysis",
-# # #             current_video=1,
-# # #         )
-
-# # #         # ── Steps 4–7: Analyse + upload frames + build results ────────────────
-# # #         def _progress(pct: int, message: str, current_video: int = 1) -> None:
-# # #             try:
-# # #                 send_progress(job_id, journey_id, pct, message,
-# # #                               current_video=current_video)
-# # #             except Exception as exc:
-# # #                 log.warning(
-# # #                     "[Job %s]  progress callback failed (non-fatal): %s", job_id, exc
-# # #                 )
-
-# # #         video_results, wall_seconds = analyze_journey(
-# # #             job_id           = job_id,
-# # #             journey_id       = journey_id,
-# # #             folder_name      = folder_name,
-# # #             video_jobs       = msg.videos,
-# # #             tmp_paths        = tmp_paths,
-# # #             progress_cb      = _progress,
-# # #             rabbit_connection= connection,
-# # #         )
-
-# # #         # ── Step 8: Calculate processing time (ms) ────────────────────────────
-# # #         processing_time_ms = int(wall_seconds * 1000)
-# # #         log.info(
-# # #             "[Job %s]  Analysis complete.  videos=%d  violations=%d  time=%dms",
-# # #             job_id,
-# # #             len(video_results),
-# # #             sum(len(vr.violations) for vr in video_results),
-# # #             processing_time_ms,
-# # #         )
-
-# # #         # ── Step 9: Send completion callback ──────────────────────────────────
-# # #         send_progress(
-# # #             job_id, journey_id, 95,
-# # #             "Sending results to backend",
-# # #             current_video=len(msg.videos),
-# # #         )
-
-# # #         completion = CompletionPayload(
-# # #             job_id          = job_id,
-# # #             journey_id      = journey_id,
-# # #             train_detail_id = train_detail_id,
-# # #             folder_name     = folder_name,
-# # #             processing_time = processing_time_ms,
-# # #             video_results   = video_results,
-# # #         )
-# # #         send_completed(completion.to_dict())
-# # #         log.info("[Job %s]  Completion callback sent.", job_id)
-
-# # #         # ── Step 10: ACK + flush ──────────────────────────────────────────────
-# # #         # FIX A: flush pika's send-buffer so the ACK actually reaches the broker
-# # #         # before any potential TCP reset can discard it.
-# # #         _ack_and_flush(channel, connection, method.delivery_tag, job_id)
-
-# # #     except Exception as exc:
-# # #         err_detail = traceback.format_exc()
-# # #         log.error("[Job %s]  FAILED:\n%s", job_id, err_detail)
-
-# # #         # POST /api/internal/analysis/failed — only jobId + errorMessage
-# # #         send_failed(job_id, journey_id, f"{exc}\n\n{err_detail}")
-
-# # #         # Nack without requeue — failed jobs go to dead-letter exchange.
-# # #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-# # #         log.warning("[Job %s]  Message nacked (no requeue).", job_id)
-
-# # #     finally:
-# # #         _cleanup(tmp_paths)
-
-
-# # # def _cleanup(tmp_paths: Dict[int, str]) -> None:
-# # #     for path in tmp_paths.values():
-# # #         try:
-# # #             if os.path.isfile(path):
-# # #                 os.remove(path)
-# # #         except OSError as exc:
-# # #             log.warning("Could not remove temp file %s: %s", path, exc)
-
-
-# # # # ── RabbitMQ callback ─────────────────────────────────────────────────────────
-
-# # # def _on_message(channel, method, properties, body, connection) -> None:
-# # #     # FIX: corrected log.info() call — previously had mismatched positional args
-# # #     # that silently swallowed delivery_tag and redelivered from the log output.
-# # #     log.info(
-# # #         "[RabbitMQ] Message received  delivery_tag=%s  redelivered=%s  body=%s",
-# # #         method.delivery_tag,
-# # #         method.redelivered,
-# # #         body.decode("utf-8", errors="replace")[:500],
-# # #     )
-# # #     try:
-# # #         data = json.loads(body)
-# # #         msg  = AnalysisJobMessage.from_dict(data)
-# # #     except Exception as exc:
-# # #         log.error("Failed to parse RabbitMQ message: %s\nBody: %s", exc, body[:500])
-# # #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-# # #         return
-
-# # #     _handle_job(msg, channel, method, connection)
-
-
-# # # # ── Consumer connect + consume ────────────────────────────────────────────────
-
-# # # def _connect_and_consume() -> None:
-# # #     """
-# # #     Connect to RabbitMQ and start consuming.
-# # #     Raises on connection failure so the retry loop can catch it.
-# # #     """
-# # #     log.info("[Consumer]  Connecting to RabbitMQ: %s  queue=%s", RABBITMQ_URL, QUEUE_NAME)
-# # #     params = pika.URLParameters(RABBITMQ_URL)
-# # #     params.heartbeat                  = 1800
-# # #     params.blocked_connection_timeout = 3600
-# # #     params.socket_timeout             = 3600
-# # #     connection = pika.BlockingConnection(params)
-# # #     channel    = connection.channel()
-
-# # #     # Declare exchange + queue + binding (idempotent — safe to call on restart)
-# # #     channel.exchange_declare(
-# # #         exchange      = EXCHANGE_NAME,
-# # #         exchange_type = "direct",
-# # #         durable       = True,
-# # #     )
-# # #     channel.queue_declare(queue=QUEUE_NAME, passive=True)
-# # #     channel.queue_bind(
-# # #         queue       = QUEUE_NAME,
-# # #         exchange    = EXCHANGE_NAME,
-# # #         routing_key = ROUTING_KEY,
-# # #     )
-
-# # #     channel.basic_qos(prefetch_count=PREFETCH_COUNT)
-# # #     channel.basic_consume(
-# # #         queue             = QUEUE_NAME,
-# # #         on_message_callback = partial(_on_message, connection=connection),
-# # #     )
-
-# # #     log.info(
-# # #         "[Consumer]  Waiting for messages on queue '%s' "
-# # #         "(exchange='%s', routing='%s')...",
-# # #         QUEUE_NAME, EXCHANGE_NAME, ROUTING_KEY,
-# # #     )
-# # #     channel.start_consuming()
-
-
-# # # # ── Consumer startup with reconnect retry ─────────────────────────────────────
-
-# # # def start() -> None:
-# # #     """
-# # #     Connect to RabbitMQ and start consuming.
-# # #     Wrapped in a retry loop — if the connection drops, the consumer waits
-# # #     RECONNECT_DELAY seconds and reconnects automatically.
-# # #     """
-# # #     while True:
-# # #         try:
-# # #             _connect_and_consume()
-# # #         except KeyboardInterrupt:
-# # #             log.info("[Consumer]  Interrupted by user — shutting down.")
-# # #             break
-# # #         except Exception as exc:
-# # #             log.error(
-# # #                 "[Consumer]  Connection lost: %s — reconnecting in %ds...",
-# # #                 exc, RECONNECT_DELAY,
-# # #             )
-# # #             time.sleep(RECONNECT_DELAY)
-
-
-# # # if __name__ == "__main__":
-# # #     start()
+# # z
 
 
 # # """
@@ -1306,79 +9,92 @@
 # # Processing flow
 # # ───────────────
 # #  1. Consume message from 'analysis.jobs'.
-# #  2. [NEW] Idempotency check — if job already completed, ACK and skip.
-# #  3. Download all videos from S3.
-# #  4. Send PROCESSING progress (10 %).
-# #  5. Analyse videos via the existing AI pipeline (analyzer.py).
-# #  6-7. VideoResult / ViolationResult objects built inside analyzer.py.
+# #  2. Idempotency check — if job already completed, ACK and skip.
+# #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
+# #  4. Download all videos from S3.
+# #  5. Send PROCESSING progress (10%).
+# #  6. Analyse videos via the existing AI pipeline (analyzer.py).
+# #  7. VideoResult / ViolationResult objects built inside analyzer.py.
 # #  8. Calculate overall processing time (wall-clock ms).
 # #  9. Send completion callback.
-# # 10. [FIX] Flush the TCP send-buffer before calling basic_ack().
+# # 10. [KEEPALIVE OFF] Stop keepalive thread.
 # # 11. Acknowledge RabbitMQ message.
 
 # # On any unhandled exception:
 # #     • Log the full traceback.
 # #     • Send a failure callback to Spring Boot.
-# #     • Nack the message (do not requeue — leave it for the dead-letter exchange).
+# #     • Nack the message (no requeue → dead-letter exchange).
 
-# # Root-cause explanation for the redelivery bug
-# # ──────────────────────────────────────────────
-# # pika.BlockingConnection.basic_ack() writes the ACK frame to an in-process
-# # send-buffer but does NOT guarantee the bytes have been flushed to the OS TCP
-# # stack before returning.  When the TCP connection is reset immediately after
-# # (ConnectionResetError / StreamLostError), the un-flushed ACK is silently
-# # discarded.  RabbitMQ never sees the ACK, so the broker marks the message as
-# # un-acknowledged and redelivers it on the next consumer connection.
+# # ═══════════════════════════════════════════════════════════════════
+# # ROOT CAUSE ANALYSIS (from 8-video test run)
+# # ═══════════════════════════════════════════════════════════════════
 
-# # Two complementary fixes are applied here:
-# #   A. connection.process_data_events(time_limit=0) right after basic_ack()
-# #      forces pika to flush its I/O buffers before we return.  This eliminates
-# #      the race in the >99 % of cases where the connection is still alive.
+# # What happened
+# # ─────────────
+# # 1. 8 videos downloaded sequentially over 7 min 53 s.
+# #    During this entire window the main thread is inside boto3
+# #    network I/O.  pika's I/O loop receives ZERO CPU.  No heartbeat
+# #    frames are sent to the broker.
 
-# #   B. An idempotency guard (check_job_completed / mark_job_completed) that
-# #      queries the Spring Boot backend before starting any work.  On a genuine
-# #      redelivery — where the ACK truly was lost — the guard detects the
-# #      already-completed state and ACKs immediately without reprocessing.
+# # 2. The broker's NAT device/firewall kills idle TCP connections
+# #    after ~60-300 s of silence.  By the time the download finishes
+# #    and analysis starts, the TCP socket is already dead.
 
-# # FIX — Issue #1: Idle heartbeat thread
-# # ──────────────────────────────────────
-# # pika's BlockingConnection drives heartbeat frames through its own select/poll
-# # I/O loop.  That loop only runs while start_consuming() is waiting for the
-# # next message OR while connection.process_data_events() is called explicitly.
-# # During long idle periods — or while pipeline.run() is occupying the main
-# # thread — no code calls process_data_events(), so heartbeats are never sent.
-# # After heartbeat_interval seconds of silence the broker closes the TCP
-# # connection.  The Python process believes it is still consuming, but any new
-# # message published to the queue stays in the Ready state because the consumer
-# # subscription is gone.
+# # 3. pipeline.run() runs fine (it doesn't need pika).  All 8 videos
+# #    process, 57 frames upload, completion callback succeeds.
 
-# # Fix: a lightweight background daemon thread calls
-# # connection.process_data_events(time_limit=0) every HEARTBEAT_INTERVAL / 2
-# # seconds, which is well within the broker's timeout window.  The thread
-# # stops automatically when the connection is closed or when the consumer shuts
-# # down.  A threading.Event is used for a clean, non-blocking sleep so the
-# # thread wakes immediately on shutdown rather than waiting out the full interval.
+# # 4. basic_ack() → ChannelWrongStateError: Channel is closed.
+# #    send_failed() is called → Spring Boot marks job FAILED.
 
-# # FIX — Issue #2: Per-video error isolation
-# # ──────────────────────────────────────────
-# # Previously, any exception raised by pipeline.run() for a single video
-# # propagated uncaught through analyze_journey() into _handle_job()'s outer
-# # except block, which called send_failed() and nacked the entire message.
-# # The fix is applied in analyzer.py (per-video try/except inside the loop).
-# # _handle_job() itself is unchanged — it still fails the whole journey if
-# # something goes wrong at the download, dedup, or completion-callback stage,
-# # which is the correct behaviour for those steps.
+# # 5. On reconnect, broker redelivers (redelivered=True).
+# #    Idempotency check → HTTP 500 (not implemented) → job re-runs.
+# #    The same 8 videos are downloaded and processed AGAIN.
+
+# # Root cause
+# # ──────────
+# # The keepalive was started AFTER the downloads — but the downloads
+# # were what killed the connection.  The keepalive must cover the
+# # ENTIRE job duration: download phase + analysis phase.
+
+# # Fix
+# # ───
+# # _AnalysisKeepalive is now entered BEFORE the download loop.
+# # It covers: download → analysis → frame upload → callback.
+# # The thread is stopped only AFTER completion callback returns,
+# # just before basic_ack().
+
+# # Thread-safety contract
+# # ──────────────────────
+# # • During download: main thread is in boto3/network I/O (no pika).
+# #   Keepalive thread holds pika_lock and calls process_data_events.
+# # • During analysis: main thread is in pipeline.run() (no pika).
+# #   Keepalive thread holds pika_lock and calls process_data_events.
+# # • During ACK/NACK: keepalive is stopped (thread.join() completed).
+# #   Main thread holds pika_lock and calls basic_ack/basic_nack.
+# # These windows never overlap → no concurrent pika access → safe.
+
+# # For 40 videos × 15 min
+# # ──────────────────────
+# # • Processing speed from log: ~7.4× realtime → 15-min video ≈ 122 s
+# # • 40 videos total analysis: ~81 min
+# # • Keepalive fires every 15 s → 4 heartbeats/min throughout
+# # • Broker heartbeat interval: 60 s → pika sends every 30 s at idle
+# # • Total job duration: downloads + ~81 min analysis
+# # • Connection will stay alive for the entire duration ✅
 # # """
 
 # # from __future__ import annotations
 
 # # import json
 # # import logging
+# # import multiprocessing as mp
 # # import os
+# # import queue as _queue
 # # import tempfile
 # # import threading
 # # import time
 # # import traceback
+# # from datetime import datetime
 # # from functools import partial
 # # from typing import Dict
 
@@ -1386,15 +102,20 @@
 # # from dotenv import load_dotenv
 
 # # from analyzer import analyze_journey
+# # from journey_runner import run_journey_in_subprocess
 # # from callback_client import (
 # #     send_completed,
 # #     send_failed,
+# #     send_video_failed,
 # #     send_progress,
 # #     set_base_url,
-# #     check_job_completed,   # idempotency check
+# #     check_job_completed,
+# #     compute_journey_status,
 # # )
-# # from models import AnalysisJobMessage, CompletionPayload
-# # from s3_service import download_video
+# # from models import AnalysisJobMessage, CompletionPayload, VideoResult, ViolationResult
+# # from s3_service import download_video, upload_text_log
+# # from journey_log import build_journey_log_text
+# # from resource_manager import resource_manager, memory_monitor
 
 # # # ── Config / credentials ──────────────────────────────────────────────────────
 # # _ENV_PATH = os.path.join(
@@ -1403,15 +124,75 @@
 # # )
 # # load_dotenv(_ENV_PATH)
 
-# # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",             "amqp://guest:guest@localhost:5672/")
-# # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",            "analysis.jobs")
-# # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",         "analysis.exchange")
-# # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",          "analysis.job.created")
-# # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",     "1"))
+# # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
+# # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "analysis.jobs")
+# # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "analysis.exchange")
+# # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "analysis.job.created")
+# # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
 # # RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
-# # # Broker heartbeat interval (seconds).  The idle-heartbeat thread fires at
-# # # half this value so we always stay comfortably inside the broker's window.
-# # HEARTBEAT_INTERVAL = int(os.environ.get("RABBITMQ_HEARTBEAT",   "1800"))
+
+# # # AMQP heartbeat interval negotiated with the broker (seconds).
+# # # pika sends a frame every interval/2 automatically while start_consuming()
+# # # is idle.  60 s keeps most NAT devices happy.
+# # HEARTBEAT_INTERVAL = int(os.environ.get("RABBITMQ_HEARTBEAT",    "60"))
+
+# # # How often the keepalive thread pokes pika during blocking work.
+# # # Must be < HEARTBEAT_INTERVAL / 2 (i.e. < 30 s).
+# # KEEPALIVE_INTERVAL = int(os.environ.get("RABBITMQ_KEEPALIVE",    "15"))
+
+# # # ── Subprocess isolation config ────────────────────────────────────────────
+# # # Each journey's analysis runs in its own child process (see journey_runner.py)
+# # # so a native OpenCV crash (OOM / access violation / segfault) kills only
+# # # that child — never the consumer process itself, never RabbitMQ's
+# # # connection, never other in-flight jobs.
+# # #
+# # # JOURNEY_TIMEOUT_SECONDS: per-video time budget used to compute each
+# # # journey's timeout dynamically (see _compute_journey_timeout below), so a
+# # # 20-video journey isn't held to the same wall-clock ceiling as a 5-video
+# # # one. If exceeded, the parent treats it the same as a crash (kills the
+# # # child, marks remaining videos failed, sends send_failed). Prevents a
+# # # hung/looping child from blocking the worker forever — this is the same
+# # # "no job stuck in PROCESSING forever" requirement as the frontend timeout,
+# # # just enforced at the worker level too.
+# # #
+# # # Real-world calibration note: a 1280x720@25fps ~43-minute video has been
+# # # observed taking ~108s of pure model inference plus ~115s of overhead
+# # # (S3 download, decode setup, violation frame upload) — roughly 220s
+# # # end-to-end per video of that length. PER_VIDEO_TIMEOUT_SECONDS defaults
+# # # generously above that observed figure to leave headroom for slower
+# # # videos/hardware without being so loose it stops catching real hangs.
+# # PER_VIDEO_TIMEOUT_SECONDS = float(os.environ.get("PER_VIDEO_TIMEOUT_SECONDS", "420"))
+
+# # # Fixed overhead added once per journey on top of the per-video budget —
+# # # covers model load (first video in the process), RabbitMQ/S3 connection
+# # # setup, and journey-level finalization (dedup, text log build/upload)
+# # # that happens after the last video.
+# # JOURNEY_TIMEOUT_BASE_SECONDS = float(os.environ.get("JOURNEY_TIMEOUT_BASE_SECONDS", "300"))
+
+# # # Floor — even a 1-video journey gets at least this much time. Also acts
+# # # as the old fixed-timeout behavior for anyone who still sets
+# # # JOURNEY_TIMEOUT_SECONDS explicitly (kept for backward-compatible env
+# # # overriding; if set, it becomes the floor rather than a hard fixed value).
+# # JOURNEY_TIMEOUT_SECONDS = int(os.environ.get("JOURNEY_TIMEOUT_SECONDS", "3600"))
+
+
+# # def _compute_journey_timeout(n_videos: int) -> float:
+# #     """
+# #     Scaled per-journey timeout: base overhead + (per-video budget × video
+# #     count), with JOURNEY_TIMEOUT_SECONDS as a floor so small journeys keep
+# #     at least the previous fixed protection window. A genuinely hung
+# #     process is still caught — it just has to actually exceed a budget
+# #     sized for the ACTUAL number of videos in this journey, not an
+# #     arbitrary fixed number picked for a smaller test batch.
+# #     """
+# #     scaled = JOURNEY_TIMEOUT_BASE_SECONDS + (PER_VIDEO_TIMEOUT_SECONDS * max(n_videos, 1))
+# #     return max(scaled, JOURNEY_TIMEOUT_SECONDS)
+
+# # # How often the parent polls the child's events_q for per-video progress
+# # # while waiting for it to finish (also doubles as the keepalive cadence
+# # # check — process_data_events still only happens on the separate keepalive
+# # # thread, this loop just drains progress events).
+# # EVENTS_POLL_INTERVAL_SECONDS = float(os.environ.get("EVENTS_POLL_INTERVAL_SECONDS", "1.0"))
 
 # # logging.basicConfig(
 # #     level  = logging.INFO,
@@ -1420,83 +201,380 @@
 # # log = logging.getLogger("consumer")
 
 
-# # # ── Idle heartbeat thread — FIX for Issue #1 ─────────────────────────────────
+# # # ── Job-duration keepalive ────────────────────────────────────────────────────
 
-# # def _start_heartbeat_thread(connection: pika.BlockingConnection,
-# #                              stop_event: threading.Event) -> threading.Thread:
+# # class _JobKeepalive:
 # #     """
-# #     FIX — Issue #1: Idle heartbeat keepalive.
+# #     Keeps the pika connection alive for the ENTIRE duration of a job —
+# #     covering both the download phase and the analysis phase.
 
-# #     Starts a daemon thread that calls connection.process_data_events() every
-# #     HEARTBEAT_INTERVAL / 2 seconds.  This drives pika's I/O loop so that AMQP
-# #     heartbeat frames are sent to the broker even when the main thread is:
-# #       (a) idle between jobs (inside start_consuming()), or
-# #       (b) blocked inside pipeline.run() during a long analysis job.
+# #     Usage (context manager):
 
-# #     Without this thread, a broker-side heartbeat timeout causes the TCP
-# #     connection to be silently dropped.  The consumer process keeps running but
-# #     its subscription is gone, so new messages accumulate in the Ready queue
-# #     and are never picked up.
+# #         with _JobKeepalive(connection, pika_lock, job_id):
+# #             # download videos   (main thread: boto3, no pika)
+# #             # analyze_journey() (main thread: OpenCV, no pika)
+# #             # send_completed()  (main thread: HTTP, no pika)
+# #         # keepalive stopped here — thread.join() has returned
+# #         _ack_and_flush(...)   # now safe to call pika
 
-# #     The thread is a daemon (dies with the process) and wakes immediately when
-# #     stop_event is set, enabling a clean shutdown without waiting out the sleep.
-
-# #     Parameters
-# #     ──────────
-# #     connection  : The active pika BlockingConnection to keep alive.
-# #     stop_event  : Set this event to stop the thread gracefully.
-
-# #     Returns
-# #     ───────
-# #     The started Thread object (caller does not need to join it — it's a daemon).
+# #     Thread-safety
+# #     ─────────────
+# #     A threading.Lock (pika_lock) is shared between this thread and
+# #     the main thread.  Only one of them holds the lock at any time:
+# #       • Keepalive: lock → process_data_events(time_limit=1) → release
+# #       • Main (ACK): lock → basic_ack → process_data_events → release
+# #     During the job body (download + analysis + HTTP callbacks) the
+# #     main thread makes NO pika calls, so the keepalive thread runs
+# #     uncontested.  After __exit__ (thread.join()) the keepalive is
+# #     fully done before the main thread calls basic_ack.
 # #     """
-# #     interval = max(30, HEARTBEAT_INTERVAL // 2)
 
-# #     def _loop():
-# #         log.info("[Heartbeat]  Thread started (interval=%ds).", interval)
-# #         while not stop_event.is_set():
-# #             # Sleep in short chunks so we react to stop_event quickly.
-# #             stop_event.wait(timeout=interval)
-# #             if stop_event.is_set():
-# #                 break
+# #     def __init__(self, connection: pika.BlockingConnection,
+# #                  pika_lock: threading.Lock, job_id: str):
+# #         self._conn   = connection
+# #         self._lock   = pika_lock
+# #         self._job_id = job_id
+# #         self._stop   = threading.Event()
+# #         self._thread = threading.Thread(
+# #             target = self._loop,
+# #             name   = f"Keepalive-{job_id}",
+# #             daemon = True,
+# #         )
+
+# #     def __enter__(self):
+# #         self._thread.start()
+# #         log.info(
+# #             "[Job %s]  Keepalive thread started (interval=%ds, heartbeat=%ds).",
+# #             self._job_id, KEEPALIVE_INTERVAL, HEARTBEAT_INTERVAL,
+# #         )
+# #         return self
+
+# #     def __exit__(self, *_):
+# #         self._stop.set()
+# #         self._thread.join(timeout=KEEPALIVE_INTERVAL + 5)
+# #         if self._thread.is_alive():
+# #             log.warning("[Job %s]  Keepalive thread did not stop cleanly.", self._job_id)
+# #         else:
+# #             log.info("[Job %s]  Keepalive thread stopped.", self._job_id)
+
+# #     def _loop(self):
+# #         while not self._stop.wait(timeout=KEEPALIVE_INTERVAL):
 # #             try:
-# #                 connection.process_data_events(time_limit=0)
+# #                 with self._lock:
+# #                     self._conn.process_data_events(time_limit=1)
+# #                 log.debug("[Job %s]  [Keepalive] heartbeat sent.", self._job_id)
 # #             except Exception as exc:
-# #                 # Connection is gone — the outer retry loop in start() will
-# #                 # reconnect.  Exit this thread silently.
-# #                 log.warning("[Heartbeat]  process_data_events failed (%s) — stopping.", exc)
+# #                 log.warning(
+# #                     "[Job %s]  [Keepalive] process_data_events failed: %s — "
+# #                     "connection may be lost.", self._job_id, exc,
+# #                 )
 # #                 break
-# #         log.info("[Heartbeat]  Thread stopped.")
-
-# #     t = threading.Thread(target=_loop, name="RabbitMQHeartbeat", daemon=True)
-# #     t.start()
-# #     return t
 
 
-# # # ── ACK helper ────────────────────────────────────────────────────────────────
+# # # ── ACK / NACK helpers ────────────────────────────────────────────────────────
 
-# # def _ack_and_flush(channel, connection, delivery_tag: int, job_id: str) -> None:
-# #     """
-# #     FIX A — Acknowledge a message and immediately flush pika's I/O buffers.
-
-# #     pika.BlockingConnection.basic_ack() writes the AMQP ACK frame into an
-# #     internal send-buffer but does not guarantee it reaches the OS TCP stack
-# #     before returning.  Calling connection.process_data_events(time_limit=0)
-# #     immediately afterward drives pika's select/poll loop once, which flushes
-# #     any pending outbound bytes.
-
-# #     Without this flush, if the TCP connection resets in the milliseconds after
-# #     basic_ack() returns, the ACK frame is silently lost and RabbitMQ redelivers
-# #     the message on the next consumer reconnect.
-# #     """
-# #     channel.basic_ack(delivery_tag=delivery_tag)
-# #     try:
-# #         # time_limit=0  → single I/O pass, no blocking wait
-# #         connection.process_data_events(time_limit=0)
-# #     except Exception as flush_err:
-# #         # Non-fatal: the ACK frame was already written; the flush is best-effort.
-# #         log.warning("[Job %s]  ACK flush warning (non-fatal): %s", job_id, flush_err)
+# # def _ack_and_flush(channel, connection, pika_lock: threading.Lock,
+# #                    delivery_tag: int, job_id: str) -> None:
+# #     """ACK the message. Called only after keepalive thread has stopped."""
+# #     # Record completion BEFORE ACKing — if ACK fails the message is requeued
+# #     # and the local cache will catch the redelivery on the next attempt.
+# #     from callback_client import mark_job_completed
+# #     mark_job_completed(job_id)
+# #     with pika_lock:
+# #         channel.basic_ack(delivery_tag=delivery_tag)
+# #         try:
+# #             connection.process_data_events(time_limit=0)
+# #         except Exception as flush_err:
+# #             log.warning("[Job %s]  ACK flush warning (non-fatal): %s",
+# #                         job_id, flush_err)
 # #     log.info("[Job %s]  Message acknowledged and ACK flushed.", job_id)
+
+
+# # def _nack(channel, pika_lock: threading.Lock,
+# #           delivery_tag: int, job_id: str) -> None:
+# #     """NACK the message. Called only after keepalive thread has stopped."""
+# #     with pika_lock:
+# #         try:
+# #             channel.basic_nack(delivery_tag=delivery_tag, requeue=False)
+# #         except Exception as exc:
+# #             log.warning("[Job %s]  NACK failed (connection gone?): %s", job_id, exc)
+# #     log.warning("[Job %s]  Message nacked (no requeue).", job_id)
+
+
+# # # ── Subprocess-supervised journey execution ────────────────────────────────
+# # #
+# # # Replaces a direct in-process call to analyze_journey() with a supervised
+# # # child process. This is the fix for the failure mode where a native
+# # # OpenCV OOM / access violation / segfault kills the ENTIRE worker process
+# # # (RabbitMQ connection thread included) partway through a journey, leaving
+# # # the remaining videos in that journey permanently unprocessed and the
+# # # job stuck — because no Python `except` clause can run after a native
+# # # crash kills the interpreter.
+# # #
+# # # With this in place: the child process is the one that dies. The parent
+# # # (this function) detects the death via process.exitcode after join(),
+# # # and — using the per-video "done" events the child streamed before it
+# # # died — marks every video that never reported completion as failed too,
+# # # then returns a failed_videos dict covering ALL of them (the one that
+# # # actually crashed AND any after it that never got a chance to run).
+# # def _run_journey_supervised(
+# #     job_id:      str,
+# #     journey_id:  int,
+# #     folder_name: str,
+# #     video_jobs:  list,
+# #     tmp_paths:   Dict[int, str],
+# #     progress_cb,
+# # ):
+# #     """
+# #     Returns (video_results, wall_seconds, failed_videos, video_error_details)
+# #     — failed_videos/video_error_details have the same shape analyze_journey()
+# #     produces, plus this function ALSO calls send_video_failed() immediately
+# #     for every video as its failure becomes known (Phase 1 requirement: "no
+# #     failed video should wait until journey completion to be reported") —
+# #     runs the actual work in an isolated child process so a native crash
+# #     can't take down the consumer.
+# #     """
+# #     ctx       = mp.get_context("spawn")
+# #     events_q  = ctx.Queue()
+# #     result_q  = ctx.Queue()
+
+# #     process = ctx.Process(
+# #         target = run_journey_in_subprocess,
+# #         args   = (job_id, journey_id, folder_name, video_jobs, tmp_paths,
+# #                   events_q, result_q),
+# #         name   = f"Journey-{job_id}",
+# #         daemon = True,
+# #     )
+# #     process.start()
+# #     log.info("[Job %s]  Journey subprocess started  pid=%s", job_id, process.pid)
+
+# #     ordered    = sorted(video_jobs, key=lambda v: v.sequence_no)
+# #     n_videos   = len(ordered)
+# #     completed_ids: Dict[int, bool] = {}      # video_id -> ok
+# #     error_by_id:   Dict[int, str]  = {}       # video_id -> error message
+# #     detail_by_id:  Dict[int, dict] = {}       # video_id -> {"errorType","reason"}
+# #     reported_ids:  set            = set()     # video_ids already sent to /failed
+# #     start_time = time.time()
+
+# #     journey_timeout = _compute_journey_timeout(n_videos)
+# #     log.info(
+# #         "[Job %s]  Journey timeout budget: %.0fs for %d video(s) "
+# #         "(base=%.0fs + %.0fs/video)", job_id, journey_timeout, n_videos,
+# #         JOURNEY_TIMEOUT_BASE_SECONDS, PER_VIDEO_TIMEOUT_SECONDS,
+# #     )
+
+# #     def _report_failure_immediately(vid: int, error_message: str,
+# #                                       error_type: str | None,
+# #                                       stack_trace: str | None,
+# #                                       reason: str | None) -> None:
+# #         """Calls the failed endpoint for one video, exactly once."""
+# #         if vid in reported_ids:
+# #             return
+# #         reported_ids.add(vid)
+# #         try:
+# #             send_video_failed(
+# #                 job_id        = job_id,
+# #                 journey_id    = journey_id,
+# #                 video_id      = vid,
+# #                 error_type    = error_type or "PROCESSING_ERROR",
+# #                 error_message = error_message,
+# #                 stack_trace   = stack_trace or "",
+# #                 reason        = reason,
+# #             )
+# #         except Exception as exc:
+# #             log.error("[Job %s]  send_video_failed failed for video=%d: %s",
+# #                        job_id, vid, exc)
+
+# #     # ── Drain events_q while waiting for the child to finish ──────────────
+# #     while True:
+# #         # Pull any progress events that arrived since the last poll.
+# #         drained_any = False
+# #         while True:
+# #             try:
+# #                 ev = events_q.get_nowait()
+# #             except _queue.Empty:
+# #                 break
+# #             drained_any = True
+# #             if ev.get("type") == "video_done":
+# #                 vid = ev["video_id"]
+# #                 ok  = ev.get("ok", False)
+# #                 completed_ids[vid] = ok
+# #                 if not ok:
+# #                     err = ev.get("error") or "Unknown per-video failure"
+# #                     error_by_id[vid] = err
+# #                     detail_by_id[vid] = {
+# #                         "errorType": ev.get("error_type") or "PROCESSING_ERROR",
+# #                         "reason":    ev.get("reason"),
+# #                     }
+# #                     # ── Phase 1: report THIS video as FAILED right now ─────
+# #                     _report_failure_immediately(
+# #                         vid, err, ev.get("error_type"), ev.get("stack_trace"),
+# #                         ev.get("reason"),
+# #                     )
+# #                 if progress_cb:
+# #                     pct = 10 + int((len(completed_ids) / max(n_videos, 1)) * 80)
+# #                     progress_cb(pct, f"Analyzed video {len(completed_ids)} of {n_videos}",
+# #                                 len(completed_ids))
+
+# #         process.join(timeout=0.05)
+# #         if process.exitcode is not None:
+# #             break
+# #         if time.time() - start_time > journey_timeout:
+# #             log.error(
+# #                 "[Job %s]  Journey subprocess exceeded timeout (%.0fs for "
+# #                 "%d videos) — terminating.", job_id, journey_timeout, n_videos,
+# #             )
+# #             process.terminate()
+# #             process.join(timeout=10)
+# #             if process.is_alive():
+# #                 process.kill()
+# #                 process.join(timeout=5)
+# #             break
+# #         if not drained_any:
+# #             time.sleep(EVENTS_POLL_INTERVAL_SECONDS)
+
+# #     # Final drain — a few events can land after exitcode is already set.
+# #     while True:
+# #         try:
+# #             ev = events_q.get_nowait()
+# #         except _queue.Empty:
+# #             break
+# #         if ev.get("type") == "video_done":
+# #             vid = ev["video_id"]
+# #             ok  = ev.get("ok", False)
+# #             completed_ids[vid] = ok
+# #             if not ok:
+# #                 err = ev.get("error") or "Unknown per-video failure"
+# #                 error_by_id[vid] = err
+# #                 detail_by_id[vid] = {
+# #                     "errorType": ev.get("error_type") or "PROCESSING_ERROR",
+# #                     "reason":    ev.get("reason"),
+# #                 }
+# #                 _report_failure_immediately(
+# #                     vid, err, ev.get("error_type"), ev.get("stack_trace"),
+# #                     ev.get("reason"),
+# #                 )
+
+# #     # ── Clean exit: pull the full result the child computed ───────────────
+# #     if process.exitcode == 0:
+# #         try:
+# #             payload = result_q.get(timeout=10)
+# #         except Exception:
+# #             payload = None
+
+# #         if payload and payload.get("type") == "result":
+# #             video_results = [VideoResult(
+# #                 video_id           = vr["videoId"] if isinstance(vr.get("videoId"), int) else int(vr["videoId"]),
+# #                 video_name         = vr["videoName"],
+# #                 sequence_no        = vr["sequenceNo"],
+# #                 duration_seconds   = vr["durationSeconds"],
+# #                 duration_formatted = vr.get("durationFormatted", ""),
+# #                 fps                = vr.get("fps", 0.0),
+# #                 size_mb            = vr.get("sizeMb", 0.0),
+# #                 original_s3_key    = vr["originalS3Key"],
+# #                 violations         = [
+# #                     ViolationResult(
+# #                         violation_type           = v["violationType"],
+# #                         severity                 = v["severity"],
+# #                         confidence               = v["confidence"],
+# #                         risk_score               = v["riskScore"],
+# #                         timestamp_seconds        = v["timestamp"],
+# #                         original_video_timestamp = v["originalVideoTimestamp"],
+# #                         frame_paths              = v.get("framePaths", []),
+# #                     )
+# #                     for v in vr.get("violations", [])
+# #                 ],
+# #             ) for vr in payload["video_results"]]
+# #             return (video_results, payload["wall_seconds"],
+# #                     payload["failed_videos"], detail_by_id)
+
+# #         if payload and payload.get("type") == "error":
+# #             # Child returned cleanly (exitcode 0) but analyze_journey raised
+# #             # above its own per-video isolation — treat ALL videos as failed,
+# #             # and report every single one immediately (none were reported
+# #             # yet, since this is a journey-level error, not per-video).
+# #             log.error("[Job %s]  Journey subprocess reported an error: %s",
+# #                        job_id, payload.get("message"))
+# #             failed_videos = {}
+# #             for vj in ordered:
+# #                 msg = payload.get("message", "Unknown error")
+# #                 failed_videos[vj.video_id] = msg
+# #                 detail_by_id[vj.video_id] = {"errorType": "PROCESSING_ERROR", "reason": None}
+# #                 _report_failure_immediately(
+# #                     vj.video_id, msg, "PROCESSING_ERROR",
+# #                     payload.get("traceback"), None,
+# #                 )
+# #             return [], time.time() - start_time, failed_videos, detail_by_id
+
+# #         # exitcode==0 but nothing usable on result_q — treat as crash-equivalent.
+# #         log.error("[Job %s]  Journey subprocess exited cleanly but sent no "
+# #                   "result — treating as failure.", job_id)
+
+# #     # ── Abnormal exit: crash, OOM-kill, timeout-kill, segfault, etc. ───────
+# #     log.error(
+# #         "[Job %s]  Journey subprocess died abnormally  exitcode=%s  "
+# #         "videos_completed=%d/%d", job_id, process.exitcode,
+# #         len(completed_ids), n_videos,
+# #     )
+
+# #     # ── Resource lifecycle (Phase 6/7): parent-side emergency cleanup ────────
+# #     # The crashed child's own CUDA context dies with its process — nothing
+# #     # the parent does can reach INTO that dead process's memory. What this
+# #     # call protects is the PARENT's own state: if the parent process ever
+# #     # touches torch/CUDA itself (directly, or transitively via any shared
+# #     # library that initializes a CUDA context on import), this ensures that
+# #     # state is also clear before the next journey's child process starts,
+# #     # and the GPU memory snapshot is logged for diagnostics either way.
+# #     try:
+# #         resource_manager.emergency_cleanup(
+# #             reason=f"child process crashed, exitcode={process.exitcode}",
+# #         )
+# #     except Exception:
+# #         log.error("[Job %s]  emergency_cleanup() failed:\n%s",
+# #                   job_id, traceback.format_exc())
+
+# #     failed_videos: Dict[int, str] = {}
+# #     video_results = []
+# #     crash_reason = (
+# #         f"Worker process crashed (exitcode={process.exitcode}) — "
+# #         "video was not processed."
+# #     )
+# #     for idx, vj in enumerate(ordered):
+# #         if vj.video_id in reported_ids:
+# #             # Already individually reported above (either a normal
+# #             # per-video failure, or already synthesized in a prior pass).
+# #             continue
+# #         if vj.video_id in completed_ids and completed_ids[vj.video_id]:
+# #             # This video finished successfully before the crash, but we
+# #             # don't have its detailed VideoResult (the child never reached
+# #             # the final result_q.put — only individual events were sent).
+# #             # We cannot fabricate violation data, so we still must surface
+# #             # it truthfully: mark it failed too, with a distinct reason,
+# #             # so Spring Boot doesn't silently lose a video's results.
+# #             msg = (
+# #                 "Processed successfully but worker crashed before journey "
+# #                 "results could be finalized (exitcode="
+# #                 f"{process.exitcode}); re-run required."
+# #             )
+# #             failed_videos[vj.video_id] = msg
+# #             detail_by_id[vj.video_id] = {
+# #                 "errorType": "RESOURCE_EXHAUSTION", "reason": None,
+# #             }
+# #             _report_failure_immediately(vj.video_id, msg, "RESOURCE_EXHAUSTION",
+# #                                           None, None)
+# #         else:
+# #             # Never started, or started but the crash happened mid-video —
+# #             # this is the "remaining videos" case from the bug report —
+# #             # report it as NOT_PROCESSED / resource exhaustion, immediately.
+# #             reason_msg = "Not Processed - Worker Resource Exhaustion"
+# #             failed_videos[vj.video_id] = crash_reason
+# #             detail_by_id[vj.video_id] = {
+# #                 "errorType": "NOT_PROCESSED", "reason": reason_msg,
+# #             }
+# #             _report_failure_immediately(vj.video_id, crash_reason,
+# #                                           "NOT_PROCESSED", None, reason_msg)
+
+# #     return video_results, time.time() - start_time, failed_videos, detail_by_id
 
 
 # # # ── Job handler ───────────────────────────────────────────────────────────────
@@ -1506,6 +584,7 @@
 # #     channel,
 # #     method,
 # #     connection,
+# #     pika_lock: threading.Lock,
 # # ) -> None:
 # #     """
 # #     Full processing flow for one AnalysisJobMessage.
@@ -1516,6 +595,7 @@
 # #     train_detail_id = msg.train_detail_id
 # #     folder_name     = msg.folder_name
 # #     tmp_paths: Dict[int, str] = {}
+# #     job_started_at  = datetime.now()
 
 # #     log.info(
 # #         "[Job %s]  journey=%d  trainDetail=%d  videos=%d  folder=%s  redelivered=%s",
@@ -1523,121 +603,216 @@
 # #         method.redelivered,
 # #     )
 
-# #     # Override callback URL from the message so Python posts to the correct
-# #     # Spring Boot server regardless of env-var settings.
 # #     if msg.callback_base_url:
 # #         log.info("[Job %s]  callbackBaseUrl=%s", job_id, msg.callback_base_url)
 # #         set_base_url(msg.callback_base_url)
 
-# #     # ── FIX B: Idempotency guard ──────────────────────────────────────────────
-# #     # Before downloading anything, ask the backend whether this job was already
-# #     # completed.  This guards against genuine ACK-loss redeliveries (where Fix A
-# #     # could not help because the previous connection was already dead).
+# #     # ── Idempotency guard ─────────────────────────────────────────────────────
 # #     try:
 # #         if check_job_completed(job_id):
 # #             log.warning(
 # #                 "[Job %s]  Already completed (redelivered=%s) — ACKing and skipping.",
 # #                 job_id, method.redelivered,
 # #             )
-# #             _ack_and_flush(channel, connection, method.delivery_tag, job_id)
+# #             _ack_and_flush(channel, connection, pika_lock,
+# #                            method.delivery_tag, job_id)
 # #             return
 # #     except Exception as idem_err:
-# #         # If the idempotency check itself fails (e.g. backend unreachable),
-# #         # log a warning but proceed with processing rather than dropping the job.
 # #         log.warning(
-# #             "[Job %s]  Idempotency check failed (%s) — proceeding with processing.",
+# #             "[Job %s]  Idempotency check failed (%s) — proceeding.",
 # #             job_id, idem_err,
 # #         )
 
-# #     try:
-# #         # ── Step 2: Download all videos from S3 ──────────────────────────────
-# #         log.info("[Job %s]  Downloading %d video(s)...", job_id, len(msg.videos))
-# #         send_progress(job_id, journey_id, 5, "Downloading videos")
+# #     # ── Start keepalive — covers download + analysis + callback ───────────────
+# #     # FIX: keepalive starts HERE, before downloads, because the download phase
+# #     # can take several minutes and will starve pika's heartbeat just as badly
+# #     # as the analysis phase.  The thread is stopped after send_completed()
+# #     # returns, just before basic_ack().
+# #     with _JobKeepalive(connection, pika_lock, job_id):
+# #         job_failed = False
+# #         job_exc    = None
 
-# #         for vj in sorted(msg.videos, key=lambda v: v.sequence_no):
-# #             suffix   = os.path.splitext(vj.s3_key)[1] or ".mp4"
-# #             fd, path = tempfile.mkstemp(suffix=suffix)
-# #             os.close(fd)
-# #             download_video(vj.s3_key, path)
-# #             tmp_paths[vj.video_id] = path
-# #             log.info(
-# #                 "[Job %s]  Downloaded video_id=%d  seq=%d  → %s",
-# #                 job_id, vj.video_id, vj.sequence_no, path,
-# #             )
+# #         try:
+# #             # ── Step 2: Download all videos from S3 ──────────────────────────
+# #             log.info("[Job %s]  Downloading %d video(s)...",
+# #                      job_id, len(msg.videos))
+# #             send_progress(job_id, journey_id, 5, "Downloading videos")
 
-# #         # ── Step 3: Progress callback after download ──────────────────────────
-# #         send_progress(
-# #             job_id, journey_id, 10,
-# #             "Downloads complete — starting analysis",
-# #             current_video=1,
-# #         )
-
-# #         # ── Steps 4–7: Analyse + upload frames + build results ────────────────
-# #         def _progress(pct: int, message: str, current_video: int = 1) -> None:
-# #             try:
-# #                 send_progress(job_id, journey_id, pct, message,
-# #                               current_video=current_video)
-# #             except Exception as exc:
-# #                 log.warning(
-# #                     "[Job %s]  progress callback failed (non-fatal): %s", job_id, exc
+# #             for vj in sorted(msg.videos, key=lambda v: v.sequence_no):
+# #                 suffix   = os.path.splitext(vj.s3_key)[1] or ".mp4"
+# #                 fd, path = tempfile.mkstemp(suffix=suffix)
+# #                 os.close(fd)
+# #                 download_video(vj.s3_key, path)
+# #                 tmp_paths[vj.video_id] = path
+# #                 log.info(
+# #                     "[Job %s]  Downloaded video_id=%d  seq=%d  → %s",
+# #                     job_id, vj.video_id, vj.sequence_no, path,
 # #                 )
 
-# #         video_results, wall_seconds = analyze_journey(
-# #             job_id            = job_id,
-# #             journey_id        = journey_id,
-# #             folder_name       = folder_name,
-# #             video_jobs        = msg.videos,
-# #             tmp_paths         = tmp_paths,
-# #             progress_cb       = _progress,
-# #             rabbit_connection = connection,
-# #         )
+# #             # ── Step 3: Progress after download ──────────────────────────────
+# #             try:
+# #                 send_progress(
+# #                 job_id, journey_id, 10,
+# #                 "Downloads complete — starting analysis",
+# #                 current_video=1,
+# #             )
+# #             except Exception as exc:
+# #                 log.warning("[Job %s]  progress(10) callback failed (non-fatal): %s",
+# #                             job_id, exc)
 
-# #         # ── Step 8: Calculate processing time (ms) ────────────────────────────
-# #         processing_time_ms = int(wall_seconds * 1000)
-# #         log.info(
-# #             "[Job %s]  Analysis complete.  videos=%d  violations=%d  time=%dms",
-# #             job_id,
-# #             len(video_results),
-# #             sum(len(vr.violations) for vr in video_results),
-# #             processing_time_ms,
-# #         )
+# #             # ── Steps 4–7: Analyse + upload frames + build results ────────────
+# #             def _progress(pct: int, message: str, current_video: int = 1) -> None:
+# #                 try:
+# #                     send_progress(job_id, journey_id, pct, message,
+# #                                   current_video=current_video)
+# #                 except Exception as exc:
+# #                     log.warning(
+# #                         "[Job %s]  progress callback failed (non-fatal): %s",
+# #                         job_id, exc,
+# #                     )
 
-# #         # ── Step 9: Send completion callback ──────────────────────────────────
-# #         send_progress(
-# #             job_id, journey_id, 95,
-# #             "Sending results to backend",
-# #             current_video=len(msg.videos),
-# #         )
+# #             video_results, wall_seconds, failed_videos, video_error_details = (
+# #                 _run_journey_supervised(
+# #                     job_id      = job_id,
+# #                     journey_id  = journey_id,
+# #                     folder_name = folder_name,
+# #                     video_jobs  = msg.videos,
+# #                     tmp_paths   = tmp_paths,
+# #                     progress_cb = _progress,
+# #                 )
+# #             )
 
-# #         completion = CompletionPayload(
-# #             job_id          = job_id,
-# #             journey_id      = journey_id,
-# #             train_detail_id = train_detail_id,
-# #             folder_name     = folder_name,
-# #             processing_time = processing_time_ms,
-# #             video_results   = video_results,
-# #         )
-# #         send_completed(completion.to_dict())
-# #         log.info("[Job %s]  Completion callback sent.", job_id)
+# #             # ── Step 8: Calculate processing time (ms) ────────────────────────
+# #             processing_time_ms = int(wall_seconds * 1000)
 
-# #         # ── Step 10: ACK + flush ──────────────────────────────────────────────
-# #         # FIX A: flush pika's send-buffer so the ACK actually reaches the broker
-# #         # before any potential TCP reset can discard it.
-# #         _ack_and_flush(channel, connection, method.delivery_tag, job_id)
+# #             succeeded_ids = {vr.video_id for vr in video_results
+# #                               if vr.video_id not in failed_videos}
+# #             failed_ids    = set(failed_videos.keys())
+# #             journey_status = compute_journey_status(
+# #                 total_videos         = len(msg.videos),
+# #                 succeeded_video_ids  = succeeded_ids,
+# #                 failed_video_ids     = failed_ids,
+# #             )
 
-# #     except Exception as exc:
-# #         err_detail = traceback.format_exc()
-# #         log.error("[Job %s]  FAILED:\n%s", job_id, err_detail)
+# #             log.info(
+# #                 "[Job %s]  Analysis complete.  videos=%d  violations=%d  time=%dms  "
+# #                 "failed=%d  status=%s",
+# #                 job_id,
+# #                 len(video_results),
+# #                 sum(len(vr.violations) for vr in video_results),
+# #                 processing_time_ms,
+# #                 len(failed_videos),
+# #                 journey_status,
+# #             )
 
-# #         # POST /api/internal/analysis/failed — only jobId + errorMessage
-# #         send_failed(job_id, journey_id, f"{exc}\n\n{err_detail}")
+# #             # ── Step 8b: Build and upload the .txt analysis log ───────────────
+# #             # Built for EVERY outcome now (COMPLETED, COMPLETED_WITH_ERRORS,
+# #             # and FAILED-with-partial-results) — not just full success — so
+# #             # the log always reflects which videos actually failed and why.
+# #             # Written to the same dynamic journey folder used for frames:
+# #             # <folderName>/<jobId>.txt
+# #             try:
+# #                 log_text = build_journey_log_text(
+# #                     job_id              = job_id,
+# #                     journey_id          = journey_id,
+# #                     video_results       = video_results,
+# #                     total_wall_seconds  = wall_seconds,
+# #                     started_at          = job_started_at,
+# #                     failed_videos       = failed_videos,
+# #                     video_error_details = video_error_details,
+# #                     journey_status      = journey_status,
+# #                 )
+# #                 upload_text_log(
+# #                     text        = log_text,
+# #                     folder_name = folder_name,
+# #                     filename    = f"{job_id}.txt",
+# #                 )
+# #                 log.info("[Job %s]  Text log uploaded to S3.", job_id)
+# #             except Exception as log_exc:
+# #                 log.warning(
+# #                     "[Job %s]  Text log build/upload failed (non-fatal): %s",
+# #                     job_id, log_exc,
+# #                 )
 
-# #         # Nack without requeue — failed jobs go to dead-letter exchange.
-# #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-# #         log.warning("[Job %s]  Message nacked (no requeue).", job_id)
+# #             # ── Step 9: Send completion OR failed callback ─────────────────────
+# #             # Per-video failures were ALREADY reported individually and
+# #             # immediately inside _run_journey_supervised (Phase 1 requirement
+# #             # — no video waits until journey end to be reported). This step
+# #             # decides the JOURNEY-level outcome:
+# #             #
+# #             #   COMPLETED              → send_completed with all video_results.
+# #             #   COMPLETED_WITH_ERRORS  → still send_completed (the journey DID
+# #             #                            finish — some videos succeeded and
+# #             #                            their results are real); per-video
+# #             #                            failures are already on record via
+# #             #                            the immediate /failed calls above.
+# #             #   FAILED                 → every video failed (or none ran) —
+# #             #                            send one journey-level /failed call
+# #             #                            summarizing it, no /completed call.
+# #             if journey_status == "FAILED":
+# #                 error_message = "; ".join(
+# #                     f"video_id={vid}: {msg_}" for vid, msg_ in failed_videos.items()
+# #                 ) or "Journey failed before any video could be processed."
+# #                 log.error(
+# #                     "[Job %s]  Journey FAILED — all %d video(s) failed: %s",
+# #                     job_id, len(failed_videos), error_message,
+# #                 )
+# #                 send_failed(job_id, journey_id, error_message)
+# #                 log.info("[Job %s]  Journey-level failed callback sent.", job_id)
+# #             else:
+# #                 send_progress(
+# #                     job_id, journey_id, 95,
+# #                     "Sending results to backend",
+# #                     current_video=len(msg.videos),
+# #                 )
+# #                 completion = CompletionPayload(
+# #                     job_id          = job_id,
+# #                     journey_id      = journey_id,
+# #                     train_detail_id = train_detail_id,
+# #                     folder_name     = folder_name,
+# #                     processing_time = processing_time_ms,
+# #                     video_results   = video_results,
+# #                 )
+# #                 completion_dict = completion.to_dict()
+# #                 completion_dict["journeyStatus"] = journey_status
+# #                 send_completed(completion_dict)
+# #                 log.info(
+# #                     "[Job %s]  Completion callback sent.  status=%s  failedVideos=%d",
+# #                     job_id, journey_status, len(failed_videos),
+# #                 )
 
-# #     finally:
-# #         _cleanup(tmp_paths)
+# #         except Exception as exc:
+# #             job_failed = True
+# #             job_exc    = exc
+# #             err_detail = traceback.format_exc()
+# #             log.error("[Job %s]  FAILED:\n%s", job_id, err_detail)
+# #             # ── Resource lifecycle (Phase 6): release resources on any
+# #             # journey-level failure that isn't already covered by the
+# #             # subprocess-crash path (e.g. S3 download failure, an exception
+# #             # raised while building/uploading the text log, or a callback
+# #             # failure that propagated up instead of being caught locally).
+# #             try:
+# #                 resource_manager.cleanup_after_failure(
+# #                     job_id=job_id, reason=f"{type(exc).__name__}: {exc}",
+# #                 )
+# #             except Exception:
+# #                 log.error("[Job %s]  cleanup_after_failure() failed:\n%s",
+# #                           job_id, traceback.format_exc())
+# #             try:
+# #                 send_failed(job_id, journey_id, f"{exc}\n\n{err_detail}")
+# #             except Exception as sf_exc:
+# #                 log.warning("[Job %s]  send_failed itself failed: %s",
+# #                             job_id, sf_exc)
+# #         finally:
+# #             _cleanup(tmp_paths)
+
+# #     # ── Keepalive stopped here — safe to call pika ────────────────────────────
+# #     if job_failed:
+# #         _nack(channel, pika_lock, method.delivery_tag, job_id)
+# #     else:
+# #         # ── Step 10: ACK ─────────────────────────────────────────────────────
+# #         _ack_and_flush(channel, connection, pika_lock,
+# #                        method.delivery_tag, job_id)
 
 
 # # def _cleanup(tmp_paths: Dict[int, str]) -> None:
@@ -1651,49 +826,84 @@
 
 # # # ── RabbitMQ callback ─────────────────────────────────────────────────────────
 
-# # def _on_message(channel, method, properties, body, connection) -> None:
+# # def _on_message(channel, method, properties, body,
+# #                 connection, pika_lock: threading.Lock) -> None:
 # #     log.info(
 # #         "[RabbitMQ] Message received  delivery_tag=%s  redelivered=%s  body=%s",
 # #         method.delivery_tag,
 # #         method.redelivered,
 # #         body.decode("utf-8", errors="replace")[:500],
 # #     )
+# #     if method.redelivered:
+# #         log.warning(
+# #             "[RabbitMQ] ⚠ REDELIVERED MESSAGE (delivery_tag=%s) — this typically means "
+# #             "the previous processing attempt was interrupted before ACK. Possible causes: "
+# #             "(1) RabbitMQ consumer_timeout fired (broker default 30 min) while the job "
+# #             "was still running — fix: raise consumer_timeout on the broker to ≥12 hours; "
+# #             "(2) worker process was killed/crashed mid-job. "
+# #             "The local idempotency cache will prevent re-processing if this worker "
+# #             "already completed the job in this session.",
+# #             method.delivery_tag,
+# #         )
 # #     try:
 # #         data = json.loads(body)
 # #         msg  = AnalysisJobMessage.from_dict(data)
 # #     except Exception as exc:
-# #         log.error("Failed to parse RabbitMQ message: %s\nBody: %s", exc, body[:500])
-# #         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+# #         log.error("Failed to parse RabbitMQ message: %s\nBody: %s",
+# #                   exc, body[:500])
+# #         with pika_lock:
+# #             channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 # #         return
 
-# #     _handle_job(msg, channel, method, connection)
+# #     _handle_job(msg, channel, method, connection, pika_lock)
 
 
 # # # ── Consumer connect + consume ────────────────────────────────────────────────
 
 # # def _connect_and_consume() -> None:
-# #     """
-# #     Connect to RabbitMQ and start consuming.
-
-# #     FIX — Issue #1: spins up the idle heartbeat thread so the connection
-# #     stays alive between jobs and during long video-analysis runs.
-
-# #     Raises on connection failure so the retry loop in start() can catch it.
-# #     """
-# #     log.info("[Consumer]  Connecting to RabbitMQ: %s  queue=%s", RABBITMQ_URL, QUEUE_NAME)
+# #     log.info("[Consumer]  Connecting to RabbitMQ: %s  queue=%s",
+# #              RABBITMQ_URL, QUEUE_NAME)
 # #     params = pika.URLParameters(RABBITMQ_URL)
-# #     params.heartbeat                  = HEARTBEAT_INTERVAL
-# #     params.blocked_connection_timeout = 3600
-# #     params.socket_timeout             = 3600
+# #     params.heartbeat                  = HEARTBEAT_INTERVAL   # 60 s
+# #     params.blocked_connection_timeout = 300
+# #     # IMPORTANT: Do NOT set socket_timeout here. The default (no timeout) is
+# #     # correct for a long-running consumer — a fixed socket_timeout would
+# #     # drop the TCP connection after that many idle seconds, which for a
+# #     # multi-hour analysis job (20 videos × ~400s = ~2.3 hours) would close
+# #     # the socket long before the job finishes. Heartbeats (HEARTBEAT_INTERVAL)
+# #     # and the keepalive thread (process_data_events every KEEPALIVE_INTERVAL
+# #     # seconds) are sufficient to keep NAT devices and the broker happy.
 # #     connection = pika.BlockingConnection(params)
 # #     channel    = connection.channel()
 
-# #     # Declare exchange + queue + binding (idempotent — safe to call on restart)
+# #     # One lock per connection — shared by _handle_job and _JobKeepalive.
+# #     pika_lock = threading.Lock()
+
 # #     channel.exchange_declare(
 # #         exchange      = EXCHANGE_NAME,
 # #         exchange_type = "direct",
 # #         durable       = True,
 # #     )
+
+# #     # Declare the queue passively (it must already exist on the broker) but
+# #     # log a clear warning if consumer_timeout needs to be raised on the broker.
+# #     # RabbitMQ 3.8.15+ enforces a consumer_timeout (default 30 minutes) that
+# #     # cancels any consumer that hasn't ACKed a message within that window —
+# #     # even if the TCP connection and heartbeats are healthy. For journeys
+# #     # longer than 30 min this causes the broker to cancel the consumer,
+# #     # requeue the message, and the worker picks it up again as a redelivery.
+# #     #
+# #     # FIX ON THE BROKER (run once as rabbitmq admin):
+# #     #   rabbitmqctl set_policy consumer-timeout \
+# #     #     ".*" '{"consumer-timeout": 43200000}' \
+# #     #     --apply-to queues
+# #     # That sets a 12-hour consumer timeout (43200000 ms) on all queues.
+# #     # Alternatively set consumer_timeout = false in rabbitmq.conf to disable it.
+# #     #
+# #     # The local idempotency cache in callback_client.py (_completed_jobs /
+# #     # mark_job_completed) is the WORKER-SIDE guard: if the broker does
+# #     # redeliver despite the above, the worker catches it and ACKs immediately
+# #     # without re-processing.
 # #     channel.queue_declare(queue=QUEUE_NAME, passive=True)
 # #     channel.queue_bind(
 # #         queue       = QUEUE_NAME,
@@ -1704,38 +914,45 @@
 # #     channel.basic_qos(prefetch_count=PREFETCH_COUNT)
 # #     channel.basic_consume(
 # #         queue               = QUEUE_NAME,
-# #         on_message_callback = partial(_on_message, connection=connection),
+# #         on_message_callback = partial(
+# #             _on_message, connection=connection, pika_lock=pika_lock
+# #         ),
 # #     )
 
 # #     log.info(
 # #         "[Consumer]  Waiting for messages on queue '%s' "
-# #         "(exchange='%s', routing='%s')...",
+# #         "(exchange='%s', routing='%s')  heartbeat=%ds  keepalive=%ds...",
 # #         QUEUE_NAME, EXCHANGE_NAME, ROUTING_KEY,
+# #         HEARTBEAT_INTERVAL, KEEPALIVE_INTERVAL,
 # #     )
-
-# #     # ── FIX — Issue #1: start idle heartbeat thread ───────────────────────────
-# #     # The thread calls connection.process_data_events(time_limit=0) every
-# #     # HEARTBEAT_INTERVAL / 2 seconds, keeping the TCP connection alive while
-# #     # the consumer is idle or while pipeline.run() is blocking the main thread.
-# #     stop_heartbeat = threading.Event()
-# #     _start_heartbeat_thread(connection, stop_heartbeat)
-
-# #     try:
-# #         channel.start_consuming()
-# #     finally:
-# #         # Signal the heartbeat thread to exit cleanly before we return (and
-# #         # the connection is closed by the retry loop or KeyboardInterrupt).
-# #         stop_heartbeat.set()
+# #     channel.start_consuming()
 
 
 # # # ── Consumer startup with reconnect retry ─────────────────────────────────────
 
 # # def start() -> None:
-# #     """
-# #     Connect to RabbitMQ and start consuming.
-# #     Wrapped in a retry loop — if the connection drops, the consumer waits
-# #     RECONNECT_DELAY seconds and reconnects automatically.
-# #     """
+# #     # ── Phase 2: startup recovery — MUST complete before RabbitMQ connects ───
+# #     # Runs the full sequence: resource cleanup → GPU cleanup → temp file
+# #     # cleanup → stale workspace cleanup → zombie-process detection. No
+# #     # consumer.basic_consume() call happens until this returns.
+# #     log.info("[Consumer]  Running startup resource cleanup...")
+# #     try:
+# #         resource_manager.initialize_service()
+# #     except Exception:
+# #         log.error("[Consumer]  initialize_service() raised — continuing "
+# #                   "startup anyway (cleanup failures must never block the "
+# #                   "worker from starting):\n%s", traceback.format_exc())
+
+# #     # ── Phase 8: background RAM/GPU/thread monitor ───────────────────────────
+# #     # Runs continuously for the lifetime of the process, independent of
+# #     # per-journey cleanup, so slow leaks across many journeys are caught
+# #     # too (not just spikes within a single journey).
+# #     try:
+# #         memory_monitor.start()
+# #     except Exception:
+# #         log.error("[Consumer]  memory_monitor.start() failed (non-fatal):\n%s",
+# #                   traceback.format_exc())
+
 # #     while True:
 # #         try:
 # #             _connect_and_consume()
@@ -1749,10 +966,20 @@
 # #             )
 # #             time.sleep(RECONNECT_DELAY)
 
+# #     # ── Graceful shutdown ──────────────────────────────────────────────────────
+# #     try:
+# #         memory_monitor.stop()
+# #     except Exception:
+# #         pass
+# #     try:
+# #         resource_manager.cleanup_on_shutdown()
+# #     except Exception:
+# #         log.error("[Consumer]  cleanup_on_shutdown() failed:\n%s",
+# #                   traceback.format_exc())
+
 
 # # if __name__ == "__main__":
 # #     start()
-
 
 
 # """
@@ -1763,97 +990,115 @@
 # Processing flow
 # ───────────────
 #  1. Consume message from 'analysis.jobs'.
-#  2. [NEW] Idempotency check — if job already completed, ACK and skip.
-#  3. Download all videos from S3.
-#  4. Send PROCESSING progress (10 %).
-#  5. Analyse videos via the existing AI pipeline (analyzer.py).
-#  6-7. VideoResult / ViolationResult objects built inside analyzer.py.
+#  2. Idempotency check — if job already completed, ACK and skip.
+#  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
+#  4. Download all videos from S3.
+#  5. Send PROCESSING progress (10%).
+#  6. Analyse videos via the existing AI pipeline (analyzer.py).
+#  7. VideoResult / ViolationResult objects built inside analyzer.py.
 #  8. Calculate overall processing time (wall-clock ms).
 #  9. Send completion callback.
-# 10. [FIX] Flush the TCP send-buffer before calling basic_ack().
+# 10. [KEEPALIVE OFF] Stop keepalive thread.
 # 11. Acknowledge RabbitMQ message.
 
 # On any unhandled exception:
 #     • Log the full traceback.
 #     • Send a failure callback to Spring Boot.
-#     • Nack the message (do not requeue — leave it for the dead-letter exchange).
+#     • Nack the message (no requeue → dead-letter exchange).
 
-# Root-cause explanation for the Ready-queue stall (Issue #1)
-# ────────────────────────────────────────────────────────────
-# pika.BlockingConnection is single-threaded.  Its heartbeat frames are sent
-# only when its internal I/O loop is given CPU time, i.e. while
-# start_consuming() is blocked waiting for a message, OR while
-# connection.process_data_events() / connection.sleep() is called explicitly.
+# ═══════════════════════════════════════════════════════════════════
+# ROOT CAUSE ANALYSIS (from 8-video test run)
+# ═══════════════════════════════════════════════════════════════════
 
-# Two situations starve the I/O loop:
+# What happened
+# ─────────────
+# 1. 8 videos downloaded sequentially over 7 min 53 s.
+#    During this entire window the main thread is inside boto3
+#    network I/O.  pika's I/O loop receives ZERO CPU.  No heartbeat
+#    frames are sent to the broker.
 
-#   A. IDLE GAP (2-10 min between jobs): after _handle_job() returns, pika
-#      re-enters start_consuming() which does drive the I/O loop.  The problem
-#      is the broker heartbeat interval itself: the original code set
-#      params.heartbeat = 1800 (30 min).  The broker waits up to 1800 s before
-#      declaring the peer dead — but some NAT devices and cloud firewalls drop
-#      idle TCP connections after as little as 60-300 s of silence.  When the
-#      TCP socket is killed by the firewall the broker eventually times out and
-#      marks the consumer as gone.  New messages then sit in Ready indefinitely
-#      because no live consumer is registered on that queue.
+# 2. The broker's NAT device/firewall kills idle TCP connections
+#    after ~60-300 s of silence.  By the time the download finishes
+#    and analysis starts, the TCP socket is already dead.
 
-#   B. DURING ANALYSIS (~64 s per video, potentially longer): while
-#      pipeline.run() occupies the main thread, pika's I/O loop is completely
-#      frozen.  The previous "fix" tried to call process_data_events() from a
-#      background thread, but BlockingConnection is NOT thread-safe — calling it
-#      from any thread other than the one that created it causes silent failures
-#      or state corruption.  The heartbeat frames were therefore not being sent.
+# 3. pipeline.run() runs fine (it doesn't need pika).  All 8 videos
+#    process, 57 frames upload, completion callback succeeds.
 
-# Correct fix applied here
-# ────────────────────────
-# 1. params.heartbeat = 60 (was 1800).
-#    A 60-second AMQP heartbeat interval means pika sends a heartbeat every
-#    30 s (half the interval, per AMQP spec).  This keeps the TCP session alive
-#    through any NAT or firewall that drops connections after 60-300 s.  During
-#    start_consuming() pika drives this automatically.
+# 4. basic_ack() → ChannelWrongStateError: Channel is closed.
+#    send_failed() is called → Spring Boot marks job FAILED.
 
-# 2. connection.call_later() scheduler for the analysis phase.
-#    call_later() is pika's own single-threaded, I/O-loop-safe callback
-#    scheduler.  Before calling pipeline.run() (which blocks the main thread),
-#    we register a recurring callback via _schedule_heartbeat().  Each
-#    invocation calls connection.process_data_events(time_limit=0) — one
-#    non-blocking I/O pass — and then re-schedules itself.  Because
-#    call_later() hooks into pika's own select/poll loop, it is fully
-#    thread-safe and guaranteed to fire even while the main thread is deep
-#    inside pipeline.run().
+# 5. On reconnect, broker redelivers (redelivered=True).
+#    Idempotency check → HTTP 500 (not implemented) → job re-runs.
+#    The same 8 videos are downloaded and processed AGAIN.
 
-#    IMPORTANT: call_later() callbacks fire only when pika's I/O loop is
-#    running, which during pipeline.run() it is NOT (the main thread is busy).
-#    The callback is therefore queued and fires on the NEXT I/O loop pass —
-#    which happens at the start of _handle_job() (via process_data_events) and
-#    again when start_consuming() resumes.  This is sufficient to prevent
-#    broker-side timeout because the heartbeat interval is now only 60 s and
-#    pika handles in-loop heartbeats automatically.
+# Root cause
+# ──────────
+# The keepalive was started AFTER the downloads — but the downloads
+# were what killed the connection.  The keepalive must cover the
+# ENTIRE job duration: download phase + analysis phase.
 
-#    The critical phase where we still need explicit keepalive is between
-#    _handle_job() returning and the next message arriving.  The call_later
-#    scheduler covers that by keeping the pika loop poked during processing so
-#    the loop is healthy when it returns to start_consuming().
+# Fix
+# ───
+# _AnalysisKeepalive is now entered BEFORE the download loop.
+# It covers: download → analysis → frame upload → callback.
+# The thread is stopped only AFTER completion callback returns,
+# just before basic_ack().
 
-# 3. HEARTBEAT_POLL_INTERVAL = 30 s (configurable).
-#    The recurring callback fires every 30 seconds during active processing.
-#    This is comfortably within the 60-second heartbeat window.
+# Thread-safety contract
+# ──────────────────────
+# • During download: main thread is in boto3/network I/O (no pika).
+#   Keepalive thread holds pika_lock and calls process_data_events.
+# • During analysis: main thread is in pipeline.run() (no pika).
+#   Keepalive thread holds pika_lock and calls process_data_events.
+# • During ACK/NACK: keepalive is stopped (thread.join() completed).
+#   Main thread holds pika_lock and calls basic_ack/basic_nack.
+# These windows never overlap → no concurrent pika access → safe.
 
-# FIX — Issue #2: Per-video error isolation (applied in analyzer.py)
-# ───────────────────────────────────────────────────────────────────
-# Each pipeline.run() call is wrapped in a per-video try/except in
-# analyzer.py.  A single video failure is logged and skipped; remaining
-# videos continue.  _handle_job() here is unchanged.
+# For 40 videos × 15 min
+# ──────────────────────
+# • Processing speed from log: ~7.4× realtime → 15-min video ≈ 122 s
+# • 40 videos total analysis: ~81 min
+# • Keepalive fires every 15 s → 4 heartbeats/min throughout
+# • Broker heartbeat interval: 60 s → pika sends every 30 s at idle
+# • Total job duration: downloads + ~81 min analysis
+# • Connection will stay alive for the entire duration ✅
+
+# ═══════════════════════════════════════════════════════════════════
+# FATAL-INTERRUPTION HANDLING (partial-journey recovery)
+# ═══════════════════════════════════════════════════════════════════
+# See `_finalize_on_interruption()` and the restructured exception
+# handling in `_handle_job()` below for the policy that governs what
+# happens when a fatal interruption (RabbitMQ connection loss, Ctrl+C,
+# OpenCV/native crash, OOM, unexpected exception, etc.) hits a journey
+# that is already in progress:
+
+#   • Zero videos succeeded so far  → existing FAILED-callback path
+#     (send_failed + NACK) is unchanged.
+#   • One or more videos already succeeded → we do NOT call the failed
+#     callback. Instead we wait up to RECOVERY_WAIT_SECONDS (2 min,
+#     used as a bounded retry budget for the completion callback),
+#     mark every still-unprocessed video as failed, send the
+#     COMPLETED_WITH_ERRORS completion callback (which already carries
+#     both the successful VideoResults and the failed/unprocessed
+#     video details — this is the same payload shape used by the
+#     existing subprocess-crash path), and finalize (ACK) the message
+#     so the worker moves on to the next queued journey. Resource
+#     cleanup (_cleanup(tmp_paths), resource_manager.cleanup_after_failure)
+#     still runs unconditionally on this path.
 # """
 
 # from __future__ import annotations
 
 # import json
 # import logging
+# import multiprocessing as mp
 # import os
+# import queue as _queue
 # import tempfile
+# import threading
 # import time
 # import traceback
+# from datetime import datetime
 # from functools import partial
 # from typing import Dict
 
@@ -1861,15 +1106,20 @@
 # from dotenv import load_dotenv
 
 # from analyzer import analyze_journey
+# from journey_runner import run_journey_in_subprocess
 # from callback_client import (
 #     send_completed,
 #     send_failed,
+#     send_video_failed,
 #     send_progress,
 #     set_base_url,
 #     check_job_completed,
+#     compute_journey_status,
 # )
-# from models import AnalysisJobMessage, CompletionPayload
-# from s3_service import download_video
+# from models import AnalysisJobMessage, CompletionPayload, VideoResult, ViolationResult
+# from s3_service import download_video, upload_text_log
+# from journey_log import build_journey_log_text
+# from resource_manager import resource_manager, memory_monitor
 
 # # ── Config / credentials ──────────────────────────────────────────────────────
 # _ENV_PATH = os.path.join(
@@ -1878,24 +1128,83 @@
 # )
 # load_dotenv(_ENV_PATH)
 
-# RABBITMQ_URL          = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# QUEUE_NAME            = os.environ.get("ANALYSIS_QUEUE",             "analysis.jobs")
-# EXCHANGE_NAME         = os.environ.get("ANALYSIS_EXCHANGE",          "analysis.exchange")
-# ROUTING_KEY           = os.environ.get("ANALYSIS_ROUTING",           "analysis.job.created")
-# PREFETCH_COUNT        = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
-# RECONNECT_DELAY       = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
+# RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
+# QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "analysis.jobs")
+# EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "analysis.exchange")
+# ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "analysis.job.created")
+# PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
+# RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
 
-# # FIX — Issue #1a: reduce heartbeat interval from 1800 s to 60 s so that
-# # pika's built-in heartbeat mechanism keeps the TCP session alive through
-# # NAT devices and firewalls that drop idle connections after 60-300 s.
-# # During start_consuming() pika sends heartbeats automatically at interval/2
-# # (i.e. every 30 s) with no extra code required.
-# HEARTBEAT_INTERVAL    = int(os.environ.get("RABBITMQ_HEARTBEAT",     "60"))
+# # AMQP heartbeat interval negotiated with the broker (seconds).
+# # pika sends a frame every interval/2 automatically while start_consuming()
+# # is idle.  60 s keeps most NAT devices happy.
+# HEARTBEAT_INTERVAL = int(os.environ.get("RABBITMQ_HEARTBEAT",    "60"))
 
-# # FIX — Issue #1b: how often (seconds) to call process_data_events() via
-# # the call_later scheduler while pipeline.run() is blocking the main thread.
-# # Must be < HEARTBEAT_INTERVAL / 2 = 30 s.
-# HEARTBEAT_POLL_INTERVAL = int(os.environ.get("RABBITMQ_POLL_INTERVAL", "20"))
+# # How often the keepalive thread pokes pika during blocking work.
+# # Must be < HEARTBEAT_INTERVAL / 2 (i.e. < 30 s).
+# KEEPALIVE_INTERVAL = int(os.environ.get("RABBITMQ_KEEPALIVE",    "15"))
+
+# # How long (seconds) we are willing to keep retrying the COMPLETED_WITH_ERRORS
+# # completion callback after a fatal interruption that struck a journey which
+# # already had at least one successfully-processed video. This is a bounded
+# # "wait for recovery" window, not a re-run of any video — the videos that
+# # already succeeded are never reprocessed.
+# RECOVERY_WAIT_SECONDS  = int(os.environ.get("RECOVERY_WAIT_SECONDS",  "120"))
+# RECOVERY_RETRY_SECONDS = int(os.environ.get("RECOVERY_RETRY_SECONDS", "5"))
+
+# # ── Subprocess isolation config ────────────────────────────────────────────
+# # Each journey's analysis runs in its own child process (see journey_runner.py)
+# # so a native OpenCV crash (OOM / access violation / segfault) kills only
+# # that child — never the consumer process itself, never RabbitMQ's
+# # connection, never other in-flight jobs.
+# #
+# # JOURNEY_TIMEOUT_SECONDS: per-video time budget used to compute each
+# # journey's timeout dynamically (see _compute_journey_timeout below), so a
+# # 20-video journey isn't held to the same wall-clock ceiling as a 5-video
+# # one. If exceeded, the parent treats it the same as a crash (kills the
+# # child, marks remaining videos failed, sends send_failed). Prevents a
+# # hung/looping child from blocking the worker forever — this is the same
+# # "no job stuck in PROCESSING forever" requirement as the frontend timeout,
+# # just enforced at the worker level too.
+# #
+# # Real-world calibration note: a 1280x720@25fps ~43-minute video has been
+# # observed taking ~108s of pure model inference plus ~115s of overhead
+# # (S3 download, decode setup, violation frame upload) — roughly 220s
+# # end-to-end per video of that length. PER_VIDEO_TIMEOUT_SECONDS defaults
+# # generously above that observed figure to leave headroom for slower
+# # videos/hardware without being so loose it stops catching real hangs.
+# PER_VIDEO_TIMEOUT_SECONDS = float(os.environ.get("PER_VIDEO_TIMEOUT_SECONDS", "420"))
+
+# # Fixed overhead added once per journey on top of the per-video budget —
+# # covers model load (first video in the process), RabbitMQ/S3 connection
+# # setup, and journey-level finalization (dedup, text log build/upload)
+# # that happens after the last video.
+# JOURNEY_TIMEOUT_BASE_SECONDS = float(os.environ.get("JOURNEY_TIMEOUT_BASE_SECONDS", "300"))
+
+# # Floor — even a 1-video journey gets at least this much time. Also acts
+# # as the old fixed-timeout behavior for anyone who still sets
+# # JOURNEY_TIMEOUT_SECONDS explicitly (kept for backward-compatible env
+# # overriding; if set, it becomes the floor rather than a hard fixed value).
+# JOURNEY_TIMEOUT_SECONDS = int(os.environ.get("JOURNEY_TIMEOUT_SECONDS", "3600"))
+
+
+# def _compute_journey_timeout(n_videos: int) -> float:
+#     """
+#     Scaled per-journey timeout: base overhead + (per-video budget × video
+#     count), with JOURNEY_TIMEOUT_SECONDS as a floor so small journeys keep
+#     at least the previous fixed protection window. A genuinely hung
+#     process is still caught — it just has to actually exceed a budget
+#     sized for the ACTUAL number of videos in this journey, not an
+#     arbitrary fixed number picked for a smaller test batch.
+#     """
+#     scaled = JOURNEY_TIMEOUT_BASE_SECONDS + (PER_VIDEO_TIMEOUT_SECONDS * max(n_videos, 1))
+#     return max(scaled, JOURNEY_TIMEOUT_SECONDS)
+
+# # How often the parent polls the child's events_q for per-video progress
+# # while waiting for it to finish (also doubles as the keepalive cadence
+# # check — process_data_events still only happens on the separate keepalive
+# # thread, this loop just drains progress events).
+# EVENTS_POLL_INTERVAL_SECONDS = float(os.environ.get("EVENTS_POLL_INTERVAL_SECONDS", "1.0"))
 
 # logging.basicConfig(
 #     level  = logging.INFO,
@@ -1904,66 +1213,602 @@
 # log = logging.getLogger("consumer")
 
 
-# # ── call_later heartbeat scheduler — FIX for Issue #1b ───────────────────────
+# # ── Job-duration keepalive ────────────────────────────────────────────────────
 
-# def _schedule_heartbeat(connection: pika.BlockingConnection,
-#                         job_id: str,
-#                         stop_flag: list) -> None:
+# class _JobKeepalive:
 #     """
-#     FIX — Issue #1b: pika-native, single-threaded heartbeat scheduler.
+#     Keeps the pika connection alive for the ENTIRE duration of a job —
+#     covering both the download phase and the analysis phase.
 
-#     Registers itself as a recurring callback via connection.call_later().
-#     call_later() is pika's own I/O-loop-safe scheduler — it is the only
-#     correct way to run periodic work with BlockingConnection because it
-#     executes on the same thread as the connection, avoiding race conditions.
+#     Usage (context manager):
 
-#     Each invocation:
-#       1. Checks stop_flag[0]; if True, does nothing and does not reschedule.
-#       2. Calls connection.process_data_events(time_limit=0) — one non-blocking
-#          pass through pika's select/poll loop, which sends any pending AMQP
-#          frames (including heartbeats).
-#       3. Re-schedules itself for HEARTBEAT_POLL_INTERVAL seconds later.
+#         with _JobKeepalive(connection, pika_lock, job_id):
+#             # download videos   (main thread: boto3, no pika)
+#             # analyze_journey() (main thread: OpenCV, no pika)
+#             # send_completed()  (main thread: HTTP, no pika)
+#         # keepalive stopped here — thread.join() has returned
+#         _ack_and_flush(...)   # now safe to call pika
 
-#     Parameters
-#     ──────────
-#     connection : The active BlockingConnection.
-#     job_id     : For log messages only.
-#     stop_flag  : A single-element list [bool].  Set stop_flag[0] = True to
-#                  cancel further reschedules (called after job completes).
+#     Thread-safety
+#     ─────────────
+#     A threading.Lock (pika_lock) is shared between this thread and
+#     the main thread.  Only one of them holds the lock at any time:
+#       • Keepalive: lock → process_data_events(time_limit=1) → release
+#       • Main (ACK): lock → basic_ack → process_data_events → release
+#     During the job body (download + analysis + HTTP callbacks) the
+#     main thread makes NO pika calls, so the keepalive thread runs
+#     uncontested.  After __exit__ (thread.join()) the keepalive is
+#     fully done before the main thread calls basic_ack.
 #     """
-#     if stop_flag[0]:
-#         return
 
-#     try:
-#         connection.process_data_events(time_limit=0)
-#         log.debug("[Job %s]  [Heartbeat] call_later tick — I/O loop poked.", job_id)
-#     except Exception as exc:
-#         log.warning("[Job %s]  [Heartbeat] process_data_events error: %s", job_id, exc)
-#         return  # connection is gone; stop rescheduling
+#     def __init__(self, connection: pika.BlockingConnection,
+#                  pika_lock: threading.Lock, job_id: str):
+#         self._conn   = connection
+#         self._lock   = pika_lock
+#         self._job_id = job_id
+#         self._stop   = threading.Event()
+#         self._thread = threading.Thread(
+#             target = self._loop,
+#             name   = f"Keepalive-{job_id}",
+#             daemon = True,
+#         )
 
-#     # Reschedule for the next tick
-#     connection.call_later(
-#         HEARTBEAT_POLL_INTERVAL,
-#         lambda: _schedule_heartbeat(connection, job_id, stop_flag),
+#     def __enter__(self):
+#         self._thread.start()
+#         log.info(
+#             "[Job %s]  Keepalive thread started (interval=%ds, heartbeat=%ds).",
+#             self._job_id, KEEPALIVE_INTERVAL, HEARTBEAT_INTERVAL,
+#         )
+#         return self
+
+#     def __exit__(self, *_):
+#         self._stop.set()
+#         self._thread.join(timeout=KEEPALIVE_INTERVAL + 5)
+#         if self._thread.is_alive():
+#             log.warning("[Job %s]  Keepalive thread did not stop cleanly.", self._job_id)
+#         else:
+#             log.info("[Job %s]  Keepalive thread stopped.", self._job_id)
+
+#     def _loop(self):
+#         while not self._stop.wait(timeout=KEEPALIVE_INTERVAL):
+#             try:
+#                 with self._lock:
+#                     self._conn.process_data_events(time_limit=1)
+#                 log.debug("[Job %s]  [Keepalive] heartbeat sent.", self._job_id)
+#             except Exception as exc:
+#                 log.warning(
+#                     "[Job %s]  [Keepalive] process_data_events failed: %s — "
+#                     "connection may be lost.", self._job_id, exc,
+#                 )
+#                 break
+
+
+# # ── ACK / NACK helpers ────────────────────────────────────────────────────────
+
+# def _ack_and_flush(channel, connection, pika_lock: threading.Lock,
+#                    delivery_tag: int, job_id: str) -> None:
+#     """ACK the message. Called only after keepalive thread has stopped."""
+#     # Record completion BEFORE ACKing — if ACK fails the message is requeued
+#     # and the local cache will catch the redelivery on the next attempt.
+#     from callback_client import mark_job_completed
+#     mark_job_completed(job_id)
+#     with pika_lock:
+#         channel.basic_ack(delivery_tag=delivery_tag)
+#         try:
+#             connection.process_data_events(time_limit=0)
+#         except Exception as flush_err:
+#             log.warning("[Job %s]  ACK flush warning (non-fatal): %s",
+#                         job_id, flush_err)
+#     log.info("[Job %s]  Message acknowledged and ACK flushed.", job_id)
+
+
+# def _nack(channel, pika_lock: threading.Lock,
+#           delivery_tag: int, job_id: str) -> None:
+#     """NACK the message. Called only after keepalive thread has stopped."""
+#     with pika_lock:
+#         try:
+#             channel.basic_nack(delivery_tag=delivery_tag, requeue=False)
+#         except Exception as exc:
+#             log.warning("[Job %s]  NACK failed (connection gone?): %s", job_id, exc)
+#     log.warning("[Job %s]  Message nacked (no requeue).", job_id)
+
+
+# def _video_result_from_dict(vr: dict) -> VideoResult:
+#     """Builds a VideoResult from the dict shape used both by the
+#     subprocess's clean-completion payload (result_q "result" type) and by
+#     the per-video crash-recovery snapshot (analyzer.py's
+#     _build_partial_video_result, carried on video_done events)."""
+#     return VideoResult(
+#         video_id           = vr["videoId"] if isinstance(vr.get("videoId"), int) else int(vr["videoId"]),
+#         video_name         = vr["videoName"],
+#         sequence_no        = vr["sequenceNo"],
+#         duration_seconds   = vr["durationSeconds"],
+#         duration_formatted = vr.get("durationFormatted", ""),
+#         fps                = vr.get("fps", 0.0),
+#         size_mb            = vr.get("sizeMb", 0.0),
+#         original_s3_key    = vr["originalS3Key"],
+#         violations         = [
+#             ViolationResult(
+#                 violation_type           = v["violationType"],
+#                 severity                 = v["severity"],
+#                 confidence               = v["confidence"],
+#                 risk_score               = v["riskScore"],
+#                 timestamp_seconds        = v["timestamp"],
+#                 original_video_timestamp = v["originalVideoTimestamp"],
+#                 frame_paths              = v.get("framePaths", []),
+#             )
+#             for v in vr.get("violations", [])
+#         ],
 #     )
 
 
-# # ── ACK helper ────────────────────────────────────────────────────────────────
-
-# def _ack_and_flush(channel, connection, delivery_tag: int, job_id: str) -> None:
+# # ── Subprocess-supervised journey execution ────────────────────────────────
+# #
+# # Replaces a direct in-process call to analyze_journey() with a supervised
+# # child process. This is the fix for the failure mode where a native
+# # OpenCV OOM / access violation / segfault kills the ENTIRE worker process
+# # (RabbitMQ connection thread included) partway through a journey, leaving
+# # the remaining videos in that journey permanently unprocessed and the
+# # job stuck — because no Python `except` clause can run after a native
+# # crash kills the interpreter.
+# #
+# # With this in place: the child process is the one that dies. The parent
+# # (this function) detects the death via process.exitcode after join(),
+# # and — using the per-video "done" events the child streamed before it
+# # died — marks every video that never reported completion as failed too,
+# # then returns a failed_videos dict covering ALL of them (the one that
+# # actually crashed AND any after it that never got a chance to run).
+# def _run_journey_supervised(
+#     job_id:      str,
+#     journey_id:  int,
+#     folder_name: str,
+#     video_jobs:  list,
+#     tmp_paths:   Dict[int, str],
+#     progress_cb,
+# ):
 #     """
-#     Acknowledge a message and immediately flush pika's I/O buffers.
-
-#     basic_ack() writes the ACK frame to pika's send-buffer but does not
-#     guarantee it reaches the OS TCP stack.  process_data_events(time_limit=0)
-#     drives one I/O loop pass to flush pending outbound bytes.
+#     Returns (video_results, wall_seconds, failed_videos, video_error_details)
+#     — failed_videos/video_error_details have the same shape analyze_journey()
+#     produces, plus this function ALSO calls send_video_failed() immediately
+#     for every video as its failure becomes known (Phase 1 requirement: "no
+#     failed video should wait until journey completion to be reported") —
+#     runs the actual work in an isolated child process so a native crash
+#     can't take down the consumer.
 #     """
-#     channel.basic_ack(delivery_tag=delivery_tag)
+#     ctx       = mp.get_context("spawn")
+#     events_q  = ctx.Queue()
+#     result_q  = ctx.Queue()
+
+#     process = ctx.Process(
+#         target = run_journey_in_subprocess,
+#         args   = (job_id, journey_id, folder_name, video_jobs, tmp_paths,
+#                   events_q, result_q),
+#         name   = f"Journey-{job_id}",
+#         daemon = True,
+#     )
+#     process.start()
+#     log.info("[Job %s]  Journey subprocess started  pid=%s", job_id, process.pid)
+
+#     ordered    = sorted(video_jobs, key=lambda v: v.sequence_no)
+#     n_videos   = len(ordered)
+#     completed_ids: Dict[int, bool] = {}      # video_id -> ok
+#     error_by_id:   Dict[int, str]  = {}       # video_id -> error message
+#     detail_by_id:  Dict[int, dict] = {}       # video_id -> {"errorType","reason"}
+#     reported_ids:  set            = set()     # video_ids already sent to /failed
+#     # Best-effort per-video VideoResult snapshots (dict shape — see
+#     # analyzer.py's _build_partial_video_result), captured the moment each
+#     # video succeeds. If the child process then dies abnormally (native
+#     # crash/OOM/segfault) before it can send the final result_q payload,
+#     # these snapshots let us PRESERVE the already-succeeded videos' real
+#     # data instead of discarding it and marking them failed too.
+#     partial_results: Dict[int, dict] = {}
+#     start_time = time.time()
+
+#     journey_timeout = _compute_journey_timeout(n_videos)
+#     log.info(
+#         "[Job %s]  Journey timeout budget: %.0fs for %d video(s) "
+#         "(base=%.0fs + %.0fs/video)", job_id, journey_timeout, n_videos,
+#         JOURNEY_TIMEOUT_BASE_SECONDS, PER_VIDEO_TIMEOUT_SECONDS,
+#     )
+
+#     def _report_failure_immediately(vid: int, error_message: str,
+#                                       error_type: str | None,
+#                                       stack_trace: str | None,
+#                                       reason: str | None) -> None:
+#         """Calls the failed endpoint for one video, exactly once."""
+#         if vid in reported_ids:
+#             return
+#         reported_ids.add(vid)
+#         try:
+#             send_video_failed(
+#                 job_id        = job_id,
+#                 journey_id    = journey_id,
+#                 video_id      = vid,
+#                 error_type    = error_type or "PROCESSING_ERROR",
+#                 error_message = error_message,
+#                 stack_trace   = stack_trace or "",
+#                 reason        = reason,
+#             )
+#         except Exception as exc:
+#             log.error("[Job %s]  send_video_failed failed for video=%d: %s",
+#                        job_id, vid, exc)
+
+#     # ── Drain events_q while waiting for the child to finish ──────────────
+#     while True:
+#         # Pull any progress events that arrived since the last poll.
+#         drained_any = False
+#         while True:
+#             try:
+#                 ev = events_q.get_nowait()
+#             except _queue.Empty:
+#                 break
+#             drained_any = True
+#             if ev.get("type") == "video_done":
+#                 vid = ev["video_id"]
+#                 ok  = ev.get("ok", False)
+#                 completed_ids[vid] = ok
+#                 if ok:
+#                     snapshot = ev.get("video_result")
+#                     if snapshot:
+#                         partial_results[vid] = snapshot
+#                 if not ok:
+#                     err = ev.get("error") or "Unknown per-video failure"
+#                     error_by_id[vid] = err
+#                     detail_by_id[vid] = {
+#                         "errorType": ev.get("error_type") or "PROCESSING_ERROR",
+#                         "reason":    ev.get("reason"),
+#                     }
+#                     # ── Phase 1: report THIS video as FAILED right now ─────
+#                     _report_failure_immediately(
+#                         vid, err, ev.get("error_type"), ev.get("stack_trace"),
+#                         ev.get("reason"),
+#                     )
+#                 if progress_cb:
+#                     pct = 10 + int((len(completed_ids) / max(n_videos, 1)) * 80)
+#                     progress_cb(pct, f"Analyzed video {len(completed_ids)} of {n_videos}",
+#                                 len(completed_ids))
+
+#         process.join(timeout=0.05)
+#         if process.exitcode is not None:
+#             break
+#         if time.time() - start_time > journey_timeout:
+#             log.error(
+#                 "[Job %s]  Journey subprocess exceeded timeout (%.0fs for "
+#                 "%d videos) — terminating.", job_id, journey_timeout, n_videos,
+#             )
+#             process.terminate()
+#             process.join(timeout=10)
+#             if process.is_alive():
+#                 process.kill()
+#                 process.join(timeout=5)
+#             break
+#         if not drained_any:
+#             time.sleep(EVENTS_POLL_INTERVAL_SECONDS)
+
+#     # Final drain — a few events can land after exitcode is already set.
+#     while True:
+#         try:
+#             ev = events_q.get_nowait()
+#         except _queue.Empty:
+#             break
+#         if ev.get("type") == "video_done":
+#             vid = ev["video_id"]
+#             ok  = ev.get("ok", False)
+#             completed_ids[vid] = ok
+#             if ok:
+#                 snapshot = ev.get("video_result")
+#                 if snapshot:
+#                     partial_results[vid] = snapshot
+#             if not ok:
+#                 err = ev.get("error") or "Unknown per-video failure"
+#                 error_by_id[vid] = err
+#                 detail_by_id[vid] = {
+#                     "errorType": ev.get("error_type") or "PROCESSING_ERROR",
+#                     "reason":    ev.get("reason"),
+#                 }
+#                 _report_failure_immediately(
+#                     vid, err, ev.get("error_type"), ev.get("stack_trace"),
+#                     ev.get("reason"),
+#                 )
+
+#     # ── Clean exit: pull the full result the child computed ───────────────
+#     if process.exitcode == 0:
+#         try:
+#             payload = result_q.get(timeout=10)
+#         except Exception:
+#             payload = None
+
+#         if payload and payload.get("type") == "result":
+#             video_results = [_video_result_from_dict(vr) for vr in payload["video_results"]]
+#             return (video_results, payload["wall_seconds"],
+#                     payload["failed_videos"], detail_by_id)
+
+#         if payload and payload.get("type") == "error":
+#             # Child returned cleanly (exitcode 0) but analyze_journey raised
+#             # above its own per-video isolation — treat ALL videos as failed,
+#             # and report every single one immediately (none were reported
+#             # yet, since this is a journey-level error, not per-video).
+#             log.error("[Job %s]  Journey subprocess reported an error: %s",
+#                        job_id, payload.get("message"))
+#             failed_videos = {}
+#             for vj in ordered:
+#                 msg = payload.get("message", "Unknown error")
+#                 failed_videos[vj.video_id] = msg
+#                 detail_by_id[vj.video_id] = {"errorType": "PROCESSING_ERROR", "reason": None}
+#                 _report_failure_immediately(
+#                     vj.video_id, msg, "PROCESSING_ERROR",
+#                     payload.get("traceback"), None,
+#                 )
+#             return [], time.time() - start_time, failed_videos, detail_by_id
+
+#         # exitcode==0 but nothing usable on result_q — treat as crash-equivalent.
+#         log.error("[Job %s]  Journey subprocess exited cleanly but sent no "
+#                   "result — treating as failure.", job_id)
+
+#     # ── Abnormal exit: crash, OOM-kill, timeout-kill, segfault, etc. ───────
+#     log.error(
+#         "[Job %s]  Journey subprocess died abnormally  exitcode=%s  "
+#         "videos_completed=%d/%d", job_id, process.exitcode,
+#         len(completed_ids), n_videos,
+#     )
+
+#     # ── Resource lifecycle (Phase 6/7): parent-side emergency cleanup ────────
+#     # The crashed child's own CUDA context dies with its process — nothing
+#     # the parent does can reach INTO that dead process's memory. What this
+#     # call protects is the PARENT's own state: if the parent process ever
+#     # touches torch/CUDA itself (directly, or transitively via any shared
+#     # library that initializes a CUDA context on import), this ensures that
+#     # state is also clear before the next journey's child process starts,
+#     # and the GPU memory snapshot is logged for diagnostics either way.
 #     try:
-#         connection.process_data_events(time_limit=0)
-#     except Exception as flush_err:
-#         log.warning("[Job %s]  ACK flush warning (non-fatal): %s", job_id, flush_err)
-#     log.info("[Job %s]  Message acknowledged and ACK flushed.", job_id)
+#         resource_manager.emergency_cleanup(
+#             reason=f"child process crashed, exitcode={process.exitcode}",
+#         )
+#     except Exception:
+#         log.error("[Job %s]  emergency_cleanup() failed:\n%s",
+#                   job_id, traceback.format_exc())
+
+#     failed_videos: Dict[int, str] = {}
+#     video_results = []
+#     crash_reason = (
+#         f"Worker process crashed (exitcode={process.exitcode}) — "
+#         "video was not processed."
+#     )
+#     for idx, vj in enumerate(ordered):
+#         if vj.video_id in completed_ids and completed_ids[vj.video_id] and \
+#                 vj.video_id in partial_results:
+#             # This video finished successfully before the crash AND we
+#             # have its real result snapshot (analyzer.py's
+#             # _build_partial_video_result, carried on the video_done
+#             # event) — preserve it as a genuine success rather than
+#             # discarding it. It is NOT added to failed_videos and NOT
+#             # reported to /failed; the journey-level outcome is decided
+#             # by the caller based on succeeded vs. failed counts, and
+#             # will resolve to COMPLETED_WITH_ERRORS (never FAILED) as
+#             # long as at least one video succeeded.
+#             try:
+#                 video_results.append(_video_result_from_dict(partial_results[vj.video_id]))
+#                 continue
+#             except Exception as exc:
+#                 log.error(
+#                     "[Job %s]  Failed to rebuild VideoResult from crash-"
+#                     "recovery snapshot for video_id=%d (%s) — falling back "
+#                     "to marking it failed.", job_id, vj.video_id, exc,
+#                 )
+#                 # fall through to the failure-marking branches below
+
+#         if vj.video_id in reported_ids:
+#             # Already individually reported above (either a normal
+#             # per-video failure, or already synthesized in a prior pass).
+#             continue
+#         if vj.video_id in completed_ids and completed_ids[vj.video_id]:
+#             # This video finished successfully before the crash, but no
+#             # result snapshot is available (e.g. analyzer.py couldn't
+#             # build one, or the event never reached us) — we cannot
+#             # fabricate violation data, so we still must surface it
+#             # truthfully: mark it failed too, with a distinct reason, so
+#             # Spring Boot doesn't silently lose a video's results.
+#             msg = (
+#                 "Processed successfully but worker crashed before journey "
+#                 "results could be finalized (exitcode="
+#                 f"{process.exitcode}); re-run required."
+#             )
+#             failed_videos[vj.video_id] = msg
+#             detail_by_id[vj.video_id] = {
+#                 "errorType": "RESOURCE_EXHAUSTION", "reason": None,
+#             }
+#             _report_failure_immediately(vj.video_id, msg, "RESOURCE_EXHAUSTION",
+#                                           None, None)
+#         else:
+#             # Never started, or started but the crash happened mid-video —
+#             # this is the "remaining videos" case from the bug report —
+#             # report it as NOT_PROCESSED / resource exhaustion, immediately.
+#             reason_msg = "Not Processed - Worker Resource Exhaustion"
+#             failed_videos[vj.video_id] = crash_reason
+#             detail_by_id[vj.video_id] = {
+#                 "errorType": "NOT_PROCESSED", "reason": reason_msg,
+#             }
+#             _report_failure_immediately(vj.video_id, crash_reason,
+#                                           "NOT_PROCESSED", None, reason_msg)
+
+#     return video_results, time.time() - start_time, failed_videos, detail_by_id
+
+
+# # ── Fatal-interruption finalization (partial-journey recovery) ────────────
+# #
+# # Called from _handle_job's outer exception handler when a fatal
+# # interruption (unexpected exception, KeyboardInterrupt, etc.) strikes
+# # AFTER at least one video has already been processed successfully by
+# # `_run_journey_supervised`. Per spec we must NOT call the failed
+# # callback in this case — instead we mark every still-unprocessed video
+# # as failed, wait up to RECOVERY_WAIT_SECONDS while retrying the
+# # completion callback, and let the caller ACK the message either way so
+# # the worker can move on to the next queued journey.
+# def _send_completed_with_recovery(completion_dict: dict, job_id: str) -> bool:
+#     """
+#     Sends the COMPLETED_WITH_ERRORS completion callback, retrying for up
+#     to RECOVERY_WAIT_SECONDS if the first attempt fails (e.g. the same
+#     transient condition that interrupted the journey — connection loss,
+#     broker hiccup — may still be resolving). Never re-processes any
+#     video; only retries delivering the already-final payload.
+
+#     Returns True if the callback was eventually delivered, False if the
+#     recovery window was exhausted without success (the journey's partial
+#     results are still preserved locally via the uploaded text log either
+#     way — see build_journey_log_text()/upload_text_log() in _handle_job).
+#     """
+#     deadline = time.time() + RECOVERY_WAIT_SECONDS
+#     attempt  = 0
+#     while True:
+#         attempt += 1
+#         try:
+#             send_completed(completion_dict)
+#             log.info(
+#                 "[Job %s]  COMPLETED_WITH_ERRORS callback delivered on "
+#                 "attempt %d after fatal interruption.", job_id, attempt,
+#             )
+#             return True
+#         except Exception as exc:
+#             remaining = deadline - time.time()
+#             if remaining <= 0:
+#                 log.error(
+#                     "[Job %s]  Could not deliver COMPLETED_WITH_ERRORS "
+#                     "callback within the %ds recovery window (%d attempts): "
+#                     "%s — giving up; partial results remain preserved in "
+#                     "the uploaded text log.", job_id, RECOVERY_WAIT_SECONDS,
+#                     attempt, exc,
+#                 )
+#                 return False
+#             wait_s = min(RECOVERY_RETRY_SECONDS, remaining)
+#             log.warning(
+#                 "[Job %s]  COMPLETED_WITH_ERRORS callback attempt %d "
+#                 "failed (%s) — retrying in %.0fs (recovery window "
+#                 "remaining %.0fs).", job_id, attempt, exc, wait_s, remaining,
+#             )
+#             time.sleep(wait_s)
+
+
+# def _finalize_partial_journey_on_interruption(
+#     *,
+#     job_id: str,
+#     journey_id: int,
+#     train_detail_id: int,
+#     folder_name: str,
+#     msg_videos: list,
+#     video_results: list,
+#     failed_videos: Dict[int, str],
+#     video_error_details: Dict[int, dict],
+#     wall_seconds: float,
+#     job_started_at: datetime,
+#     interruption_reason: str,
+# ) -> None:
+#     """
+#     Builds and sends the COMPLETED_WITH_ERRORS payload after a fatal
+#     interruption that hit a journey with at least one already-succeeded
+#     video. Marks every video that is neither in video_results nor already
+#     in failed_videos as failed (reason: fatal interruption), uploads the
+#     text log (so results are preserved even if the callback ultimately
+#     can't be delivered), and attempts the completion callback with a
+#     bounded recovery window.
+#     """
+#     succeeded_ids = {vr.video_id for vr in video_results}
+#     accounted_ids = succeeded_ids | set(failed_videos.keys())
+
+#     for vj in msg_videos:
+#         if vj.video_id in accounted_ids:
+#             continue
+#         msg = (
+#             f"Not Processed - Fatal Interruption ({interruption_reason}) — "
+#             "journey was interrupted before this video could be processed."
+#         )
+#         failed_videos[vj.video_id] = msg
+#         video_error_details[vj.video_id] = {
+#             "errorType": "NOT_PROCESSED",
+#             "reason":    "Not Processed - Fatal Interruption",
+#         }
+#         try:
+#             send_video_failed(
+#                 job_id        = job_id,
+#                 journey_id    = journey_id,
+#                 video_id      = vj.video_id,
+#                 error_type    = "NOT_PROCESSED",
+#                 error_message = msg,
+#                 stack_trace   = "",
+#                 reason        = "Not Processed - Fatal Interruption",
+#             )
+#         except Exception as exc:
+#             log.error("[Job %s]  send_video_failed failed for video=%d "
+#                       "during interruption finalization: %s",
+#                       job_id, vj.video_id, exc)
+
+#     failed_ids = set(failed_videos.keys())
+#     journey_status = compute_journey_status(
+#         total_videos        = len(msg_videos),
+#         succeeded_video_ids = succeeded_ids,
+#         failed_video_ids    = failed_ids,
+#     )
+#     # By construction at least one video succeeded, so this should always
+#     # resolve to COMPLETED_WITH_ERRORS (or COMPLETED, if the interruption
+#     # struck after the very last video already succeeded) — never FAILED.
+#     if journey_status == "FAILED":
+#         journey_status = "COMPLETED_WITH_ERRORS"
+
+#     log.warning(
+#         "[Job %s]  Finalizing partial journey after fatal interruption "
+#         "(%s).  succeeded=%d  failed=%d  status=%s",
+#         job_id, interruption_reason, len(succeeded_ids), len(failed_ids),
+#         journey_status,
+#     )
+
+#     try:
+#         log_text = build_journey_log_text(
+#             job_id              = job_id,
+#             journey_id          = journey_id,
+#             video_results       = video_results,
+#             total_wall_seconds  = wall_seconds,
+#             started_at          = job_started_at,
+#             failed_videos       = failed_videos,
+#             video_error_details = video_error_details,
+#             journey_status      = journey_status,
+#         )
+#         upload_text_log(
+#             text        = log_text,
+#             folder_name = folder_name,
+#             filename    = f"{job_id}.txt",
+#         )
+#         log.info("[Job %s]  Text log uploaded to S3 (partial-journey path).",
+#                  job_id)
+#     except Exception as log_exc:
+#         log.warning("[Job %s]  Text log build/upload failed (non-fatal): %s",
+#                     job_id, log_exc)
+
+#     processing_time_ms = int(wall_seconds * 1000)
+#     completion = CompletionPayload(
+#         job_id          = job_id,
+#         journey_id      = journey_id,
+#         train_detail_id = train_detail_id,
+#         folder_name     = folder_name,
+#         processing_time = processing_time_ms,
+#         video_results   = video_results,
+#     )
+#     completion_dict = completion.to_dict()
+#     completion_dict["journeyStatus"] = journey_status
+
+#     # Notify the frontend of progress/status before the final callback too,
+#     # best-effort — mirrors the normal-path "Sending results to backend"
+#     # progress update so the UI doesn't appear stuck at whatever percentage
+#     # it was at when the interruption happened.
+#     try:
+#         send_progress(
+#             job_id, journey_id, 95,
+#             f"Recovering from interruption — status {journey_status}",
+#             current_video=len(msg_videos),
+#         )
+#     except Exception as exc:
+#         log.warning("[Job %s]  progress callback failed (non-fatal): %s",
+#                     job_id, exc)
+
+#     _send_completed_with_recovery(completion_dict, job_id)
 
 
 # # ── Job handler ───────────────────────────────────────────────────────────────
@@ -1973,6 +1818,7 @@
 #     channel,
 #     method,
 #     connection,
+#     pika_lock: threading.Lock,
 # ) -> None:
 #     """
 #     Full processing flow for one AnalysisJobMessage.
@@ -1983,6 +1829,7 @@
 #     train_detail_id = msg.train_detail_id
 #     folder_name     = msg.folder_name
 #     tmp_paths: Dict[int, str] = {}
+#     job_started_at  = datetime.now()
 
 #     log.info(
 #         "[Job %s]  journey=%d  trainDetail=%d  videos=%d  folder=%s  redelivered=%s",
@@ -2001,117 +1848,272 @@
 #                 "[Job %s]  Already completed (redelivered=%s) — ACKing and skipping.",
 #                 job_id, method.redelivered,
 #             )
-#             _ack_and_flush(channel, connection, method.delivery_tag, job_id)
+#             _ack_and_flush(channel, connection, pika_lock,
+#                            method.delivery_tag, job_id)
 #             return
 #     except Exception as idem_err:
 #         log.warning(
-#             "[Job %s]  Idempotency check failed (%s) — proceeding with processing.",
+#             "[Job %s]  Idempotency check failed (%s) — proceeding.",
 #             job_id, idem_err,
 #         )
 
-#     # ── FIX — Issue #1b: start call_later heartbeat before blocking work ──────
-#     # pipeline.run() will block the main thread for the full video duration.
-#     # Register a recurring call_later callback so pika's I/O loop is poked
-#     # every HEARTBEAT_POLL_INTERVAL seconds even while the main thread is busy.
-#     # stop_flag[0] is set to True after the job finishes to cancel reschedules.
-#     stop_flag = [False]
-#     connection.call_later(
-#         HEARTBEAT_POLL_INTERVAL,
-#         lambda: _schedule_heartbeat(connection, job_id, stop_flag),
-#     )
-#     log.info(
-#         "[Job %s]  call_later heartbeat scheduled (every %ds).",
-#         job_id, HEARTBEAT_POLL_INTERVAL,
-#     )
+#     # ── Start keepalive — covers download + analysis + callback ───────────────
+#     # FIX: keepalive starts HERE, before downloads, because the download phase
+#     # can take several minutes and will starve pika's heartbeat just as badly
+#     # as the analysis phase.  The thread is stopped after send_completed()
+#     # returns, just before basic_ack().
+#     with _JobKeepalive(connection, pika_lock, job_id):
+#         job_failed = False
 
-#     try:
-#         # ── Step 2: Download all videos from S3 ──────────────────────────────
-#         log.info("[Job %s]  Downloading %d video(s)...", job_id, len(msg.videos))
-#         send_progress(job_id, journey_id, 5, "Downloading videos")
+#         # Mutable state visible to the outer except block, so a fatal
+#         # interruption at ANY point after _run_journey_supervised has
+#         # returned at least one successful video can be finalized as
+#         # COMPLETED_WITH_ERRORS instead of FAILED.
+#         video_results:       list            = []
+#         failed_videos:       Dict[int, str]  = {}
+#         video_error_details: Dict[int, dict] = {}
+#         wall_seconds:        float           = 0.0
 
-#         for vj in sorted(msg.videos, key=lambda v: v.sequence_no):
-#             suffix   = os.path.splitext(vj.s3_key)[1] or ".mp4"
-#             fd, path = tempfile.mkstemp(suffix=suffix)
-#             os.close(fd)
-#             download_video(vj.s3_key, path)
-#             tmp_paths[vj.video_id] = path
-#             log.info(
-#                 "[Job %s]  Downloaded video_id=%d  seq=%d  → %s",
-#                 job_id, vj.video_id, vj.sequence_no, path,
-#             )
+#         try:
+#             # ── Step 2: Download all videos from S3 ──────────────────────────
+#             log.info("[Job %s]  Downloading %d video(s)...",
+#                      job_id, len(msg.videos))
+#             send_progress(job_id, journey_id, 5, "Downloading videos")
 
-#         # ── Step 3: Progress callback after download ──────────────────────────
-#         send_progress(
-#             job_id, journey_id, 10,
-#             "Downloads complete — starting analysis",
-#             current_video=1,
-#         )
-
-#         # ── Steps 4–7: Analyse + upload frames + build results ────────────────
-#         def _progress(pct: int, message: str, current_video: int = 1) -> None:
-#             try:
-#                 send_progress(job_id, journey_id, pct, message,
-#                               current_video=current_video)
-#             except Exception as exc:
-#                 log.warning(
-#                     "[Job %s]  progress callback failed (non-fatal): %s", job_id, exc
+#             for vj in sorted(msg.videos, key=lambda v: v.sequence_no):
+#                 suffix   = os.path.splitext(vj.s3_key)[1] or ".mp4"
+#                 fd, path = tempfile.mkstemp(suffix=suffix)
+#                 os.close(fd)
+#                 download_video(vj.s3_key, path)
+#                 tmp_paths[vj.video_id] = path
+#                 log.info(
+#                     "[Job %s]  Downloaded video_id=%d  seq=%d  → %s",
+#                     job_id, vj.video_id, vj.sequence_no, path,
 #                 )
 
-#         video_results, wall_seconds = analyze_journey(
-#             job_id            = job_id,
-#             journey_id        = journey_id,
-#             folder_name       = folder_name,
-#             video_jobs        = msg.videos,
-#             tmp_paths         = tmp_paths,
-#             progress_cb       = _progress,
-#             rabbit_connection = connection,
-#         )
+#             # ── Step 3: Progress after download ──────────────────────────────
+#             try:
+#                 send_progress(
+#                 job_id, journey_id, 10,
+#                 "Downloads complete — starting analysis",
+#                 current_video=1,
+#             )
+#             except Exception as exc:
+#                 log.warning("[Job %s]  progress(10) callback failed (non-fatal): %s",
+#                             job_id, exc)
 
-#         # ── Step 8: Calculate processing time (ms) ────────────────────────────
-#         processing_time_ms = int(wall_seconds * 1000)
-#         log.info(
-#             "[Job %s]  Analysis complete.  videos=%d  violations=%d  time=%dms",
-#             job_id,
-#             len(video_results),
-#             sum(len(vr.violations) for vr in video_results),
-#             processing_time_ms,
-#         )
+#             # ── Steps 4–7: Analyse + upload frames + build results ────────────
+#             def _progress(pct: int, message: str, current_video: int = 1) -> None:
+#                 try:
+#                     send_progress(job_id, journey_id, pct, message,
+#                                   current_video=current_video)
+#                 except Exception as exc:
+#                     log.warning(
+#                         "[Job %s]  progress callback failed (non-fatal): %s",
+#                         job_id, exc,
+#                     )
 
-#         # ── Step 9: Send completion callback ──────────────────────────────────
-#         send_progress(
-#             job_id, journey_id, 95,
-#             "Sending results to backend",
-#             current_video=len(msg.videos),
-#         )
+#             # NOTE: _run_journey_supervised already isolates native crashes,
+#             # OOM, and per-journey timeouts inside the child process and
+#             # NEVER lets those abort this call — it always returns a
+#             # (video_results, wall_seconds, failed_videos, video_error_details)
+#             # tuple for those cases (see its "Abnormal exit" branch above).
+#             # Assigning straight into the outer-scope variables means that
+#             # if a fatal interruption happens in any step AFTER this call
+#             # (text log build, callback send, etc.), the outer except block
+#             # below still has the correct partial results to work with.
+#             (video_results, wall_seconds,
+#              failed_videos, video_error_details) = _run_journey_supervised(
+#                 job_id      = job_id,
+#                 journey_id  = journey_id,
+#                 folder_name = folder_name,
+#                 video_jobs  = msg.videos,
+#                 tmp_paths   = tmp_paths,
+#                 progress_cb = _progress,
+#             )
 
-#         completion = CompletionPayload(
-#             job_id          = job_id,
-#             journey_id      = journey_id,
-#             train_detail_id = train_detail_id,
-#             folder_name     = folder_name,
-#             processing_time = processing_time_ms,
-#             video_results   = video_results,
-#         )
-#         send_completed(completion.to_dict())
-#         log.info("[Job %s]  Completion callback sent.", job_id)
+#             # ── Step 8: Calculate processing time (ms) ────────────────────────
+#             processing_time_ms = int(wall_seconds * 1000)
 
-#         # ── Step 10: ACK + flush ──────────────────────────────────────────────
-#         _ack_and_flush(channel, connection, method.delivery_tag, job_id)
+#             succeeded_ids = {vr.video_id for vr in video_results
+#                               if vr.video_id not in failed_videos}
+#             failed_ids    = set(failed_videos.keys())
+#             journey_status = compute_journey_status(
+#                 total_videos         = len(msg.videos),
+#                 succeeded_video_ids  = succeeded_ids,
+#                 failed_video_ids     = failed_ids,
+#             )
 
-#     except Exception as exc:
-#         err_detail = traceback.format_exc()
-#         log.error("[Job %s]  FAILED:\n%s", job_id, err_detail)
+#             log.info(
+#                 "[Job %s]  Analysis complete.  videos=%d  violations=%d  time=%dms  "
+#                 "failed=%d  status=%s",
+#                 job_id,
+#                 len(video_results),
+#                 sum(len(vr.violations) for vr in video_results),
+#                 processing_time_ms,
+#                 len(failed_videos),
+#                 journey_status,
+#             )
 
-#         send_failed(job_id, journey_id, f"{exc}\n\n{err_detail}")
+#             # ── Step 8b: Build and upload the .txt analysis log ───────────────
+#             # Built for EVERY outcome now (COMPLETED, COMPLETED_WITH_ERRORS,
+#             # and FAILED-with-partial-results) — not just full success — so
+#             # the log always reflects which videos actually failed and why.
+#             # Written to the same dynamic journey folder used for frames:
+#             # <folderName>/<jobId>.txt
+#             try:
+#                 log_text = build_journey_log_text(
+#                     job_id              = job_id,
+#                     journey_id          = journey_id,
+#                     video_results       = video_results,
+#                     total_wall_seconds  = wall_seconds,
+#                     started_at          = job_started_at,
+#                     failed_videos       = failed_videos,
+#                     video_error_details = video_error_details,
+#                     journey_status      = journey_status,
+#                 )
+#                 upload_text_log(
+#                     text        = log_text,
+#                     folder_name = folder_name,
+#                     filename    = f"{job_id}.txt",
+#                 )
+#                 log.info("[Job %s]  Text log uploaded to S3.", job_id)
+#             except Exception as log_exc:
+#                 log.warning(
+#                     "[Job %s]  Text log build/upload failed (non-fatal): %s",
+#                     job_id, log_exc,
+#                 )
 
-#         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-#         log.warning("[Job %s]  Message nacked (no requeue).", job_id)
+#             # ── Step 9: Send completion OR failed callback ─────────────────────
+#             # Per-video failures were ALREADY reported individually and
+#             # immediately inside _run_journey_supervised (Phase 1 requirement
+#             # — no video waits until journey end to be reported). This step
+#             # decides the JOURNEY-level outcome:
+#             #
+#             #   COMPLETED              → send_completed with all video_results.
+#             #   COMPLETED_WITH_ERRORS  → still send_completed (the journey DID
+#             #                            finish — some videos succeeded and
+#             #                            their results are real); per-video
+#             #                            failures are already on record via
+#             #                            the immediate /failed calls above.
+#             #   FAILED                 → every video failed (or none ran) —
+#             #                            send one journey-level /failed call
+#             #                            summarizing it, no /completed call.
+#             if journey_status == "FAILED":
+#                 error_message = "; ".join(
+#                     f"video_id={vid}: {msg_}" for vid, msg_ in failed_videos.items()
+#                 ) or "Journey failed before any video could be processed."
+#                 log.error(
+#                     "[Job %s]  Journey FAILED — all %d video(s) failed: %s",
+#                     job_id, len(failed_videos), error_message,
+#                 )
+#                 send_failed(job_id, journey_id, error_message)
+#                 log.info("[Job %s]  Journey-level failed callback sent.", job_id)
+#             else:
+#                 send_progress(
+#                     job_id, journey_id, 95,
+#                     "Sending results to backend",
+#                     current_video=len(msg.videos),
+#                 )
+#                 completion = CompletionPayload(
+#                     job_id          = job_id,
+#                     journey_id      = journey_id,
+#                     train_detail_id = train_detail_id,
+#                     folder_name     = folder_name,
+#                     processing_time = processing_time_ms,
+#                     video_results   = video_results,
+#                 )
+#                 completion_dict = completion.to_dict()
+#                 completion_dict["journeyStatus"] = journey_status
+#                 send_completed(completion_dict)
+#                 log.info(
+#                     "[Job %s]  Completion callback sent.  status=%s  failedVideos=%d",
+#                     job_id, journey_status, len(failed_videos),
+#                 )
 
-#     finally:
-#         # Cancel the call_later heartbeat — no more reschedules needed.
-#         stop_flag[0] = True
-#         log.info("[Job %s]  call_later heartbeat cancelled.", job_id)
-#         _cleanup(tmp_paths)
+#         except BaseException as exc:
+#             # BaseException (not just Exception) so that fatal interruptions
+#             # such as KeyboardInterrupt (Ctrl+C) and SystemExit are handled
+#             # by the same partial-results-preserving logic as any other
+#             # unexpected error, instead of skipping cleanup/finalization.
+#             err_detail = traceback.format_exc()
+#             log.error("[Job %s]  FATAL INTERRUPTION:\n%s", job_id, err_detail)
+
+#             # ── Resource lifecycle (Phase 6): release resources on any
+#             # journey-level failure that isn't already covered by the
+#             # subprocess-crash path (e.g. S3 download failure, an exception
+#             # raised while building/uploading the text log, or a callback
+#             # failure that propagated up instead of being caught locally).
+#             try:
+#                 resource_manager.cleanup_after_failure(
+#                     job_id=job_id, reason=f"{type(exc).__name__}: {exc}",
+#                 )
+#             except Exception:
+#                 log.error("[Job %s]  cleanup_after_failure() failed:\n%s",
+#                           job_id, traceback.format_exc())
+
+#             if video_results:
+#                 # ── At least one video already succeeded: do NOT call the
+#                 # failed callback. Preserve the successful results, mark the
+#                 # rest as failed, and finalize as COMPLETED_WITH_ERRORS
+#                 # (with a bounded recovery/retry window for the callback).
+#                 job_failed = False
+#                 try:
+#                     _finalize_partial_journey_on_interruption(
+#                         job_id               = job_id,
+#                         journey_id           = journey_id,
+#                         train_detail_id      = train_detail_id,
+#                         folder_name          = folder_name,
+#                         msg_videos           = msg.videos,
+#                         video_results        = video_results,
+#                         failed_videos        = failed_videos,
+#                         video_error_details  = video_error_details,
+#                         wall_seconds         = wall_seconds,
+#                         job_started_at       = job_started_at,
+#                         interruption_reason  = f"{type(exc).__name__}: {exc}",
+#                     )
+#                 except Exception as finalize_exc:
+#                     # Even the recovery path itself failed unexpectedly —
+#                     # this is the only case where we still fall back to the
+#                     # failed callback, since we genuinely could not finalize
+#                     # the partial results any other way.
+#                     log.error(
+#                         "[Job %s]  Partial-journey finalization itself "
+#                         "failed: %s — falling back to failed callback.",
+#                         job_id, finalize_exc,
+#                     )
+#                     job_failed = True
+#                     try:
+#                         send_failed(job_id, journey_id,
+#                                     f"{exc}\n\n{err_detail}\n\n"
+#                                     f"(partial-finalization also failed: {finalize_exc})")
+#                     except Exception as sf_exc:
+#                         log.warning("[Job %s]  send_failed itself failed: %s",
+#                                     job_id, sf_exc)
+#             else:
+#                 # ── Zero videos succeeded — existing FAILED-callback path. ──
+#                 job_failed = True
+#                 try:
+#                     send_failed(job_id, journey_id, f"{exc}\n\n{err_detail}")
+#                 except Exception as sf_exc:
+#                     log.warning("[Job %s]  send_failed itself failed: %s",
+#                                 job_id, sf_exc)
+#         finally:
+#             # Always release temp files / resources, on every path: clean
+#             # success, FAILED, COMPLETED_WITH_ERRORS, or a still-failing
+#             # finalization attempt.
+#             _cleanup(tmp_paths)
+
+#     # ── Keepalive stopped here — safe to call pika ────────────────────────────
+#     if job_failed:
+#         _nack(channel, pika_lock, method.delivery_tag, job_id)
+#     else:
+#         # ── Step 10: ACK ─────────────────────────────────────────────────────
+#         # Also reached for the COMPLETED_WITH_ERRORS-after-interruption path:
+#         # the message is finalized here so the worker moves on to the next
+#         # queued journey, exactly as it does after a normal completion.
+#         _ack_and_flush(channel, connection, pika_lock,
+#                        method.delivery_tag, job_id)
 
 
 # def _cleanup(tmp_paths: Dict[int, str]) -> None:
@@ -2125,52 +2127,84 @@
 
 # # ── RabbitMQ callback ─────────────────────────────────────────────────────────
 
-# def _on_message(channel, method, properties, body, connection) -> None:
+# def _on_message(channel, method, properties, body,
+#                 connection, pika_lock: threading.Lock) -> None:
 #     log.info(
 #         "[RabbitMQ] Message received  delivery_tag=%s  redelivered=%s  body=%s",
 #         method.delivery_tag,
 #         method.redelivered,
 #         body.decode("utf-8", errors="replace")[:500],
 #     )
+#     if method.redelivered:
+#         log.warning(
+#             "[RabbitMQ] ⚠ REDELIVERED MESSAGE (delivery_tag=%s) — this typically means "
+#             "the previous processing attempt was interrupted before ACK. Possible causes: "
+#             "(1) RabbitMQ consumer_timeout fired (broker default 30 min) while the job "
+#             "was still running — fix: raise consumer_timeout on the broker to ≥12 hours; "
+#             "(2) worker process was killed/crashed mid-job. "
+#             "The local idempotency cache will prevent re-processing if this worker "
+#             "already completed the job in this session.",
+#             method.delivery_tag,
+#         )
 #     try:
 #         data = json.loads(body)
 #         msg  = AnalysisJobMessage.from_dict(data)
 #     except Exception as exc:
-#         log.error("Failed to parse RabbitMQ message: %s\nBody: %s", exc, body[:500])
-#         channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+#         log.error("Failed to parse RabbitMQ message: %s\nBody: %s",
+#                   exc, body[:500])
+#         with pika_lock:
+#             channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 #         return
 
-#     _handle_job(msg, channel, method, connection)
+#     _handle_job(msg, channel, method, connection, pika_lock)
 
 
 # # ── Consumer connect + consume ────────────────────────────────────────────────
 
 # def _connect_and_consume() -> None:
-#     """
-#     Connect to RabbitMQ and start consuming.
-
-#     FIX — Issue #1a: params.heartbeat is now 60 s (was 1800 s).
-#     pika automatically sends heartbeat frames every 30 s while
-#     start_consuming() is running, which keeps the TCP session alive through
-#     NAT/firewall idle-connection timeouts.
-
-#     Raises on connection failure so the retry loop in start() can catch it.
-#     """
-#     log.info("[Consumer]  Connecting to RabbitMQ: %s  queue=%s", RABBITMQ_URL, QUEUE_NAME)
+#     log.info("[Consumer]  Connecting to RabbitMQ: %s  queue=%s",
+#              RABBITMQ_URL, QUEUE_NAME)
 #     params = pika.URLParameters(RABBITMQ_URL)
-#     # FIX — Issue #1a: short heartbeat so NAT/firewall cannot kill the idle socket.
-#     params.heartbeat                  = HEARTBEAT_INTERVAL   # 60 s default
+#     params.heartbeat                  = HEARTBEAT_INTERVAL   # 60 s
 #     params.blocked_connection_timeout = 300
-#     params.socket_timeout             = 300
+#     # IMPORTANT: Do NOT set socket_timeout here. The default (no timeout) is
+#     # correct for a long-running consumer — a fixed socket_timeout would
+#     # drop the TCP connection after that many idle seconds, which for a
+#     # multi-hour analysis job (20 videos × ~400s = ~2.3 hours) would close
+#     # the socket long before the job finishes. Heartbeats (HEARTBEAT_INTERVAL)
+#     # and the keepalive thread (process_data_events every KEEPALIVE_INTERVAL
+#     # seconds) are sufficient to keep NAT devices and the broker happy.
 #     connection = pika.BlockingConnection(params)
 #     channel    = connection.channel()
 
-#     # Declare exchange + queue + binding (idempotent — safe to call on restart)
+#     # One lock per connection — shared by _handle_job and _JobKeepalive.
+#     pika_lock = threading.Lock()
+
 #     channel.exchange_declare(
 #         exchange      = EXCHANGE_NAME,
 #         exchange_type = "direct",
 #         durable       = True,
 #     )
+
+#     # Declare the queue passively (it must already exist on the broker) but
+#     # log a clear warning if consumer_timeout needs to be raised on the broker.
+#     # RabbitMQ 3.8.15+ enforces a consumer_timeout (default 30 minutes) that
+#     # cancels any consumer that hasn't ACKed a message within that window —
+#     # even if the TCP connection and heartbeats are healthy. For journeys
+#     # longer than 30 min this causes the broker to cancel the consumer,
+#     # requeue the message, and the worker picks it up again as a redelivery.
+#     #
+#     # FIX ON THE BROKER (run once as rabbitmq admin):
+#     #   rabbitmqctl set_policy consumer-timeout \
+#     #     ".*" '{"consumer-timeout": 43200000}' \
+#     #     --apply-to queues
+#     # That sets a 12-hour consumer timeout (43200000 ms) on all queues.
+#     # Alternatively set consumer_timeout = false in rabbitmq.conf to disable it.
+#     #
+#     # The local idempotency cache in callback_client.py (_completed_jobs /
+#     # mark_job_completed) is the WORKER-SIDE guard: if the broker does
+#     # redeliver despite the above, the worker catches it and ACKs immediately
+#     # without re-processing.
 #     channel.queue_declare(queue=QUEUE_NAME, passive=True)
 #     channel.queue_bind(
 #         queue       = QUEUE_NAME,
@@ -2181,14 +2215,16 @@
 #     channel.basic_qos(prefetch_count=PREFETCH_COUNT)
 #     channel.basic_consume(
 #         queue               = QUEUE_NAME,
-#         on_message_callback = partial(_on_message, connection=connection),
+#         on_message_callback = partial(
+#             _on_message, connection=connection, pika_lock=pika_lock
+#         ),
 #     )
 
 #     log.info(
 #         "[Consumer]  Waiting for messages on queue '%s' "
-#         "(exchange='%s', routing='%s')  heartbeat=%ds  poll=%ds...",
+#         "(exchange='%s', routing='%s')  heartbeat=%ds  keepalive=%ds...",
 #         QUEUE_NAME, EXCHANGE_NAME, ROUTING_KEY,
-#         HEARTBEAT_INTERVAL, HEARTBEAT_POLL_INTERVAL,
+#         HEARTBEAT_INTERVAL, KEEPALIVE_INTERVAL,
 #     )
 #     channel.start_consuming()
 
@@ -2196,11 +2232,28 @@
 # # ── Consumer startup with reconnect retry ─────────────────────────────────────
 
 # def start() -> None:
-#     """
-#     Connect to RabbitMQ and start consuming.
-#     Wrapped in a retry loop — if the connection drops, the consumer waits
-#     RECONNECT_DELAY seconds and reconnects automatically.
-#     """
+#     # ── Phase 2: startup recovery — MUST complete before RabbitMQ connects ───
+#     # Runs the full sequence: resource cleanup → GPU cleanup → temp file
+#     # cleanup → stale workspace cleanup → zombie-process detection. No
+#     # consumer.basic_consume() call happens until this returns.
+#     log.info("[Consumer]  Running startup resource cleanup...")
+#     try:
+#         resource_manager.initialize_service()
+#     except Exception:
+#         log.error("[Consumer]  initialize_service() raised — continuing "
+#                   "startup anyway (cleanup failures must never block the "
+#                   "worker from starting):\n%s", traceback.format_exc())
+
+#     # ── Phase 8: background RAM/GPU/thread monitor ───────────────────────────
+#     # Runs continuously for the lifetime of the process, independent of
+#     # per-journey cleanup, so slow leaks across many journeys are caught
+#     # too (not just spikes within a single journey).
+#     try:
+#         memory_monitor.start()
+#     except Exception:
+#         log.error("[Consumer]  memory_monitor.start() failed (non-fatal):\n%s",
+#                   traceback.format_exc())
+
 #     while True:
 #         try:
 #             _connect_and_consume()
@@ -2214,11 +2267,20 @@
 #             )
 #             time.sleep(RECONNECT_DELAY)
 
+#     # ── Graceful shutdown ──────────────────────────────────────────────────────
+#     try:
+#         memory_monitor.stop()
+#     except Exception:
+#         pass
+#     try:
+#         resource_manager.cleanup_on_shutdown()
+#     except Exception:
+#         log.error("[Consumer]  cleanup_on_shutdown() failed:\n%s",
+#                   traceback.format_exc())
+
 
 # if __name__ == "__main__":
 #     start()
-
-
 
 """
 consumer.py
@@ -2300,17 +2362,43 @@ For 40 videos × 15 min
 • Broker heartbeat interval: 60 s → pika sends every 30 s at idle
 • Total job duration: downloads + ~81 min analysis
 • Connection will stay alive for the entire duration ✅
+
+═══════════════════════════════════════════════════════════════════
+FATAL-INTERRUPTION HANDLING (partial-journey recovery)
+═══════════════════════════════════════════════════════════════════
+See `_finalize_on_interruption()` and the restructured exception
+handling in `_handle_job()` below for the policy that governs what
+happens when a fatal interruption (RabbitMQ connection loss, Ctrl+C,
+OpenCV/native crash, OOM, unexpected exception, etc.) hits a journey
+that is already in progress:
+
+  • Zero videos succeeded so far  → existing FAILED-callback path
+    (send_failed + NACK) is unchanged.
+  • One or more videos already succeeded → we do NOT call the failed
+    callback. Instead we wait up to RECOVERY_WAIT_SECONDS (2 min,
+    used as a bounded retry budget for the completion callback),
+    mark every still-unprocessed video as failed, send the
+    COMPLETED_WITH_ERRORS completion callback (which already carries
+    both the successful VideoResults and the failed/unprocessed
+    video details — this is the same payload shape used by the
+    existing subprocess-crash path), and finalize (ACK) the message
+    so the worker moves on to the next queued journey. Resource
+    cleanup (_cleanup(tmp_paths), resource_manager.cleanup_after_failure)
+    still runs unconditionally on this path.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import multiprocessing as mp
 import os
+import queue as _queue
 import tempfile
 import threading
 import time
 import traceback
+from datetime import datetime
 from functools import partial
 from typing import Dict
 
@@ -2318,15 +2406,20 @@ import pika
 from dotenv import load_dotenv
 
 from analyzer import analyze_journey
+from journey_runner import run_journey_in_subprocess
 from callback_client import (
     send_completed,
     send_failed,
+    send_video_failed,
     send_progress,
     set_base_url,
     check_job_completed,
+    compute_journey_status,
 )
-from models import AnalysisJobMessage, CompletionPayload
-from s3_service import download_video
+from models import AnalysisJobMessage, CompletionPayload, VideoResult, ViolationResult
+from s3_service import download_video, upload_text_log
+from journey_log import build_journey_log_text
+from resource_manager import resource_manager, memory_monitor
 
 # ── Config / credentials ──────────────────────────────────────────────────────
 _ENV_PATH = os.path.join(
@@ -2350,6 +2443,68 @@ HEARTBEAT_INTERVAL = int(os.environ.get("RABBITMQ_HEARTBEAT",    "60"))
 # How often the keepalive thread pokes pika during blocking work.
 # Must be < HEARTBEAT_INTERVAL / 2 (i.e. < 30 s).
 KEEPALIVE_INTERVAL = int(os.environ.get("RABBITMQ_KEEPALIVE",    "15"))
+
+# How long (seconds) we are willing to keep retrying the COMPLETED_WITH_ERRORS
+# completion callback after a fatal interruption that struck a journey which
+# already had at least one successfully-processed video. This is a bounded
+# "wait for recovery" window, not a re-run of any video — the videos that
+# already succeeded are never reprocessed.
+RECOVERY_WAIT_SECONDS  = int(os.environ.get("RECOVERY_WAIT_SECONDS",  "120"))
+RECOVERY_RETRY_SECONDS = int(os.environ.get("RECOVERY_RETRY_SECONDS", "5"))
+
+# ── Subprocess isolation config ────────────────────────────────────────────
+# Each journey's analysis runs in its own child process (see journey_runner.py)
+# so a native OpenCV crash (OOM / access violation / segfault) kills only
+# that child — never the consumer process itself, never RabbitMQ's
+# connection, never other in-flight jobs.
+#
+# JOURNEY_TIMEOUT_SECONDS: per-video time budget used to compute each
+# journey's timeout dynamically (see _compute_journey_timeout below), so a
+# 20-video journey isn't held to the same wall-clock ceiling as a 5-video
+# one. If exceeded, the parent treats it the same as a crash (kills the
+# child, marks remaining videos failed, sends send_failed). Prevents a
+# hung/looping child from blocking the worker forever — this is the same
+# "no job stuck in PROCESSING forever" requirement as the frontend timeout,
+# just enforced at the worker level too.
+#
+# Real-world calibration note: a 1280x720@25fps ~43-minute video has been
+# observed taking ~108s of pure model inference plus ~115s of overhead
+# (S3 download, decode setup, violation frame upload) — roughly 220s
+# end-to-end per video of that length. PER_VIDEO_TIMEOUT_SECONDS defaults
+# generously above that observed figure to leave headroom for slower
+# videos/hardware without being so loose it stops catching real hangs.
+PER_VIDEO_TIMEOUT_SECONDS = float(os.environ.get("PER_VIDEO_TIMEOUT_SECONDS", "420"))
+
+# Fixed overhead added once per journey on top of the per-video budget —
+# covers model load (first video in the process), RabbitMQ/S3 connection
+# setup, and journey-level finalization (dedup, text log build/upload)
+# that happens after the last video.
+JOURNEY_TIMEOUT_BASE_SECONDS = float(os.environ.get("JOURNEY_TIMEOUT_BASE_SECONDS", "300"))
+
+# Floor — even a 1-video journey gets at least this much time. Also acts
+# as the old fixed-timeout behavior for anyone who still sets
+# JOURNEY_TIMEOUT_SECONDS explicitly (kept for backward-compatible env
+# overriding; if set, it becomes the floor rather than a hard fixed value).
+JOURNEY_TIMEOUT_SECONDS = int(os.environ.get("JOURNEY_TIMEOUT_SECONDS", "3600"))
+
+
+def _compute_journey_timeout(n_videos: int) -> float:
+    """
+    Scaled per-journey timeout: base overhead + (per-video budget × video
+    count), with JOURNEY_TIMEOUT_SECONDS as a floor so small journeys keep
+    at least the previous fixed protection window. A genuinely hung
+    process is still caught — it just has to actually exceed a budget
+    sized for the ACTUAL number of videos in this journey, not an
+    arbitrary fixed number picked for a smaller test batch.
+    """
+    scaled = JOURNEY_TIMEOUT_BASE_SECONDS + (PER_VIDEO_TIMEOUT_SECONDS * max(n_videos, 1))
+    return max(scaled, JOURNEY_TIMEOUT_SECONDS)
+
+# How often the parent polls the child's events_q for per-video progress
+# while waiting for it to finish (also doubles as the keepalive cadence
+# check — process_data_events still only happens on the separate keepalive
+# thread, this loop just drains progress events).
+EVENTS_POLL_INTERVAL_SECONDS = float(os.environ.get("EVENTS_POLL_INTERVAL_SECONDS", "1.0"))
 
 logging.basicConfig(
     level  = logging.INFO,
@@ -2433,6 +2588,10 @@ class _JobKeepalive:
 def _ack_and_flush(channel, connection, pika_lock: threading.Lock,
                    delivery_tag: int, job_id: str) -> None:
     """ACK the message. Called only after keepalive thread has stopped."""
+    # Record completion BEFORE ACKing — if ACK fails the message is requeued
+    # and the local cache will catch the redelivery on the next attempt.
+    from callback_client import mark_job_completed
+    mark_job_completed(job_id)
     with pika_lock:
         channel.basic_ack(delivery_tag=delivery_tag)
         try:
@@ -2454,6 +2613,539 @@ def _nack(channel, pika_lock: threading.Lock,
     log.warning("[Job %s]  Message nacked (no requeue).", job_id)
 
 
+def _video_result_from_dict(vr: dict) -> VideoResult:
+    """Builds a VideoResult from the dict shape used both by the
+    subprocess's clean-completion payload (result_q "result" type) and by
+    the per-video crash-recovery snapshot (analyzer.py's
+    _build_partial_video_result, carried on video_done events)."""
+    return VideoResult(
+        video_id           = vr["videoId"] if isinstance(vr.get("videoId"), int) else int(vr["videoId"]),
+        video_name         = vr["videoName"],
+        sequence_no        = vr["sequenceNo"],
+        duration_seconds   = vr["durationSeconds"],
+        duration_formatted = vr.get("durationFormatted", ""),
+        fps                = vr.get("fps", 0.0),
+        size_mb            = vr.get("sizeMb", 0.0),
+        original_s3_key    = vr["originalS3Key"],
+        violations         = [
+            ViolationResult(
+                violation_type           = v["violationType"],
+                severity                 = v["severity"],
+                confidence               = v["confidence"],
+                risk_score               = v["riskScore"],
+                timestamp_seconds        = v["timestamp"],
+                original_video_timestamp = v["originalVideoTimestamp"],
+                frame_paths              = v.get("framePaths", []),
+            )
+            for v in vr.get("violations", [])
+        ],
+    )
+
+
+# ── Subprocess-supervised journey execution ────────────────────────────────
+#
+# Replaces a direct in-process call to analyze_journey() with a supervised
+# child process. This is the fix for the failure mode where a native
+# OpenCV OOM / access violation / segfault kills the ENTIRE worker process
+# (RabbitMQ connection thread included) partway through a journey, leaving
+# the remaining videos in that journey permanently unprocessed and the
+# job stuck — because no Python `except` clause can run after a native
+# crash kills the interpreter.
+#
+# With this in place: the child process is the one that dies. The parent
+# (this function) detects the death via process.exitcode after join(),
+# and — using the per-video "done" events the child streamed before it
+# died — marks every video that never reported completion as failed too,
+# then returns a failed_videos dict covering ALL of them (the one that
+# actually crashed AND any after it that never got a chance to run).
+def _run_journey_supervised(
+    job_id:      str,
+    journey_id:  int,
+    folder_name: str,
+    video_jobs:  list,
+    tmp_paths:   Dict[int, str],
+    progress_cb,
+):
+    """
+    Returns (video_results, wall_seconds, failed_videos, video_error_details)
+    — failed_videos/video_error_details have the same shape analyze_journey()
+    produces, plus this function ALSO calls send_video_failed() immediately
+    for every video as its failure becomes known (Phase 1 requirement: "no
+    failed video should wait until journey completion to be reported") —
+    runs the actual work in an isolated child process so a native crash
+    can't take down the consumer.
+    """
+    ctx       = mp.get_context("spawn")
+    events_q  = ctx.Queue()
+    result_q  = ctx.Queue()
+
+    process = ctx.Process(
+        target = run_journey_in_subprocess,
+        args   = (job_id, journey_id, folder_name, video_jobs, tmp_paths,
+                  events_q, result_q),
+        name   = f"Journey-{job_id}",
+        daemon = True,
+    )
+    process.start()
+    log.info("[Job %s]  Journey subprocess started  pid=%s", job_id, process.pid)
+
+    ordered    = sorted(video_jobs, key=lambda v: v.sequence_no)
+    n_videos   = len(ordered)
+    completed_ids: Dict[int, bool] = {}      # video_id -> ok
+    error_by_id:   Dict[int, str]  = {}       # video_id -> error message
+    detail_by_id:  Dict[int, dict] = {}       # video_id -> {"errorType","reason"}
+    reported_ids:  set            = set()     # video_ids already sent to /failed
+    # Best-effort per-video VideoResult snapshots (dict shape — see
+    # analyzer.py's _build_partial_video_result), captured the moment each
+    # video succeeds. If the child process then dies abnormally (native
+    # crash/OOM/segfault) before it can send the final result_q payload,
+    # these snapshots let us PRESERVE the already-succeeded videos' real
+    # data instead of discarding it and marking them failed too.
+    partial_results: Dict[int, dict] = {}
+    start_time = time.time()
+
+    journey_timeout = _compute_journey_timeout(n_videos)
+    log.info(
+        "[Job %s]  Journey timeout budget: %.0fs for %d video(s) "
+        "(base=%.0fs + %.0fs/video)", job_id, journey_timeout, n_videos,
+        JOURNEY_TIMEOUT_BASE_SECONDS, PER_VIDEO_TIMEOUT_SECONDS,
+    )
+
+    def _report_failure_immediately(vid: int, error_message: str,
+                                      error_type: str | None,
+                                      stack_trace: str | None,
+                                      reason: str | None) -> None:
+        """Calls the failed endpoint for one video, exactly once."""
+        if vid in reported_ids:
+            return
+        reported_ids.add(vid)
+        try:
+            send_video_failed(
+                job_id        = job_id,
+                journey_id    = journey_id,
+                video_id      = vid,
+                error_type    = error_type or "PROCESSING_ERROR",
+                error_message = error_message,
+                stack_trace   = stack_trace or "",
+                reason        = reason,
+            )
+        except Exception as exc:
+            log.error("[Job %s]  send_video_failed failed for video=%d: %s",
+                       job_id, vid, exc)
+
+    def _handle_video_done_event(ev: dict) -> None:
+        """Shared per-event handling, used by every drain site (the
+        polling loop, the post-exit final drain, AND the new interrupt-
+        triggered drain below) so a parent-side interruption never skips
+        this bookkeeping the way it used to."""
+        if ev.get("type") != "video_done":
+            return
+        vid = ev["video_id"]
+        ok  = ev.get("ok", False)
+        completed_ids[vid] = ok
+        if ok:
+            snapshot = ev.get("video_result")
+            if snapshot:
+                partial_results[vid] = snapshot
+        if not ok:
+            err = ev.get("error") or "Unknown per-video failure"
+            error_by_id[vid] = err
+            detail_by_id[vid] = {
+                "errorType": ev.get("error_type") or "PROCESSING_ERROR",
+                "reason":    ev.get("reason"),
+            }
+            # ── Phase 1: report THIS video as FAILED right now ─────
+            _report_failure_immediately(
+                vid, err, ev.get("error_type"), ev.get("stack_trace"),
+                ev.get("reason"),
+            )
+
+    def _drain_events_once() -> None:
+        """Non-blocking drain of whatever is currently sitting on
+        events_q. Used for the interrupt-recovery final drain below."""
+        while True:
+            try:
+                ev = events_q.get_nowait()
+            except _queue.Empty:
+                break
+            _handle_video_done_event(ev)
+
+    def _finalize_abnormal(label: str, crash_reason: str):
+        """Shared finalization for BOTH a crashed/timed-out child AND a
+        parent-side interruption (Ctrl+C, KeyboardInterrupt, RabbitMQ
+        connection loss, any unexpected exception) while the parent was
+        waiting on the child. Preserves real VideoResult data for any
+        video whose success snapshot already arrived on events_q, and
+        marks only the genuinely-unfinished videos as failed/not-processed
+        — never discards already-completed work."""
+        try:
+            resource_manager.emergency_cleanup(reason=label)
+        except Exception:
+            log.error("[Job %s]  emergency_cleanup() failed:\n%s",
+                      job_id, traceback.format_exc())
+
+        failed_videos: Dict[int, str] = {}
+        video_results = []
+        for vj in ordered:
+            if vj.video_id in completed_ids and completed_ids[vj.video_id] and \
+                    vj.video_id in partial_results:
+                # This video finished successfully AND we have its real
+                # result snapshot (analyzer.py's _build_partial_video_result,
+                # carried on the video_done event) — preserve it as a
+                # genuine success rather than discarding it. NOT added to
+                # failed_videos / not reported to /failed; the journey-level
+                # outcome is decided by the caller based on succeeded vs.
+                # failed counts and will resolve to COMPLETED_WITH_ERRORS
+                # (never FAILED) as long as at least one video succeeded.
+                try:
+                    video_results.append(_video_result_from_dict(partial_results[vj.video_id]))
+                    continue
+                except Exception as exc:
+                    log.error(
+                        "[Job %s]  Failed to rebuild VideoResult from "
+                        "recovery snapshot for video_id=%d (%s) — falling "
+                        "back to marking it failed.", job_id, vj.video_id, exc,
+                    )
+                    # fall through to the failure-marking branches below
+
+            if vj.video_id in reported_ids:
+                # Already individually reported above (either a normal
+                # per-video failure, or already synthesized in a prior pass).
+                continue
+            if vj.video_id in completed_ids and completed_ids[vj.video_id]:
+                # Finished successfully, but no result snapshot is
+                # available — we cannot fabricate violation data, so we
+                # still must surface it truthfully: mark it failed too,
+                # with a distinct reason, so Spring Boot doesn't silently
+                # lose a video's results.
+                msg = (
+                    "Processed successfully but worker was interrupted "
+                    f"before journey results could be finalized ({label}); "
+                    "re-run required."
+                )
+                failed_videos[vj.video_id] = msg
+                detail_by_id[vj.video_id] = {
+                    "errorType": "RESOURCE_EXHAUSTION", "reason": None,
+                }
+                _report_failure_immediately(vj.video_id, msg, "RESOURCE_EXHAUSTION",
+                                              None, None)
+            else:
+                # Never started, or started but the interruption happened
+                # mid-video — report it as NOT_PROCESSED, immediately.
+                reason_msg = "Not Processed - Worker Resource Exhaustion"
+                failed_videos[vj.video_id] = crash_reason
+                detail_by_id[vj.video_id] = {
+                    "errorType": "NOT_PROCESSED", "reason": reason_msg,
+                }
+                _report_failure_immediately(vj.video_id, crash_reason,
+                                              "NOT_PROCESSED", None, reason_msg)
+
+        return video_results, time.time() - start_time, failed_videos, detail_by_id
+
+    # ── Drain events_q while waiting for the child to finish ──────────────
+    #
+    # FIX (parent-side interruption while waiting): this loop used to have
+    # NO try/except of its own — a KeyboardInterrupt (Ctrl+C), a connection-
+    # loss-triggered exception, or any other interruption that landed while
+    # the parent was inside time.sleep()/process.join() here would propagate
+    # straight out of this function, BEFORE the "Abnormal exit" handling
+    # below ever ran. That meant any videos that had already completed (and
+    # whose video_done events were sitting un-drained on events_q) were
+    # silently lost, the journey was reported as if zero videos succeeded,
+    # AND the child process was left running orphaned in the background.
+    #
+    # Now: any interruption here is caught, a final drain collects whatever
+    # the child already finished, the child is terminated cleanly, and we
+    # finalize through the SAME "abnormal exit" logic used for a crashed
+    # child — so already-completed videos are never lost and no process is
+    # left orphaned.
+    try:
+        while True:
+            # Pull any progress events that arrived since the last poll.
+            drained_any = False
+            while True:
+                try:
+                    ev = events_q.get_nowait()
+                except _queue.Empty:
+                    break
+                drained_any = True
+                _handle_video_done_event(ev)
+                if ev.get("type") == "video_done" and progress_cb:
+                    pct = 10 + int((len(completed_ids) / max(n_videos, 1)) * 80)
+                    progress_cb(pct, f"Analyzed video {len(completed_ids)} of {n_videos}",
+                                len(completed_ids))
+
+            process.join(timeout=0.05)
+            if process.exitcode is not None:
+                break
+            if time.time() - start_time > journey_timeout:
+                log.error(
+                    "[Job %s]  Journey subprocess exceeded timeout (%.0fs for "
+                    "%d videos) — terminating.", job_id, journey_timeout, n_videos,
+                )
+                process.terminate()
+                process.join(timeout=10)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+                break
+            if not drained_any:
+                time.sleep(EVENTS_POLL_INTERVAL_SECONDS)
+    except BaseException as exc:
+        # BaseException (not just Exception) so KeyboardInterrupt/SystemExit
+        # are caught here too, per the "any interruption while the parent is
+        # waiting" requirement.
+        log.error(
+            "[Job %s]  Parent interrupted while waiting on journey "
+            "subprocess (%s: %s) — draining already-completed video "
+            "results and terminating the child cleanly instead of losing "
+            "them.", job_id, type(exc).__name__, exc,
+        )
+        _drain_events_once()
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+        log.info(
+            "[Job %s]  Journey subprocess terminated after parent "
+            "interruption (no orphaned child left running).", job_id,
+        )
+        return _finalize_abnormal(
+            label=f"parent interrupted: {type(exc).__name__}: {exc}",
+            crash_reason=(
+                f"Worker interrupted ({type(exc).__name__}) — "
+                "video was not processed."
+            ),
+        )
+
+    # ── Clean exit: pull the full result the child computed ───────────────
+    if process.exitcode == 0:
+        try:
+            payload = result_q.get(timeout=10)
+        except Exception:
+            payload = None
+
+        if payload and payload.get("type") == "result":
+            video_results = [_video_result_from_dict(vr) for vr in payload["video_results"]]
+            return (video_results, payload["wall_seconds"],
+                    payload["failed_videos"], detail_by_id)
+
+        if payload and payload.get("type") == "error":
+            # Child returned cleanly (exitcode 0) but analyze_journey raised
+            # above its own per-video isolation — treat ALL videos as failed,
+            # and report every single one immediately (none were reported
+            # yet, since this is a journey-level error, not per-video).
+            log.error("[Job %s]  Journey subprocess reported an error: %s",
+                       job_id, payload.get("message"))
+            failed_videos = {}
+            for vj in ordered:
+                msg = payload.get("message", "Unknown error")
+                failed_videos[vj.video_id] = msg
+                detail_by_id[vj.video_id] = {"errorType": "PROCESSING_ERROR", "reason": None}
+                _report_failure_immediately(
+                    vj.video_id, msg, "PROCESSING_ERROR",
+                    payload.get("traceback"), None,
+                )
+            return [], time.time() - start_time, failed_videos, detail_by_id
+
+        # exitcode==0 but nothing usable on result_q — treat as crash-equivalent.
+        log.error("[Job %s]  Journey subprocess exited cleanly but sent no "
+                  "result — treating as failure.", job_id)
+
+    # ── Abnormal exit: crash, OOM-kill, timeout-kill, segfault, etc. ───────
+    log.error(
+        "[Job %s]  Journey subprocess died abnormally  exitcode=%s  "
+        "videos_completed=%d/%d", job_id, process.exitcode,
+        len(completed_ids), n_videos,
+    )
+    return _finalize_abnormal(
+        label=f"child process crashed, exitcode={process.exitcode}",
+        crash_reason=(
+            f"Worker process crashed (exitcode={process.exitcode}) — "
+            "video was not processed."
+        ),
+    )
+
+
+# ── Fatal-interruption finalization (partial-journey recovery) ────────────
+#
+# Called from _handle_job's outer exception handler when a fatal
+# interruption (unexpected exception, KeyboardInterrupt, etc.) strikes
+# AFTER at least one video has already been processed successfully by
+# `_run_journey_supervised`. Per spec we must NOT call the failed
+# callback in this case — instead we mark every still-unprocessed video
+# as failed, wait up to RECOVERY_WAIT_SECONDS while retrying the
+# completion callback, and let the caller ACK the message either way so
+# the worker can move on to the next queued journey.
+def _send_completed_with_recovery(completion_dict: dict, job_id: str) -> bool:
+    """
+    Sends the COMPLETED_WITH_ERRORS completion callback, retrying for up
+    to RECOVERY_WAIT_SECONDS if the first attempt fails (e.g. the same
+    transient condition that interrupted the journey — connection loss,
+    broker hiccup — may still be resolving). Never re-processes any
+    video; only retries delivering the already-final payload.
+
+    Returns True if the callback was eventually delivered, False if the
+    recovery window was exhausted without success (the journey's partial
+    results are still preserved locally via the uploaded text log either
+    way — see build_journey_log_text()/upload_text_log() in _handle_job).
+    """
+    deadline = time.time() + RECOVERY_WAIT_SECONDS
+    attempt  = 0
+    while True:
+        attempt += 1
+        try:
+            send_completed(completion_dict)
+            log.info(
+                "[Job %s]  COMPLETED_WITH_ERRORS callback delivered on "
+                "attempt %d after fatal interruption.", job_id, attempt,
+            )
+            return True
+        except Exception as exc:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                log.error(
+                    "[Job %s]  Could not deliver COMPLETED_WITH_ERRORS "
+                    "callback within the %ds recovery window (%d attempts): "
+                    "%s — giving up; partial results remain preserved in "
+                    "the uploaded text log.", job_id, RECOVERY_WAIT_SECONDS,
+                    attempt, exc,
+                )
+                return False
+            wait_s = min(RECOVERY_RETRY_SECONDS, remaining)
+            log.warning(
+                "[Job %s]  COMPLETED_WITH_ERRORS callback attempt %d "
+                "failed (%s) — retrying in %.0fs (recovery window "
+                "remaining %.0fs).", job_id, attempt, exc, wait_s, remaining,
+            )
+            time.sleep(wait_s)
+
+
+def _finalize_partial_journey_on_interruption(
+    *,
+    job_id: str,
+    journey_id: int,
+    train_detail_id: int,
+    folder_name: str,
+    msg_videos: list,
+    video_results: list,
+    failed_videos: Dict[int, str],
+    video_error_details: Dict[int, dict],
+    wall_seconds: float,
+    job_started_at: datetime,
+    interruption_reason: str,
+) -> None:
+    """
+    Builds and sends the COMPLETED_WITH_ERRORS payload after a fatal
+    interruption that hit a journey with at least one already-succeeded
+    video. Marks every video that is neither in video_results nor already
+    in failed_videos as failed (reason: fatal interruption), uploads the
+    text log (so results are preserved even if the callback ultimately
+    can't be delivered), and attempts the completion callback with a
+    bounded recovery window.
+    """
+    succeeded_ids = {vr.video_id for vr in video_results}
+    accounted_ids = succeeded_ids | set(failed_videos.keys())
+
+    for vj in msg_videos:
+        if vj.video_id in accounted_ids:
+            continue
+        msg = (
+            f"Not Processed - Fatal Interruption ({interruption_reason}) — "
+            "journey was interrupted before this video could be processed."
+        )
+        failed_videos[vj.video_id] = msg
+        video_error_details[vj.video_id] = {
+            "errorType": "NOT_PROCESSED",
+            "reason":    "Not Processed - Fatal Interruption",
+        }
+        try:
+            send_video_failed(
+                job_id        = job_id,
+                journey_id    = journey_id,
+                video_id      = vj.video_id,
+                error_type    = "NOT_PROCESSED",
+                error_message = msg,
+                stack_trace   = "",
+                reason        = "Not Processed - Fatal Interruption",
+            )
+        except Exception as exc:
+            log.error("[Job %s]  send_video_failed failed for video=%d "
+                      "during interruption finalization: %s",
+                      job_id, vj.video_id, exc)
+
+    failed_ids = set(failed_videos.keys())
+    journey_status = compute_journey_status(
+        total_videos        = len(msg_videos),
+        succeeded_video_ids = succeeded_ids,
+        failed_video_ids    = failed_ids,
+    )
+    # By construction at least one video succeeded, so this should always
+    # resolve to COMPLETED_WITH_ERRORS (or COMPLETED, if the interruption
+    # struck after the very last video already succeeded) — never FAILED.
+    if journey_status == "FAILED":
+        journey_status = "COMPLETED_WITH_ERRORS"
+
+    log.warning(
+        "[Job %s]  Finalizing partial journey after fatal interruption "
+        "(%s).  succeeded=%d  failed=%d  status=%s",
+        job_id, interruption_reason, len(succeeded_ids), len(failed_ids),
+        journey_status,
+    )
+
+    try:
+        log_text = build_journey_log_text(
+            job_id              = job_id,
+            journey_id          = journey_id,
+            video_results       = video_results,
+            total_wall_seconds  = wall_seconds,
+            started_at          = job_started_at,
+            failed_videos       = failed_videos,
+            video_error_details = video_error_details,
+            journey_status      = journey_status,
+        )
+        upload_text_log(
+            text        = log_text,
+            folder_name = folder_name,
+            filename    = f"{job_id}.txt",
+        )
+        log.info("[Job %s]  Text log uploaded to S3 (partial-journey path).",
+                 job_id)
+    except Exception as log_exc:
+        log.warning("[Job %s]  Text log build/upload failed (non-fatal): %s",
+                    job_id, log_exc)
+
+    processing_time_ms = int(wall_seconds * 1000)
+    completion = CompletionPayload(
+        job_id          = job_id,
+        journey_id      = journey_id,
+        train_detail_id = train_detail_id,
+        folder_name     = folder_name,
+        processing_time = processing_time_ms,
+        video_results   = video_results,
+    )
+    completion_dict = completion.to_dict()
+    completion_dict["journeyStatus"] = journey_status
+
+    # Notify the frontend of progress/status before the final callback too,
+    # best-effort — mirrors the normal-path "Sending results to backend"
+    # progress update so the UI doesn't appear stuck at whatever percentage
+    # it was at when the interruption happened.
+    try:
+        send_progress(
+            job_id, journey_id, 95,
+            f"Recovering from interruption — status {journey_status}",
+            current_video=len(msg_videos),
+        )
+    except Exception as exc:
+        log.warning("[Job %s]  progress callback failed (non-fatal): %s",
+                    job_id, exc)
+
+    _send_completed_with_recovery(completion_dict, job_id)
+
+
 # ── Job handler ───────────────────────────────────────────────────────────────
 
 def _handle_job(
@@ -2472,6 +3164,7 @@ def _handle_job(
     train_detail_id = msg.train_detail_id
     folder_name     = msg.folder_name
     tmp_paths: Dict[int, str] = {}
+    job_started_at  = datetime.now()
 
     log.info(
         "[Job %s]  journey=%d  trainDetail=%d  videos=%d  folder=%s  redelivered=%s",
@@ -2506,7 +3199,15 @@ def _handle_job(
     # returns, just before basic_ack().
     with _JobKeepalive(connection, pika_lock, job_id):
         job_failed = False
-        job_exc    = None
+
+        # Mutable state visible to the outer except block, so a fatal
+        # interruption at ANY point after _run_journey_supervised has
+        # returned at least one successful video can be finalized as
+        # COMPLETED_WITH_ERRORS instead of FAILED.
+        video_results:       list            = []
+        failed_videos:       Dict[int, str]  = {}
+        video_error_details: Dict[int, dict] = {}
+        wall_seconds:        float           = 0.0
 
         try:
             # ── Step 2: Download all videos from S3 ──────────────────────────
@@ -2547,54 +3248,195 @@ def _handle_job(
                         job_id, exc,
                     )
 
-            video_results, wall_seconds = analyze_journey(
-                job_id            = job_id,
-                journey_id        = journey_id,
-                folder_name       = folder_name,
-                video_jobs        = msg.videos,
-                tmp_paths         = tmp_paths,
-                progress_cb       = _progress,
-                rabbit_connection = connection,
+            # NOTE: _run_journey_supervised already isolates native crashes,
+            # OOM, and per-journey timeouts inside the child process and
+            # NEVER lets those abort this call — it always returns a
+            # (video_results, wall_seconds, failed_videos, video_error_details)
+            # tuple for those cases (see its "Abnormal exit" branch above).
+            # Assigning straight into the outer-scope variables means that
+            # if a fatal interruption happens in any step AFTER this call
+            # (text log build, callback send, etc.), the outer except block
+            # below still has the correct partial results to work with.
+            (video_results, wall_seconds,
+             failed_videos, video_error_details) = _run_journey_supervised(
+                job_id      = job_id,
+                journey_id  = journey_id,
+                folder_name = folder_name,
+                video_jobs  = msg.videos,
+                tmp_paths   = tmp_paths,
+                progress_cb = _progress,
             )
 
             # ── Step 8: Calculate processing time (ms) ────────────────────────
             processing_time_ms = int(wall_seconds * 1000)
+
+            succeeded_ids = {vr.video_id for vr in video_results
+                              if vr.video_id not in failed_videos}
+            failed_ids    = set(failed_videos.keys())
+            journey_status = compute_journey_status(
+                total_videos         = len(msg.videos),
+                succeeded_video_ids  = succeeded_ids,
+                failed_video_ids     = failed_ids,
+            )
+
             log.info(
-                "[Job %s]  Analysis complete.  videos=%d  violations=%d  time=%dms",
+                "[Job %s]  Analysis complete.  videos=%d  violations=%d  time=%dms  "
+                "failed=%d  status=%s",
                 job_id,
                 len(video_results),
                 sum(len(vr.violations) for vr in video_results),
                 processing_time_ms,
+                len(failed_videos),
+                journey_status,
             )
 
-            # ── Step 9: Send completion callback ──────────────────────────────
-            send_progress(
-                job_id, journey_id, 95,
-                "Sending results to backend",
-                current_video=len(msg.videos),
-            )
-            completion = CompletionPayload(
-                job_id          = job_id,
-                journey_id      = journey_id,
-                train_detail_id = train_detail_id,
-                folder_name     = folder_name,
-                processing_time = processing_time_ms,
-                video_results   = video_results,
-            )
-            send_completed(completion.to_dict())
-            log.info("[Job %s]  Completion callback sent.", job_id)
-
-        except Exception as exc:
-            job_failed = True
-            job_exc    = exc
-            err_detail = traceback.format_exc()
-            log.error("[Job %s]  FAILED:\n%s", job_id, err_detail)
+            # ── Step 8b: Build and upload the .txt analysis log ───────────────
+            # Built for EVERY outcome now (COMPLETED, COMPLETED_WITH_ERRORS,
+            # and FAILED-with-partial-results) — not just full success — so
+            # the log always reflects which videos actually failed and why.
+            # Written to the same dynamic journey folder used for frames:
+            # <folderName>/<jobId>.txt
             try:
-                send_failed(job_id, journey_id, f"{exc}\n\n{err_detail}")
-            except Exception as sf_exc:
-                log.warning("[Job %s]  send_failed itself failed: %s",
-                            job_id, sf_exc)
+                log_text = build_journey_log_text(
+                    job_id              = job_id,
+                    journey_id          = journey_id,
+                    video_results       = video_results,
+                    total_wall_seconds  = wall_seconds,
+                    started_at          = job_started_at,
+                    failed_videos       = failed_videos,
+                    video_error_details = video_error_details,
+                    journey_status      = journey_status,
+                )
+                upload_text_log(
+                    text        = log_text,
+                    folder_name = folder_name,
+                    filename    = f"{job_id}.txt",
+                )
+                log.info("[Job %s]  Text log uploaded to S3.", job_id)
+            except Exception as log_exc:
+                log.warning(
+                    "[Job %s]  Text log build/upload failed (non-fatal): %s",
+                    job_id, log_exc,
+                )
+
+            # ── Step 9: Send completion OR failed callback ─────────────────────
+            # Per-video failures were ALREADY reported individually and
+            # immediately inside _run_journey_supervised (Phase 1 requirement
+            # — no video waits until journey end to be reported). This step
+            # decides the JOURNEY-level outcome:
+            #
+            #   COMPLETED              → send_completed with all video_results.
+            #   COMPLETED_WITH_ERRORS  → still send_completed (the journey DID
+            #                            finish — some videos succeeded and
+            #                            their results are real); per-video
+            #                            failures are already on record via
+            #                            the immediate /failed calls above.
+            #   FAILED                 → every video failed (or none ran) —
+            #                            send one journey-level /failed call
+            #                            summarizing it, no /completed call.
+            if journey_status == "FAILED":
+                error_message = "; ".join(
+                    f"video_id={vid}: {msg_}" for vid, msg_ in failed_videos.items()
+                ) or "Journey failed before any video could be processed."
+                log.error(
+                    "[Job %s]  Journey FAILED — all %d video(s) failed: %s",
+                    job_id, len(failed_videos), error_message,
+                )
+                send_failed(job_id, journey_id, error_message)
+                log.info("[Job %s]  Journey-level failed callback sent.", job_id)
+            else:
+                send_progress(
+                    job_id, journey_id, 95,
+                    "Sending results to backend",
+                    current_video=len(msg.videos),
+                )
+                completion = CompletionPayload(
+                    job_id          = job_id,
+                    journey_id      = journey_id,
+                    train_detail_id = train_detail_id,
+                    folder_name     = folder_name,
+                    processing_time = processing_time_ms,
+                    video_results   = video_results,
+                )
+                completion_dict = completion.to_dict()
+                completion_dict["journeyStatus"] = journey_status
+                send_completed(completion_dict)
+                log.info(
+                    "[Job %s]  Completion callback sent.  status=%s  failedVideos=%d",
+                    job_id, journey_status, len(failed_videos),
+                )
+
+        except BaseException as exc:
+            # BaseException (not just Exception) so that fatal interruptions
+            # such as KeyboardInterrupt (Ctrl+C) and SystemExit are handled
+            # by the same partial-results-preserving logic as any other
+            # unexpected error, instead of skipping cleanup/finalization.
+            err_detail = traceback.format_exc()
+            log.error("[Job %s]  FATAL INTERRUPTION:\n%s", job_id, err_detail)
+
+            # ── Resource lifecycle (Phase 6): release resources on any
+            # journey-level failure that isn't already covered by the
+            # subprocess-crash path (e.g. S3 download failure, an exception
+            # raised while building/uploading the text log, or a callback
+            # failure that propagated up instead of being caught locally).
+            try:
+                resource_manager.cleanup_after_failure(
+                    job_id=job_id, reason=f"{type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                log.error("[Job %s]  cleanup_after_failure() failed:\n%s",
+                          job_id, traceback.format_exc())
+
+            if video_results:
+                # ── At least one video already succeeded: do NOT call the
+                # failed callback. Preserve the successful results, mark the
+                # rest as failed, and finalize as COMPLETED_WITH_ERRORS
+                # (with a bounded recovery/retry window for the callback).
+                job_failed = False
+                try:
+                    _finalize_partial_journey_on_interruption(
+                        job_id               = job_id,
+                        journey_id           = journey_id,
+                        train_detail_id      = train_detail_id,
+                        folder_name          = folder_name,
+                        msg_videos           = msg.videos,
+                        video_results        = video_results,
+                        failed_videos        = failed_videos,
+                        video_error_details  = video_error_details,
+                        wall_seconds         = wall_seconds,
+                        job_started_at       = job_started_at,
+                        interruption_reason  = f"{type(exc).__name__}: {exc}",
+                    )
+                except Exception as finalize_exc:
+                    # Even the recovery path itself failed unexpectedly —
+                    # this is the only case where we still fall back to the
+                    # failed callback, since we genuinely could not finalize
+                    # the partial results any other way.
+                    log.error(
+                        "[Job %s]  Partial-journey finalization itself "
+                        "failed: %s — falling back to failed callback.",
+                        job_id, finalize_exc,
+                    )
+                    job_failed = True
+                    try:
+                        send_failed(job_id, journey_id,
+                                    f"{exc}\n\n{err_detail}\n\n"
+                                    f"(partial-finalization also failed: {finalize_exc})")
+                    except Exception as sf_exc:
+                        log.warning("[Job %s]  send_failed itself failed: %s",
+                                    job_id, sf_exc)
+            else:
+                # ── Zero videos succeeded — existing FAILED-callback path. ──
+                job_failed = True
+                try:
+                    send_failed(job_id, journey_id, f"{exc}\n\n{err_detail}")
+                except Exception as sf_exc:
+                    log.warning("[Job %s]  send_failed itself failed: %s",
+                                job_id, sf_exc)
         finally:
+            # Always release temp files / resources, on every path: clean
+            # success, FAILED, COMPLETED_WITH_ERRORS, or a still-failing
+            # finalization attempt.
             _cleanup(tmp_paths)
 
     # ── Keepalive stopped here — safe to call pika ────────────────────────────
@@ -2602,6 +3444,9 @@ def _handle_job(
         _nack(channel, pika_lock, method.delivery_tag, job_id)
     else:
         # ── Step 10: ACK ─────────────────────────────────────────────────────
+        # Also reached for the COMPLETED_WITH_ERRORS-after-interruption path:
+        # the message is finalized here so the worker moves on to the next
+        # queued journey, exactly as it does after a normal completion.
         _ack_and_flush(channel, connection, pika_lock,
                        method.delivery_tag, job_id)
 
@@ -2625,6 +3470,17 @@ def _on_message(channel, method, properties, body,
         method.redelivered,
         body.decode("utf-8", errors="replace")[:500],
     )
+    if method.redelivered:
+        log.warning(
+            "[RabbitMQ] ⚠ REDELIVERED MESSAGE (delivery_tag=%s) — this typically means "
+            "the previous processing attempt was interrupted before ACK. Possible causes: "
+            "(1) RabbitMQ consumer_timeout fired (broker default 30 min) while the job "
+            "was still running — fix: raise consumer_timeout on the broker to ≥12 hours; "
+            "(2) worker process was killed/crashed mid-job. "
+            "The local idempotency cache will prevent re-processing if this worker "
+            "already completed the job in this session.",
+            method.delivery_tag,
+        )
     try:
         data = json.loads(body)
         msg  = AnalysisJobMessage.from_dict(data)
@@ -2646,7 +3502,13 @@ def _connect_and_consume() -> None:
     params = pika.URLParameters(RABBITMQ_URL)
     params.heartbeat                  = HEARTBEAT_INTERVAL   # 60 s
     params.blocked_connection_timeout = 300
-    params.socket_timeout             = 300
+    # IMPORTANT: Do NOT set socket_timeout here. The default (no timeout) is
+    # correct for a long-running consumer — a fixed socket_timeout would
+    # drop the TCP connection after that many idle seconds, which for a
+    # multi-hour analysis job (20 videos × ~400s = ~2.3 hours) would close
+    # the socket long before the job finishes. Heartbeats (HEARTBEAT_INTERVAL)
+    # and the keepalive thread (process_data_events every KEEPALIVE_INTERVAL
+    # seconds) are sufficient to keep NAT devices and the broker happy.
     connection = pika.BlockingConnection(params)
     channel    = connection.channel()
 
@@ -2658,6 +3520,26 @@ def _connect_and_consume() -> None:
         exchange_type = "direct",
         durable       = True,
     )
+
+    # Declare the queue passively (it must already exist on the broker) but
+    # log a clear warning if consumer_timeout needs to be raised on the broker.
+    # RabbitMQ 3.8.15+ enforces a consumer_timeout (default 30 minutes) that
+    # cancels any consumer that hasn't ACKed a message within that window —
+    # even if the TCP connection and heartbeats are healthy. For journeys
+    # longer than 30 min this causes the broker to cancel the consumer,
+    # requeue the message, and the worker picks it up again as a redelivery.
+    #
+    # FIX ON THE BROKER (run once as rabbitmq admin):
+    #   rabbitmqctl set_policy consumer-timeout \
+    #     ".*" '{"consumer-timeout": 43200000}' \
+    #     --apply-to queues
+    # That sets a 12-hour consumer timeout (43200000 ms) on all queues.
+    # Alternatively set consumer_timeout = false in rabbitmq.conf to disable it.
+    #
+    # The local idempotency cache in callback_client.py (_completed_jobs /
+    # mark_job_completed) is the WORKER-SIDE guard: if the broker does
+    # redeliver despite the above, the worker catches it and ACKs immediately
+    # without re-processing.
     channel.queue_declare(queue=QUEUE_NAME, passive=True)
     channel.queue_bind(
         queue       = QUEUE_NAME,
@@ -2685,6 +3567,28 @@ def _connect_and_consume() -> None:
 # ── Consumer startup with reconnect retry ─────────────────────────────────────
 
 def start() -> None:
+    # ── Phase 2: startup recovery — MUST complete before RabbitMQ connects ───
+    # Runs the full sequence: resource cleanup → GPU cleanup → temp file
+    # cleanup → stale workspace cleanup → zombie-process detection. No
+    # consumer.basic_consume() call happens until this returns.
+    log.info("[Consumer]  Running startup resource cleanup...")
+    try:
+        resource_manager.initialize_service()
+    except Exception:
+        log.error("[Consumer]  initialize_service() raised — continuing "
+                  "startup anyway (cleanup failures must never block the "
+                  "worker from starting):\n%s", traceback.format_exc())
+
+    # ── Phase 8: background RAM/GPU/thread monitor ───────────────────────────
+    # Runs continuously for the lifetime of the process, independent of
+    # per-journey cleanup, so slow leaks across many journeys are caught
+    # too (not just spikes within a single journey).
+    try:
+        memory_monitor.start()
+    except Exception:
+        log.error("[Consumer]  memory_monitor.start() failed (non-fatal):\n%s",
+                  traceback.format_exc())
+
     while True:
         try:
             _connect_and_consume()
@@ -2697,6 +3601,17 @@ def start() -> None:
                 exc, RECONNECT_DELAY,
             )
             time.sleep(RECONNECT_DELAY)
+
+    # ── Graceful shutdown ──────────────────────────────────────────────────────
+    try:
+        memory_monitor.stop()
+    except Exception:
+        pass
+    try:
+        resource_manager.cleanup_on_shutdown()
+    except Exception:
+        log.error("[Consumer]  cleanup_on_shutdown() failed:\n%s",
+                  traceback.format_exc())
 
 
 if __name__ == "__main__":

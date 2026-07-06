@@ -15732,7 +15732,7 @@ class ViolationStore:
         need_video = []
         for v in mine:
             if v.annotated_frame is not None:
-                v.frame_path      = self._save_frame(v.annotated_frame, v.events, v.time_str)
+                v.frame_path      = self._save_frame(v.annotated_frame, v.events, v.time_str, v.frame_index)
                 v.annotated_frame = None   # free memory
                 saved += 1
             else:
@@ -15769,7 +15769,7 @@ class ViolationStore:
                         print(f"[ViolationStore] Seek failed for {src_filename} "
                               f"@ local_time={local_str}")
                         continue
-                    v.frame_path = self._save_frame(frame, v.events, v.time_str)
+                    v.frame_path = self._save_frame(frame, v.events, v.time_str, v.frame_index)
                     saved += 1
                 cap.release()
 
@@ -15777,21 +15777,40 @@ class ViolationStore:
 
     def _save_frame(
         self,
-        frame:    np.ndarray,
-        events:   List[str],
-        time_str: str,
+        frame:       np.ndarray,
+        events:      List[str],
+        time_str:    str,
+        frame_index: int,
     ) -> str:
         """
         Save a single violation frame as JPEG.
 
-        Filename format:  <events>_<HH-MM-SS>.jpg
-        Example:          seat_absence_00-01-14.jpg
-                          seat_absence_drowsy_00-03-02.jpg
-                          phone_use_00-00-24.jpg
+        Filename format:  <events>_<HH-MM-SS>_<frame_index>.jpg
+        Example:          seat_absence_00-01-14_1042.jpg
+                          seat_absence_drowsy_00-03-02_5310.jpg
+                          phone_use_00-00-24_612.jpg
+
+        FIX — Wrong/stale frame evidence (filename collision):
+        ────────────────────────────────────────────────────────
+        The filename used to be built from event-type + time_str ALONE
+        (floored to the whole second). Any two DIFFERENT violations that
+        share the same event type and land in the same whole second of
+        global journey time — easily possible for a multi-frame event,
+        for videos that meet near a journey boundary, or simply on a
+        rerun/reprocess of the same journey (same S3 folder reused) —
+        produced the IDENTICAL filename/S3 key. Uploads overwrite
+        unconditionally, so whichever violation was saved last silently
+        replaced the other's evidence image, and a rerun could leave a
+        violation pointing at a stale frame from a previous run.
+
+        frame_index is the value already used as (part of) the
+        record_violation() dedup key, so it is guaranteed unique per
+        violation within a journey — including it here makes the
+        filename/S3 key collision-proof.
         """
         distraction   = "_".join(sorted(events))   # sorted for deterministic name
         filename_time = time_str.replace(":", "-")
-        filename      = f"{distraction}_{filename_time}.jpg"
+        filename      = f"{distraction}_{filename_time}_{frame_index}.jpg"
         path          = os.path.join(self.frames_dir, filename)
         ok = cv2.imwrite(
             path,

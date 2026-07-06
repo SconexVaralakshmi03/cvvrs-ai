@@ -1,4 +1,4 @@
-# utils/logger.py
+# # utils/logger.py
 
 import logging
 import os
@@ -30,8 +30,17 @@ def setup_logger(name: str = "gadget_monitor") -> logging.Logger:
     os.makedirs(os.path.dirname(RUN_LOG_PATH), exist_ok=True)
 
     logger = logging.getLogger(name)
-    if logger.handlers:
-        logger.handlers.clear()
+    # FIX (file descriptor leak): logger.handlers.clear() only drops the
+    # references — it never closes the underlying FileHandler/StreamHandler,
+    # so every call to setup_logger() (once per video) leaked an open file
+    # descriptor for the life of the worker process. Explicitly close()
+    # each handler before removing it.
+    for h in list(logger.handlers):
+        try:
+            h.close()
+        except Exception:
+            pass
+        logger.removeHandler(h)
     logger.setLevel(logging.DEBUG)
 
     fh = logging.FileHandler(RUN_LOG_PATH, mode="w", encoding="utf-8")
