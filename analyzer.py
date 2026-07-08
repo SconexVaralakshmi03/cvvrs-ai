@@ -6110,6 +6110,10 @@ def analyze_journey(
         _log_resource_snapshot("VIDEO START", job_id=job_id,
                                 violations=len(shared_vstore._violations))
 
+        # ── Per-video processing time + RAM consumed tracking ────────────────
+        _video_proc_start   = time.time()
+        _video_rss_start_gb = _rss_gb()
+
         # ── Resource lifecycle (Phase 3): GPU threshold safety check ─────────
         # If CUDA memory usage is already at/above the configured threshold
         # before this video even starts, attempting inference is very likely
@@ -6317,6 +6321,21 @@ def analyze_journey(
             # Stop processing further videos in this journey.
             _log_resource_snapshot("VIDEO END (OOM-STOP)", job_id=job_id,
                                     violations=len(shared_vstore._violations))
+
+            # ── Per-video processing time + RAM consumed summary (OOM path) ──
+            _video_proc_elapsed  = time.time() - _video_proc_start
+            _video_rss_end_gb    = _rss_gb()
+            _video_rss_delta_gb  = (
+                _video_rss_end_gb - _video_rss_start_gb
+                if (_video_rss_end_gb >= 0 and _video_rss_start_gb >= 0) else -1.0
+            )
+            _rss_end_str   = f"{_video_rss_end_gb:.3f}GB" if _video_rss_end_gb >= 0 else "n/a"
+            _rss_delta_str = f"{_video_rss_delta_gb:+.3f}GB" if _video_rss_delta_gb != -1.0 else "n/a"
+            print(
+                f"[Analyzer:{job_id}]  video_id={vj.video_id}  seq={vj.sequence_no}  "
+                f"PROCESSING_TIME={_video_proc_elapsed:.2f}s  "
+                f"RAM_USED={_rss_end_str}  RAM_CONSUMED(delta)={_rss_delta_str}  (OOM-STOP)"
+            )
             # Break out of the for-loop so we move straight to dedup/upload/build.
             break
 
@@ -6335,6 +6354,21 @@ def analyze_journey(
         # ── Fix 5: memory/resource snapshot — after this video ───────────────
         _log_resource_snapshot("VIDEO END", job_id=job_id,
                                 violations=len(shared_vstore._violations))
+
+        # ── Per-video processing time + RAM consumed summary ─────────────────
+        _video_proc_elapsed  = time.time() - _video_proc_start
+        _video_rss_end_gb    = _rss_gb()
+        _video_rss_delta_gb  = (
+            _video_rss_end_gb - _video_rss_start_gb
+            if (_video_rss_end_gb >= 0 and _video_rss_start_gb >= 0) else -1.0
+        )
+        _rss_end_str   = f"{_video_rss_end_gb:.3f}GB" if _video_rss_end_gb >= 0 else "n/a"
+        _rss_delta_str = f"{_video_rss_delta_gb:+.3f}GB" if _video_rss_delta_gb != -1.0 else "n/a"
+        print(
+            f"[Analyzer:{job_id}]  video_id={vj.video_id}  seq={vj.sequence_no}  "
+            f"PROCESSING_TIME={_video_proc_elapsed:.2f}s  "
+            f"RAM_USED={_rss_end_str}  RAM_CONSUMED(delta)={_rss_delta_str}"
+        )
 
         # Report per-video progress (10%–90% band)
         if progress_cb:
