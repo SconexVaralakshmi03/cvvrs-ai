@@ -221,7 +221,7 @@ GADGET_MIN_EDGE_VARIANCE   = 90.0   # floored at 35.0 in code for IR footage
 GADGET_EAR_PROXIMITY_MARGIN = 0.05
 
 # ── Seat absence ──────────────────────────────────────────────────────────────
-ABSENCE_ALLOWED_DURATION   = 4.0
+ABSENCE_ALLOWED_DURATION   = 2.0
 ABSENCE_CALIBRATION_FRAMES = 60
 ABSENCE_OVERLAP_THRESH     = 0.10
 

@@ -15427,6 +15427,16 @@ class _Violation:
     local_time_str:  str                  = ""    # local time within that file e.g. "00:00:23"
     frame_path:      Optional[str]        = None
     annotated_frame: Optional[np.ndarray] = None
+    # NEW — additive, filled in later (if at all) by close_violation_episode().
+    # True trigger→end span: true_end_timestamp - true_start_timestamp ==
+    # true_duration. Stay None if the episode was still ongoing when the
+    # video ended (never actually "closed"), in which case the existing
+    # `duration` field above (threshold-snapshot value) is the only
+    # duration info available for this violation — this behaviour is
+    # unchanged.
+    true_start_timestamp: Optional[float] = None
+    true_end_timestamp:   Optional[float] = None
+    true_duration:        Optional[float] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -15549,6 +15559,50 @@ class ViolationStore:
             )
         )
 
+    # NEW — additive: attach the true trigger→end duration ────────────────────
+
+    def close_violation_episode(
+        self,
+        source_filename:  str,
+        event_type:       str,
+        start_video_time: float,
+        end_video_time:   float,
+        duration:         float,
+    ) -> None:
+        """
+        Record that a previously-logged violation episode has genuinely
+        ended, and how long it actually lasted from trigger to end (e.g.
+        triggered at 10.33, ended at 15.33 → duration 5.0).
+
+        Called from main.py whenever a detector reports a
+        completed_events entry (see gadget_detector.py /
+        seat_absence_detector.py / head_drop_detector.py). Finds the most
+        recently recorded, not-yet-closed violation for this
+        (source_filename, event_type) and fills in its
+        true_start_timestamp / true_end_timestamp / true_duration fields
+        ONLY — every other field on that _Violation, and every other
+        violation in the store, is left completely untouched. If no
+        matching open violation is found (e.g. it was never actually
+        confirmed/logged, or the episode was already closed), this is a
+        harmless no-op.
+        """
+        for v in reversed(self._violations):
+            if (
+                v.source_filename == source_filename
+                and event_type in v.events
+                and v.true_duration is None
+            ):
+                v.true_start_timestamp = round(start_video_time, 2)
+                v.true_end_timestamp   = round(end_video_time, 2)
+                v.true_duration        = round(max(0.0, duration), 2)
+                print(f"[CLOSE-EPISODE] matched violation frame_index={v.frame_index} "
+                      f"type={event_type!r} source={source_filename!r} "
+                      f"-> true_duration={v.true_duration}")
+                return
+        print(f"[CLOSE-EPISODE] NO MATCH for source={source_filename!r} "
+              f"event_type={event_type!r} (start={start_video_time:.2f} "
+              f"end={end_video_time:.2f} dur={duration:.2f}) — no open violation found")
+
     # ── Finalize ──────────────────────────────────────────────────────────────
 
     def write_report(self, processing_time: float = 0.0) -> str:
@@ -15666,7 +15720,17 @@ class ViolationStore:
                 max_risk, risk_level = v.risk_score, v.risk_level
             if best_frame is None and v.annotated_frame is not None:
                 best_frame = v.annotated_frame
-        return _Violation(
+
+        # FIX — true_start_timestamp / true_end_timestamp / true_duration
+        # (and frame_path) used to be dropped here because they weren't
+        # passed into the rebuilt _Violation, silently resetting to the
+        # dataclass default (None) on every merge. close_violation_episode()
+        # runs during frame processing, BEFORE finalize() calls this, so
+        # any true_duration it had already filled in was being wiped out
+        # right before the report was built.
+        before_durations = [v.true_duration for v in group]
+
+        merged = _Violation(
             timestamp        = base.timestamp,
             time_str         = base.time_str,
             frame_index      = base.frame_index,
@@ -15681,7 +15745,14 @@ class ViolationStore:
             source_filename  = base.source_filename,
             local_time_str   = base.local_time_str,
             annotated_frame  = best_frame,
+            frame_path            = base.frame_path,
+            true_start_timestamp  = base.true_start_timestamp,
+            true_end_timestamp    = base.true_end_timestamp,
+            true_duration         = base.true_duration,
         )
+        print(f"[MERGE] frame_index={base.frame_index} true_durations "
+              f"before={before_durations} -> after={merged.true_duration}")
+        return merged
 
     # ── Private — frame extraction & saving ──────────────────────────────────
 
@@ -15824,6 +15895,9 @@ class ViolationStore:
     # ── Private — report builder ──────────────────────────────────────────────
 
     def _build_report(self, processing_time: float = 0.0) -> dict:
+        for v in self._violations:
+            print(f"[REPORT] frame_index={v.frame_index} type={v.type} "
+                  f"events={v.events} true_duration={v.true_duration}")
         return {
             "analysis_id":     self.analysis_id,
             "train_detail_id": self.train_detail_id,
@@ -15841,6 +15915,13 @@ class ViolationStore:
                     "events":      v.events,
                     "severity":    v.severity,
                     "duration":    v.duration,
+                    # NEW — additive: true trigger→end duration (e.g.
+                    # triggered at 10.33, ended at 15.33 → 5.0). None if
+                    # the violation was still ongoing when the video
+                    # ended (never actually closed) — "duration" above
+                    # remains the only figure available in that case,
+                    # unchanged from before.
+                    "trigger_duration_seconds": v.true_duration,
                     "risk_score":  v.risk_score,
                     "risk_level":  v.risk_level,
                     "confidence":  v.confidence,

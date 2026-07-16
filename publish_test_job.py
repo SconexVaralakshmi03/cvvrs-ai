@@ -1,7 +1,7 @@
 # """
 # publish_test_job.py
 # ────────────────────
-# Simulates Spring Boot publishing a message to the 'analysis.jobs' queue.
+# Simulates Spring Boot publishing a message to the 'dev.analysis.jobs' queue.
 
 # Usage:
 #     python publish_test_job.py
@@ -28,7 +28,7 @@
 # load_dotenv(_ENV_PATH)
 
 # RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
-# QUEUE_NAME   = os.environ.get("ANALYSIS_QUEUE", "analysis.jobs")
+# QUEUE_NAME   = os.environ.get("ANALYSIS_QUEUE", "dev.analysis.jobs")
 
 # # ── Edit this to match your test scenario ────────────────────────────────────
 # JOB_MESSAGE = {
@@ -81,8 +81,8 @@
 """
 publish_test_job.py
 ────────────────────
-Simulates Spring Boot publishing a message to the 'analysis.jobs' queue
-via the 'analysis.exchange' exchange (routing key: analysis.job.created).
+Simulates Spring Boot publishing a message to the 'dev.analysis.jobs' queue
+via the 'dev.analysis.exchange' exchange (routing key: dev.analysis.job.created).
 
 Usage
 ─────
@@ -125,9 +125,9 @@ _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "
 load_dotenv(_ENV_PATH)
 
 RABBITMQ_URL  = os.environ.get("RABBITMQ_URL",       "amqp://guest:guest@localhost:5672/")
-QUEUE_NAME    = os.environ.get("ANALYSIS_QUEUE",    "analysis.jobs")
-EXCHANGE_NAME = os.environ.get("ANALYSIS_EXCHANGE", "analysis.exchange")
-ROUTING_KEY   = os.environ.get("ANALYSIS_ROUTING",  "analysis.job.created")
+QUEUE_NAME    = os.environ.get("ANALYSIS_QUEUE",    "dev.analysis.jobs")
+EXCHANGE_NAME = os.environ.get("ANALYSIS_EXCHANGE", "dev.analysis.exchange")
+ROUTING_KEY   = os.environ.get("ANALYSIS_ROUTING",  "dev.analysis.job.created")
 
 # ── Edit this to match your test scenario ────────────────────────────────────
 JOB_MESSAGE = {

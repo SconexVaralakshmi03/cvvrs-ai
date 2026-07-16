@@ -1,3 +1,6597 @@
+# # # # # from __future__ import annotations
+
+# # # # # import gc
+# # # # # import logging
+# # # # # import os
+# # # # # import threading
+# # # # # import time
+# # # # # from typing import Dict, List, Tuple
+
+# # # # # import cv2
+
+# # # # # try:
+# # # # #     import psutil
+# # # # #     _PSUTIL_AVAILABLE = True
+# # # # # except ImportError:
+# # # # #     psutil = None
+# # # # #     _PSUTIL_AVAILABLE = False
+
+# # # # # from models import VideoJob, VideoResult, ViolationResult
+# # # # # from s3_service import upload_frame, upload_frame_from_path
+
+# # # # # # Import the existing pipeline and store — unchanged
+# # # # # from main import GadgetDetectionPipeline
+# # # # # from utils.violation_store import ViolationStore
+
+# # # # # log = logging.getLogger("analyzer")
+
+# # # # # # OUTPUTS_ROOT mirrors the constant inside violation_store.py
+# # # # # OUTPUTS_ROOT = "outputs"
+
+
+# # # # # # ── Memory / resource diagnostics (Fix 5) ──────────────────────────────────────
+
+# # # # # _PROCESS = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+
+
+# # # # # def _rss_gb() -> float:
+# # # # #     """Current process resident set size, in GB. Returns -1.0 if psutil is unavailable."""
+# # # # #     if _PROCESS is None:
+# # # # #         return -1.0
+# # # # #     try:
+# # # # #         return _PROCESS.memory_info().rss / (1024 ** 3)
+# # # # #     except Exception:
+# # # # #         return -1.0
+
+
+# # # # # def _log_resource_snapshot(label: str, job_id: str = "", violations: int = -1) -> None:
+# # # # #     """
+# # # # #     Emit a single-line resource snapshot. `label` is one of:
+# # # # #     'VIDEO START', 'VIDEO END', 'JOURNEY START', 'JOURNEY END'.
+# # # # #     """
+# # # # #     rss        = _rss_gb()
+# # # # #     thread_cnt = threading.active_count()
+# # # # #     rss_str    = f"{rss:.3f}GB" if rss >= 0 else "n/a (psutil unavailable)"
+# # # # #     viol_str   = f"  VIOLATIONS={violations}" if violations >= 0 else ""
+# # # # #     print(
+# # # # #         f"[MEMORY {label}]  job={job_id}  RSS={rss_str}  THREADS={thread_cnt}{viol_str}"
+# # # # #     )
+
+
+# # # # # # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# # # # # def _video_meta(path: str) -> Tuple[float, float, int, float]:
+# # # # #     """Returns (duration_seconds, fps, total_frames, size_mb)."""
+# # # # #     cap = cv2.VideoCapture(path)
+# # # # #     if not cap.isOpened():
+# # # # #         return 0.0, 25.0, 0, 0.0
+# # # # #     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # # # #     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # # # #     cap.release()
+# # # # #     duration = total / fps if fps > 0 and total > 0 else 0.0
+# # # # #     size_mb  = round(os.path.getsize(path) / 1_000_000, 2) if os.path.isfile(path) else 0.0
+# # # # #     return duration, fps, total, size_mb
+
+
+# # # # # def _fmt_duration(seconds: float) -> str:
+# # # # #     """Converts float seconds to 'H:MM:SS' string."""
+# # # # #     t  = int(seconds)
+# # # # #     hh = t // 3600
+# # # # #     mm = (t % 3600) // 60
+# # # # #     ss = t % 60
+# # # # #     return f"{hh}:{mm:02d}:{ss:02d}"
+
+
+# # # # # def _event_type_to_violation_type(event_type: str) -> str:
+# # # # #     """
+# # # # #     Map internal event_type strings → CVVRS API ViolationType enum values.
+
+# # # # #     CVVRS types: PHONE_USAGE | DROWSY | DISTRACTION | EATING |
+# # # # #                  EYES_CLOSED | POSTURE_ALERT | HAND_TO_EAR | SEAT_ABSENCE
+# # # # #     """
+# # # # #     return {
+# # # # #         "phone_use":       "PHONE_USAGE",
+# # # # #         "seat_absence":    "SEAT_ABSENCE",
+# # # # #         "drowsy":          "DROWSY",
+# # # # #         "sleeping":        "DROWSY",
+# # # # #         "sleeping_absent": "DROWSY",
+# # # # #         "distraction":     "DISTRACTION",
+# # # # #         "eating":          "EATING",
+# # # # #         "eyes_closed":     "EYES_CLOSED",
+# # # # #         "posture_alert":   "POSTURE_ALERT",
+# # # # #         "hand_to_ear":     "HAND_TO_EAR",
+# # # # #     }.get(event_type.lower(), event_type.upper())
+
+
+# # # # # def _severity_for_risk(risk_score: float) -> str:
+# # # # #     """
+# # # # #     Map risk score → severity string.
+
+# # # # #     Tiers (aligned with CVVRS severity reference):
+# # # # #         >= 95  → CRITICAL
+# # # # #         >= 80  → HIGH
+# # # # #         >= 50  → MEDIUM
+# # # # #         <  50  → LOW
+# # # # #     """
+# # # # #     if risk_score >= 95:
+# # # # #         return "CRITICAL"
+# # # # #     if risk_score >= 80:
+# # # # #         return "HIGH"
+# # # # #     if risk_score >= 50:
+# # # # #         return "MEDIUM"
+# # # # #     return "LOW"
+
+
+# # # # # def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
+# # # # #     """
+# # # # #     Convert the relative frame path stored by ViolationStore._save_frame()
+# # # # #     back to an absolute local disk path.
+
+# # # # #     _save_frame() returns:  "<analysis_id>/frames/<filename>"
+# # # # #     The actual disk path is: "outputs/<analysis_id>/frames/<filename>"
+# # # # #     """
+# # # # #     filename = os.path.basename(relative_path)
+# # # # #     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+# # # # # def _hms_to_seconds(hms: str) -> float:
+# # # # #     """
+# # # # #     Convert "H:MM:SS" or "HH:MM:SS" to float seconds.
+# # # # #     Returns 0.0 on any parse error.
+# # # # #     """
+# # # # #     try:
+# # # # #         parts = hms.strip().split(":")
+# # # # #         if len(parts) == 3:
+# # # # #             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+# # # # #         if len(parts) == 2:
+# # # # #             return int(parts[0]) * 60 + float(parts[1])
+# # # # #         return float(parts[0])
+# # # # #     except Exception:
+# # # # #         return 0.0
+
+
+# # # # # # ── Main entry point ──────────────────────────────────────────────────────────
+
+# # # # # def analyze_journey(
+# # # # #     job_id:      str,
+# # # # #     journey_id:  int,
+# # # # #     folder_name: str,                  # e.g. "journeys/1/2026-06-10/JRN-..."
+# # # # #     video_jobs:  List[VideoJob],
+# # # # #     tmp_paths:   Dict[int, str],       # video_id → local tmp file path
+# # # # #     progress_cb  = None,               # optional callable(pct, msg, current_video)
+# # # # #     rabbit_connection = None,
+# # # # # ) -> Tuple[List[VideoResult], float]:
+# # # # #     """
+# # # # #     Run the full detection pipeline over all videos in a journey.
+
+# # # # #     Parameters
+# # # # #     ──────────
+# # # # #     job_id      : RabbitMQ job ID (used for logging only).
+# # # # #     journey_id  : Journey ID.
+# # # # #     folder_name : Journey folder prefix used for S3 frame key construction,
+# # # # #                   e.g. "journeys/1/2026-06-10/JRN-20260610-1-ABC123".
+# # # # #     video_jobs  : List of VideoJob objects (will be sorted by sequence_no).
+# # # # #     tmp_paths   : Mapping of video_id → absolute local temp file path.
+# # # # #     progress_cb : Optional callable(pct, msg, current_video_idx) for updates.
+
+# # # # #     Returns
+# # # # #     ───────
+# # # # #     (video_results, total_wall_clock_seconds)
+# # # # #     """
+# # # # #     # Sort by sequence_no — critical for correct time/frame offset continuity
+# # # # #     ordered  = sorted(video_jobs, key=lambda v: v.sequence_no)
+# # # # #     n_videos = len(ordered)
+
+# # # # #     # One shared ViolationStore for the whole journey.
+# # # # #     analysis_id   = f"journey_{journey_id}"
+# # # # #     shared_vstore = ViolationStore(
+# # # # #         analysis_id     = analysis_id,
+# # # # #         train_detail_id = journey_id,
+# # # # #     )
+
+# # # # #     time_offset  = 0.0
+# # # # #     frame_offset = 0
+# # # # #     wall_start   = time.time()
+
+# # # # #     # Per-video metadata cache (keyed by video_id)
+# # # # #     meta_by_id: Dict[int, dict] = {}
+
+# # # # #     # Track which videos were skipped due to a per-video error so we can
+# # # # #     # still include them in the VideoResult list with zero violations.
+# # # # #     failed_video_ids: set = set()
+
+# # # # #     # ── Fix 5: memory/resource snapshot — journey start ──────────────────────
+# # # # #     _log_resource_snapshot("JOURNEY START", job_id=job_id,
+# # # # #                             violations=len(shared_vstore._violations))
+
+# # # # #     # ── Run the AI pipeline over each video ──────────────────────────────────
+# # # # #     for idx, vj in enumerate(ordered):
+# # # # #         tmp_path    = tmp_paths[vj.video_id]
+# # # # #         db_filename = os.path.basename(vj.s3_key)
+
+# # # # #         duration, fps, total_frames, size_mb = _video_meta(tmp_path)
+
+# # # # #         meta_by_id[vj.video_id] = {
+# # # # #             "duration_seconds":   duration,
+# # # # #             "duration_formatted": _fmt_duration(duration),
+# # # # #             "fps":                fps,
+# # # # #             "size_mb":            size_mb,
+# # # # #             "total_frames":       total_frames,
+# # # # #         }
+
+# # # # #         print(
+# # # # #             f"[Analyzer:{job_id}]  [{idx + 1}/{n_videos}]  "
+# # # # #             f"video_id={vj.video_id}  seq={vj.sequence_no}  "
+# # # # #             f"file={db_filename}  "
+# # # # #             f"time_offset={time_offset:.2f}s  frame_offset={frame_offset}"
+# # # # #         )
+
+# # # # #         # ── Fix 5: memory/resource snapshot — before this video ──────────────
+# # # # #         _log_resource_snapshot("VIDEO START", job_id=job_id,
+# # # # #                                 violations=len(shared_vstore._violations))
+
+# # # # #         pipeline = GadgetDetectionPipeline(
+# # # # #             source           = tmp_path,
+# # # # #             analysis_id      = analysis_id,
+# # # # #             train_detail_id  = journey_id,
+# # # # #             save             = False,
+# # # # #             display          = False,
+# # # # #             shared_vstore    = shared_vstore,
+# # # # #             time_offset      = time_offset,
+# # # # #             frame_offset     = frame_offset,
+# # # # #             source_filename  = db_filename,
+# # # # #         )
+
+# # # # #         # ── FIX — Issue #2: per-video error isolation ─────────────────────────
+# # # # #         # Wrap pipeline.run() so a failure for one video is logged and skipped,
+# # # # #         # allowing the remaining videos in the journey to be processed normally.
+# # # # #         #
+# # # # #         # We catch BaseException (not just Exception) because
+# # # # #         # GadgetDetectionPipeline.run() calls sys.exit(1) when it cannot open
+# # # # #         # a video file — sys.exit raises SystemExit which is a BaseException
+# # # # #         # subclass and would otherwise escape an "except Exception" guard.
+# # # # #         #
+# # # # #         # KeyboardInterrupt is explicitly re-raised so Ctrl-C still works.
+# # # # #         # SystemExit is also re-raised so a genuine fatal signal propagates to
+# # # # #         # the consumer's outer handler (nack + DLQ) instead of being swallowed.
+# # # # #         try:
+# # # # #             pipeline.run()
+# # # # #         except KeyboardInterrupt:
+# # # # #             raise
+# # # # #         except SystemExit:
+# # # # #             raise
+# # # # #         except BaseException as video_exc:
+# # # # #             print(
+# # # # #                 f"[Analyzer:{job_id}]  WARNING — video_id={vj.video_id} "
+# # # # #                 f"seq={vj.sequence_no} FAILED (skipping): {video_exc!r}"
+# # # # #             )
+# # # # #             failed_video_ids.add(vj.video_id)
+# # # # #             # Fall through: advance offsets and continue with the next video.
+
+# # # # #         # Drop our reference to the finished pipeline so it (and the
+# # # # #         # ThreadPoolExecutor/MediaPipe resources it owned, which run() has
+# # # # #         # already explicitly shut down/closed) can be collected promptly
+# # # # #         # rather than living until the next loop iteration reassigns it.
+# # # # #         del pipeline
+
+# # # # #         # Advance offsets for the next video regardless of success/failure.
+# # # # #         # Using the metadata we already captured keeps offsets consistent for
+# # # # #         # subsequent videos even when this one's pipeline run was skipped.
+# # # # #         time_offset  += duration
+# # # # #         frame_offset += total_frames
+
+# # # # #         # ── Fix 5: memory/resource snapshot — after this video ───────────────
+# # # # #         _log_resource_snapshot("VIDEO END", job_id=job_id,
+# # # # #                                 violations=len(shared_vstore._violations))
+
+# # # # #         # Report per-video progress (10%–90% band)
+# # # # #         if progress_cb:
+# # # # #             pct = 10 + int(((idx + 1) / n_videos) * 80)
+# # # # #             try:
+# # # # #                 progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# # # # #             except Exception as exc:
+# # # # #                 print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+
+# # # # #     total_wall_seconds = time.time() - wall_start
+
+# # # # #     # ── Dedup + merge ─────────────────────────────────────────────────────────
+# # # # #     shared_vstore._deduplicate_by_frame()
+# # # # #     shared_vstore._merge_by_time_window()
+
+# # # # #     # ── Extract frames + upload to S3 ───────────────────────────────────────
+# # # # #     #
+# # # # #     # BUG FIX — Wrong frames in violation evidence
+# # # # #     # ─────────────────────────────────────────────
+# # # # #     # The old code called:
+# # # # #     #   for vj in ordered:
+# # # # #     #       shared_vstore.extract_violation_frames(tmp_path)
+# # # # #     #
+# # # # #     # extract_violation_frames() iterates ALL violations in the shared store
+# # # # #     # and seeks to v.frame_index (a GLOBAL frame number across all videos).
+# # # # #     # When called with video_2's path, it seeks to e.g. frame 4500 in video_2
+# # # # #     # — but frame 4500 is from video_1 (frame_index was global, not local).
+# # # # #     # Result: every violation gets a frame from the WRONG video.
+# # # # #     #
+# # # # #     # Fix: build a per-filename path map, then for each violation use its
+# # # # #     # source_filename to open the correct video and seek using local_time_str
+# # # # #     # (seconds within that specific video file) — which is correct regardless
+# # # # #     # of how many videos precede it in the journey.
+
+# # # # #     # Map db_filename → local tmp path
+# # # # #     path_by_filename: Dict[str, str] = {
+# # # # #         os.path.basename(vj.s3_key): tmp_paths[vj.video_id]
+# # # # #         for vj in ordered
+# # # # #     }
+
+# # # # #     for v in shared_vstore._violations:
+# # # # #         # ── Case 1: annotated frame already in memory — upload directly ──────
+# # # # #         if v.annotated_frame is not None:
+# # # # #             filename = _frame_filename(v)
+# # # # #             try:
+# # # # #                 s3_key            = upload_frame(v.annotated_frame, journey_id,
+# # # # #                                                  filename, folder_name=folder_name)
+# # # # #                 v.frame_path      = s3_key
+# # # # #                 v.annotated_frame = None
+# # # # #             except Exception as exc:
+# # # # #                 print(f"[Analyzer:{job_id}]  In-memory frame upload failed ({filename}): {exc}")
+# # # # #             continue
+
+# # # # #         # ── Case 2: no frame yet — extract from the correct source video ─────
+# # # # #         if v.frame_path:
+# # # # #             # Already extracted to disk by a previous extract_violation_frames()
+# # # # #             # call (e.g. standalone mode). Upload it.
+# # # # #             local_path = _local_frame_path(shared_vstore, v.frame_path)
+# # # # #             if os.path.isfile(local_path):
+# # # # #                 try:
+# # # # #                     s3_key       = upload_frame_from_path(local_path, journey_id,
+# # # # #                                                           folder_name=folder_name)
+# # # # #                     v.frame_path = s3_key
+# # # # #                 except Exception as exc:
+# # # # #                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
+# # # # #             else:
+# # # # #                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+# # # # #             continue
+
+# # # # #         # ── Case 3: no frame at all — seek into the correct source video ─────
+# # # # #         src_file = getattr(v, "source_filename", "")
+# # # # #         tmp_path = path_by_filename.get(src_file, "")
+# # # # #         if not tmp_path or not os.path.isfile(tmp_path):
+# # # # #             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
+# # # # #                   f"(source_filename={src_file!r}) — skipping frame extraction")
+# # # # #             continue
+
+# # # # #         # Use local_time_str (seconds within this video) to seek correctly.
+# # # # #         # v.local_time_str is set by record_violation(local_video_time=...) and
+# # # # #         # stored as an "H:MM:SS" string. Convert back to seconds for cv2 seek.
+# # # # #         local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # # # #         cap = cv2.VideoCapture(tmp_path)
+# # # # #         frame_img = None
+# # # # #         if cap.isOpened():
+# # # # #             cap.set(cv2.CAP_PROP_POS_MSEC, local_secs * 1000.0)
+# # # # #             ret, frame_img = cap.read()
+# # # # #             if not ret:
+# # # # #                 # Fallback: try seeking by fraction of duration
+# # # # #                 fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # # # #                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # # # #                 local_frame = int(local_secs * fps)
+# # # # #                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(local_frame, max(0, total - 1)))
+# # # # #                 ret, frame_img = cap.read()
+# # # # #         cap.release()
+
+# # # # #         if frame_img is None:
+# # # # #             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
+# # # # #                   f"@ local_time={local_secs:.2f}s — skipping")
+# # # # #             continue
+
+# # # # #         filename = _frame_filename(v)
+# # # # #         try:
+# # # # #             s3_key       = upload_frame(frame_img, journey_id,
+# # # # #                                         filename, folder_name=folder_name)
+# # # # #             v.frame_path = s3_key
+# # # # #         except Exception as exc:
+# # # # #             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
+
+# # # # #     # ── Build VideoResult / ViolationResult objects ───────────────────────────
+# # # # #     violations_by_filename: Dict[str, list] = {}
+# # # # #     for v in shared_vstore._violations:
+# # # # #         violations_by_filename.setdefault(v.source_filename, []).append(v)
+
+# # # # #     video_results: List[VideoResult] = []
+
+# # # # #     for vj in ordered:
+# # # # #         meta        = meta_by_id[vj.video_id]
+# # # # #         db_filename = os.path.basename(vj.s3_key)
+# # # # #         raw_viols   = violations_by_filename.get(db_filename, [])
+
+# # # # #         violation_results = []
+# # # # #         for v in raw_viols:
+# # # # #             # timestamp_seconds: float seconds from journey start (global)
+# # # # #             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+
+# # # # #             # original_video_timestamp: float seconds within the source video (local)
+# # # # #             local_ts = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # # # #             violation_results.append(
+# # # # #                 ViolationResult(
+# # # # #                     violation_type           = _event_type_to_violation_type(v.type),
+# # # # #                     severity                 = _severity_for_risk(v.risk_score),
+# # # # #                     confidence               = round(v.confidence * 100, 2),
+# # # # #                     risk_score               = float(v.risk_score),
+# # # # #                     timestamp_seconds        = _fmt_duration(journey_ts),
+# # # # #                     original_video_timestamp = _fmt_duration(local_ts),
+# # # # #                     frame_paths              = [v.frame_path] if v.frame_path else [],
+# # # # #                 )
+# # # # #             )
+
+# # # # #         video_results.append(
+# # # # #             VideoResult(
+# # # # #                 video_id           = vj.video_id,
+# # # # #                 video_name         = db_filename,
+# # # # #                 sequence_no        = vj.sequence_no,
+# # # # #                 duration_seconds   = meta["duration_seconds"],
+# # # # #                 duration_formatted = meta["duration_formatted"],
+# # # # #                 fps                = meta["fps"],
+# # # # #                 size_mb            = meta["size_mb"],
+# # # # #                 original_s3_key    = vj.s3_key,
+# # # # #                 violations         = violation_results,
+# # # # #             )
+# # # # #         )
+
+# # # # #     if failed_video_ids:
+# # # # #         print(
+# # # # #             f"[Analyzer:{job_id}]  Journey analysis complete with "
+# # # # #             f"{len(failed_video_ids)} skipped video(s): {sorted(failed_video_ids)}"
+# # # # #         )
+
+# # # # #     # ── Fix 6: explicit garbage collection at end of journey ─────────────────
+# # # # #     # By this point every violation's annotated_frame has already been
+# # # # #     # uploaded and cleared (set to None) above, and every per-video pipeline
+# # # # #     # (executor + MediaPipe graphs) has already been explicitly shut down /
+# # # # #     # closed inside GadgetDetectionPipeline.run(). gc.collect() here is a
+# # # # #     # belt-and-suspenders step to promptly reclaim any reference cycles
+# # # # #     # (e.g. exception tracebacks) before the next journey starts.
+# # # # #     n_violations_final = len(shared_vstore._violations)
+# # # # #     _log_resource_snapshot("JOURNEY END (pre-GC)", job_id=job_id,
+# # # # #                             violations=n_violations_final)
+# # # # #     gc.collect()
+# # # # #     _log_resource_snapshot("JOURNEY END (post-GC)", job_id=job_id,
+# # # # #                             violations=n_violations_final)
+
+# # # # #     return video_results, total_wall_seconds
+
+
+# # # # # # ── Private helpers ───────────────────────────────────────────────────────────
+
+# # # # # def _frame_filename(v) -> str:
+# # # # #     """Derive a JPEG filename from a _Violation object (matches _save_frame logic)."""
+# # # # #     distraction   = "_".join(sorted(v.events))
+# # # # #     filename_time = v.time_str.replace(":", "-")
+# # # # #     return f"{distraction}_{filename_time}.jpg"
+
+
+# # # # from __future__ import annotations
+
+# # # # import gc
+# # # # import logging
+# # # # import os
+# # # # import threading
+# # # # import time
+# # # # from typing import Dict, List, Tuple
+
+# # # # import cv2
+
+# # # # try:
+# # # #     import psutil
+# # # #     _PSUTIL_AVAILABLE = True
+# # # # except ImportError:
+# # # #     psutil = None
+# # # #     _PSUTIL_AVAILABLE = False
+
+# # # # from models import VideoJob, VideoResult, ViolationResult
+# # # # from s3_service import upload_frame, upload_frame_from_path
+
+# # # # # Import the existing pipeline and store — unchanged
+# # # # from main import GadgetDetectionPipeline
+# # # # from utils.violation_store import ViolationStore
+
+# # # # log = logging.getLogger("analyzer")
+
+# # # # # OUTPUTS_ROOT mirrors the constant inside violation_store.py
+# # # # OUTPUTS_ROOT = "outputs"
+
+
+# # # # # ── Memory / resource diagnostics (Fix 5) ──────────────────────────────────────
+
+# # # # _PROCESS = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+
+
+# # # # def _rss_gb() -> float:
+# # # #     """Current process resident set size, in GB. Returns -1.0 if psutil is unavailable."""
+# # # #     if _PROCESS is None:
+# # # #         return -1.0
+# # # #     try:
+# # # #         return _PROCESS.memory_info().rss / (1024 ** 3)
+# # # #     except Exception:
+# # # #         return -1.0
+
+
+# # # # def _log_resource_snapshot(label: str, job_id: str = "", violations: int = -1) -> None:
+# # # #     """
+# # # #     Emit a single-line resource snapshot. `label` is one of:
+# # # #     'VIDEO START', 'VIDEO END', 'JOURNEY START', 'JOURNEY END'.
+# # # #     """
+# # # #     rss        = _rss_gb()
+# # # #     thread_cnt = threading.active_count()
+# # # #     rss_str    = f"{rss:.3f}GB" if rss >= 0 else "n/a (psutil unavailable)"
+# # # #     viol_str   = f"  VIOLATIONS={violations}" if violations >= 0 else ""
+# # # #     print(
+# # # #         f"[MEMORY {label}]  job={job_id}  RSS={rss_str}  THREADS={thread_cnt}{viol_str}"
+# # # #     )
+
+
+# # # # # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# # # # def _video_meta(path: str) -> Tuple[float, float, int, float]:
+# # # #     """Returns (duration_seconds, fps, total_frames, size_mb)."""
+# # # #     cap = cv2.VideoCapture(path)
+# # # #     if not cap.isOpened():
+# # # #         return 0.0, 25.0, 0, 0.0
+# # # #     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # # #     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # # #     cap.release()
+# # # #     duration = total / fps if fps > 0 and total > 0 else 0.0
+# # # #     size_mb  = round(os.path.getsize(path) / 1_000_000, 2) if os.path.isfile(path) else 0.0
+# # # #     return duration, fps, total, size_mb
+
+
+# # # # def _fmt_duration(seconds: float) -> str:
+# # # #     """Converts float seconds to 'H:MM:SS' string."""
+# # # #     t  = int(seconds)
+# # # #     hh = t // 3600
+# # # #     mm = (t % 3600) // 60
+# # # #     ss = t % 60
+# # # #     return f"{hh}:{mm:02d}:{ss:02d}"
+
+
+# # # # def _event_type_to_violation_type(event_type: str) -> str:
+# # # #     """
+# # # #     Map internal event_type strings → CVVRS API ViolationType enum values.
+
+# # # #     CVVRS types: PHONE_USAGE | DROWSY | DISTRACTION | EATING |
+# # # #                  EYES_CLOSED | POSTURE_ALERT | HAND_TO_EAR | SEAT_ABSENCE
+# # # #     """
+# # # #     return {
+# # # #         "phone_use":       "PHONE_USAGE",
+# # # #         "seat_absence":    "SEAT_ABSENCE",
+# # # #         "drowsy":          "DROWSY",
+# # # #         "sleeping":        "DROWSY",
+# # # #         "sleeping_absent": "DROWSY",
+# # # #         "distraction":     "DISTRACTION",
+# # # #         "eating":          "EATING",
+# # # #         "eyes_closed":     "EYES_CLOSED",
+# # # #         "posture_alert":   "POSTURE_ALERT",
+# # # #         "hand_to_ear":     "HAND_TO_EAR",
+# # # #     }.get(event_type.lower(), event_type.upper())
+
+
+# # # # def _severity_for_risk(risk_score: float) -> str:
+# # # #     """
+# # # #     Map risk score → severity string.
+
+# # # #     Tiers (aligned with CVVRS severity reference):
+# # # #         >= 95  → CRITICAL
+# # # #         >= 80  → HIGH
+# # # #         >= 50  → MEDIUM
+# # # #         <  50  → LOW
+# # # #     """
+# # # #     if risk_score >= 95:
+# # # #         return "CRITICAL"
+# # # #     if risk_score >= 80:
+# # # #         return "HIGH"
+# # # #     if risk_score >= 50:
+# # # #         return "MEDIUM"
+# # # #     return "LOW"
+
+
+# # # # def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
+# # # #     """
+# # # #     Convert the relative frame path stored by ViolationStore._save_frame()
+# # # #     back to an absolute local disk path.
+
+# # # #     _save_frame() returns:  "<analysis_id>/frames/<filename>"
+# # # #     The actual disk path is: "outputs/<analysis_id>/frames/<filename>"
+# # # #     """
+# # # #     filename = os.path.basename(relative_path)
+# # # #     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+# # # # def _hms_to_seconds(hms: str) -> float:
+# # # #     """
+# # # #     Convert "H:MM:SS" or "HH:MM:SS" to float seconds.
+# # # #     Returns 0.0 on any parse error.
+# # # #     """
+# # # #     try:
+# # # #         parts = hms.strip().split(":")
+# # # #         if len(parts) == 3:
+# # # #             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+# # # #         if len(parts) == 2:
+# # # #             return int(parts[0]) * 60 + float(parts[1])
+# # # #         return float(parts[0])
+# # # #     except Exception:
+# # # #         return 0.0
+
+
+# # # # # ── Main entry point ──────────────────────────────────────────────────────────
+
+# # # # def analyze_journey(
+# # # #     job_id:        str,
+# # # #     journey_id:    int,
+# # # #     folder_name:   str,                  # e.g. "journeys/1/2026-06-10/JRN-..."
+# # # #     video_jobs:    List[VideoJob],
+# # # #     tmp_paths:     Dict[int, str],       # video_id → local tmp file path
+# # # #     progress_cb    = None,               # optional callable(pct, msg, current_video)
+# # # #     video_done_cb  = None,               # optional callable(video_id, ok, error, error_type, stack_trace, reason)
+# # # # ) -> Tuple[List[VideoResult], float]:
+# # # #     """
+# # # #     Run the full detection pipeline over all videos in a journey.
+
+# # # #     Parameters
+# # # #     ──────────
+# # # #     job_id        : RabbitMQ job ID (used for logging only).
+# # # #     journey_id    : Journey ID.
+# # # #     folder_name   : Journey folder prefix used for S3 frame key construction,
+# # # #                     e.g. "journeys/1/2026-06-10/JRN-20260610-1-ABC123".
+# # # #     video_jobs    : List of VideoJob objects (will be sorted by sequence_no).
+# # # #     tmp_paths     : Mapping of video_id → absolute local temp file path.
+# # # #     progress_cb   : Optional callable(pct, msg, current_video_idx) for updates.
+# # # #     video_done_cb : Optional callable(video_id, ok, error, error_type,
+# # # #                     stack_trace, reason) fired immediately after each video
+# # # #                     finishes (success or failure). Used by journey_runner.py
+# # # #                     to push per-video progress events to the parent process via
+# # # #                     a multiprocessing.Queue so the parent knows which videos
+# # # #                     completed before a native crash kills the child.
+
+# # # #     Returns
+# # # #     ───────
+# # # #     (video_results, total_wall_clock_seconds)
+# # # #     """
+# # # #     # Sort by sequence_no — critical for correct time/frame offset continuity
+# # # #     ordered  = sorted(video_jobs, key=lambda v: v.sequence_no)
+# # # #     n_videos = len(ordered)
+
+# # # #     # One shared ViolationStore for the whole journey.
+# # # #     analysis_id   = f"journey_{journey_id}"
+# # # #     shared_vstore = ViolationStore(
+# # # #         analysis_id     = analysis_id,
+# # # #         train_detail_id = journey_id,
+# # # #     )
+
+# # # #     time_offset  = 0.0
+# # # #     frame_offset = 0
+# # # #     wall_start   = time.time()
+
+# # # #     # Per-video metadata cache (keyed by video_id)
+# # # #     meta_by_id: Dict[int, dict] = {}
+
+# # # #     # Track which videos were skipped due to a per-video error so we can
+# # # #     # still include them in the VideoResult list with zero violations.
+# # # #     failed_video_ids: set = set()
+
+# # # #     # ── Fix 5: memory/resource snapshot — journey start ──────────────────────
+# # # #     _log_resource_snapshot("JOURNEY START", job_id=job_id,
+# # # #                             violations=len(shared_vstore._violations))
+
+# # # #     # ── Run the AI pipeline over each video ──────────────────────────────────
+# # # #     for idx, vj in enumerate(ordered):
+# # # #         tmp_path    = tmp_paths[vj.video_id]
+# # # #         db_filename = os.path.basename(vj.s3_key)
+
+# # # #         duration, fps, total_frames, size_mb = _video_meta(tmp_path)
+
+# # # #         meta_by_id[vj.video_id] = {
+# # # #             "duration_seconds":   duration,
+# # # #             "duration_formatted": _fmt_duration(duration),
+# # # #             "fps":                fps,
+# # # #             "size_mb":            size_mb,
+# # # #             "total_frames":       total_frames,
+# # # #         }
+
+# # # #         print(
+# # # #             f"[Analyzer:{job_id}]  [{idx + 1}/{n_videos}]  "
+# # # #             f"video_id={vj.video_id}  seq={vj.sequence_no}  "
+# # # #             f"file={db_filename}  "
+# # # #             f"time_offset={time_offset:.2f}s  frame_offset={frame_offset}"
+# # # #         )
+
+# # # #         # ── Fix 5: memory/resource snapshot — before this video ──────────────
+# # # #         _log_resource_snapshot("VIDEO START", job_id=job_id,
+# # # #                                 violations=len(shared_vstore._violations))
+
+# # # #         pipeline = GadgetDetectionPipeline(
+# # # #             source           = tmp_path,
+# # # #             analysis_id      = analysis_id,
+# # # #             train_detail_id  = journey_id,
+# # # #             save             = False,
+# # # #             display          = False,
+# # # #             shared_vstore    = shared_vstore,
+# # # #             time_offset      = time_offset,
+# # # #             frame_offset     = frame_offset,
+# # # #             source_filename  = db_filename,
+# # # #         )
+
+# # # #         # ── FIX — Issue #2: per-video error isolation ─────────────────────────
+# # # #         # Wrap pipeline.run() so a failure for one video is logged and skipped,
+# # # #         # allowing the remaining videos in the journey to be processed normally.
+# # # #         #
+# # # #         # We catch BaseException (not just Exception) because
+# # # #         # GadgetDetectionPipeline.run() calls sys.exit(1) when it cannot open
+# # # #         # a video file — sys.exit raises SystemExit which is a BaseException
+# # # #         # subclass and would otherwise escape an "except Exception" guard.
+# # # #         #
+# # # #         # KeyboardInterrupt is explicitly re-raised so Ctrl-C still works.
+# # # #         # SystemExit is also re-raised so a genuine fatal signal propagates to
+# # # #         # the consumer's outer handler (nack + DLQ) instead of being swallowed.
+# # # #         #
+# # # #         # video_done_cb is called after every video — success or failure —
+# # # #         # so that journey_runner.py's parent process learns which videos
+# # # #         # completed before a native crash kills the child. It is best-effort:
+# # # #         # a failure inside the callback is swallowed so it never disrupts the
+# # # #         # remaining video loop.
+# # # #         _video_exc_for_cb: BaseException | None = None
+# # # #         try:
+# # # #             pipeline.run()
+# # # #         except KeyboardInterrupt:
+# # # #             raise
+# # # #         except SystemExit:
+# # # #             raise
+# # # #         except BaseException as video_exc:
+# # # #             _video_exc_for_cb = video_exc
+# # # #             print(
+# # # #                 f"[Analyzer:{job_id}]  WARNING — video_id={vj.video_id} "
+# # # #                 f"seq={vj.sequence_no} FAILED (skipping): {video_exc!r}"
+# # # #             )
+# # # #             failed_video_ids.add(vj.video_id)
+# # # #             # Fall through: advance offsets and continue with the next video.
+
+# # # #         # Fire video_done_cb (best-effort) so the parent process can track
+# # # #         # per-video completion before a native crash terminates the child.
+# # # #         if video_done_cb is not None:
+# # # #             try:
+# # # #                 if _video_exc_for_cb is None:
+# # # #                     video_done_cb(
+# # # #                         vj.video_id,
+# # # #                         True,   # ok
+# # # #                         None,   # error
+# # # #                         None,   # error_type
+# # # #                         None,   # stack_trace
+# # # #                         None,   # reason
+# # # #                     )
+# # # #                 else:
+# # # #                     import traceback as _tb
+# # # #                     video_done_cb(
+# # # #                         vj.video_id,
+# # # #                         False,                          # ok
+# # # #                         str(_video_exc_for_cb),         # error
+# # # #                         "PROCESSING_ERROR",             # error_type
+# # # #                         _tb.format_exc(),               # stack_trace
+# # # #                         None,                           # reason
+# # # #                     )
+# # # #             except Exception:
+# # # #                 pass  # never let a callback error kill the analysis loop
+
+# # # #         # Drop our reference to the finished pipeline so it (and the
+# # # #         # ThreadPoolExecutor/MediaPipe resources it owned, which run() has
+# # # #         # already explicitly shut down/closed) can be collected promptly
+# # # #         # rather than living until the next loop iteration reassigns it.
+# # # #         del pipeline
+
+# # # #         # Advance offsets for the next video regardless of success/failure.
+# # # #         # Using the metadata we already captured keeps offsets consistent for
+# # # #         # subsequent videos even when this one's pipeline run was skipped.
+# # # #         time_offset  += duration
+# # # #         frame_offset += total_frames
+
+# # # #         # ── Fix 5: memory/resource snapshot — after this video ───────────────
+# # # #         _log_resource_snapshot("VIDEO END", job_id=job_id,
+# # # #                                 violations=len(shared_vstore._violations))
+
+# # # #         # Report per-video progress (10%–90% band)
+# # # #         if progress_cb:
+# # # #             pct = 10 + int(((idx + 1) / n_videos) * 80)
+# # # #             try:
+# # # #                 progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# # # #             except Exception as exc:
+# # # #                 print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+
+# # # #     total_wall_seconds = time.time() - wall_start
+
+# # # #     # ── Dedup + merge ─────────────────────────────────────────────────────────
+# # # #     shared_vstore._deduplicate_by_frame()
+# # # #     shared_vstore._merge_by_time_window()
+
+# # # #     # ── Extract frames + upload to S3 ───────────────────────────────────────
+# # # #     #
+# # # #     # BUG FIX — Wrong frames in violation evidence
+# # # #     # ─────────────────────────────────────────────
+# # # #     # The old code called:
+# # # #     #   for vj in ordered:
+# # # #     #       shared_vstore.extract_violation_frames(tmp_path)
+# # # #     #
+# # # #     # extract_violation_frames() iterates ALL violations in the shared store
+# # # #     # and seeks to v.frame_index (a GLOBAL frame number across all videos).
+# # # #     # When called with video_2's path, it seeks to e.g. frame 4500 in video_2
+# # # #     # — but frame 4500 is from video_1 (frame_index was global, not local).
+# # # #     # Result: every violation gets a frame from the WRONG video.
+# # # #     #
+# # # #     # Fix: build a per-filename path map, then for each violation use its
+# # # #     # source_filename to open the correct video and seek using local_time_str
+# # # #     # (seconds within that specific video file) — which is correct regardless
+# # # #     # of how many videos precede it in the journey.
+
+# # # #     # Map db_filename → local tmp path
+# # # #     path_by_filename: Dict[str, str] = {
+# # # #         os.path.basename(vj.s3_key): tmp_paths[vj.video_id]
+# # # #         for vj in ordered
+# # # #     }
+
+# # # #     for v in shared_vstore._violations:
+# # # #         # ── Case 1: annotated frame already in memory — upload directly ──────
+# # # #         if v.annotated_frame is not None:
+# # # #             filename = _frame_filename(v)
+# # # #             try:
+# # # #                 s3_key            = upload_frame(v.annotated_frame, journey_id,
+# # # #                                                  filename, folder_name=folder_name)
+# # # #                 v.frame_path      = s3_key
+# # # #                 v.annotated_frame = None
+# # # #             except Exception as exc:
+# # # #                 print(f"[Analyzer:{job_id}]  In-memory frame upload failed ({filename}): {exc}")
+# # # #             continue
+
+# # # #         # ── Case 2: no frame yet — extract from the correct source video ─────
+# # # #         if v.frame_path:
+# # # #             # Already extracted to disk by a previous extract_violation_frames()
+# # # #             # call (e.g. standalone mode). Upload it.
+# # # #             local_path = _local_frame_path(shared_vstore, v.frame_path)
+# # # #             if os.path.isfile(local_path):
+# # # #                 try:
+# # # #                     s3_key       = upload_frame_from_path(local_path, journey_id,
+# # # #                                                           folder_name=folder_name)
+# # # #                     v.frame_path = s3_key
+# # # #                 except Exception as exc:
+# # # #                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
+# # # #             else:
+# # # #                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+# # # #             continue
+
+# # # #         # ── Case 3: no frame at all — seek into the correct source video ─────
+# # # #         src_file = getattr(v, "source_filename", "")
+# # # #         tmp_path = path_by_filename.get(src_file, "")
+# # # #         if not tmp_path or not os.path.isfile(tmp_path):
+# # # #             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
+# # # #                   f"(source_filename={src_file!r}) — skipping frame extraction")
+# # # #             continue
+
+# # # #         # Use local_time_str (seconds within this video) to seek correctly.
+# # # #         # v.local_time_str is set by record_violation(local_video_time=...) and
+# # # #         # stored as an "H:MM:SS" string. Convert back to seconds for cv2 seek.
+# # # #         local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # # #         cap = cv2.VideoCapture(tmp_path)
+# # # #         frame_img = None
+# # # #         if cap.isOpened():
+# # # #             cap.set(cv2.CAP_PROP_POS_MSEC, local_secs * 1000.0)
+# # # #             ret, frame_img = cap.read()
+# # # #             if not ret:
+# # # #                 # Fallback: try seeking by fraction of duration
+# # # #                 fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # # #                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # # #                 local_frame = int(local_secs * fps)
+# # # #                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(local_frame, max(0, total - 1)))
+# # # #                 ret, frame_img = cap.read()
+# # # #         cap.release()
+
+# # # #         if frame_img is None:
+# # # #             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
+# # # #                   f"@ local_time={local_secs:.2f}s — skipping")
+# # # #             continue
+
+# # # #         filename = _frame_filename(v)
+# # # #         try:
+# # # #             s3_key       = upload_frame(frame_img, journey_id,
+# # # #                                         filename, folder_name=folder_name)
+# # # #             v.frame_path = s3_key
+# # # #         except Exception as exc:
+# # # #             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
+
+# # # #     # ── Build VideoResult / ViolationResult objects ───────────────────────────
+# # # #     violations_by_filename: Dict[str, list] = {}
+# # # #     for v in shared_vstore._violations:
+# # # #         violations_by_filename.setdefault(v.source_filename, []).append(v)
+
+# # # #     video_results: List[VideoResult] = []
+
+# # # #     for vj in ordered:
+# # # #         meta        = meta_by_id[vj.video_id]
+# # # #         db_filename = os.path.basename(vj.s3_key)
+# # # #         raw_viols   = violations_by_filename.get(db_filename, [])
+
+# # # #         violation_results = []
+# # # #         for v in raw_viols:
+# # # #             # timestamp_seconds: float seconds from journey start (global)
+# # # #             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+
+# # # #             # original_video_timestamp: float seconds within the source video (local)
+# # # #             local_ts = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # # #             violation_results.append(
+# # # #                 ViolationResult(
+# # # #                     violation_type           = _event_type_to_violation_type(v.type),
+# # # #                     severity                 = _severity_for_risk(v.risk_score),
+# # # #                     confidence               = round(v.confidence * 100, 2),
+# # # #                     risk_score               = float(v.risk_score),
+# # # #                     timestamp_seconds        = _fmt_duration(journey_ts),
+# # # #                     original_video_timestamp = _fmt_duration(local_ts),
+# # # #                     frame_paths              = [v.frame_path] if v.frame_path else [],
+# # # #                 )
+# # # #             )
+
+# # # #         video_results.append(
+# # # #             VideoResult(
+# # # #                 video_id           = vj.video_id,
+# # # #                 video_name         = db_filename,
+# # # #                 sequence_no        = vj.sequence_no,
+# # # #                 duration_seconds   = meta["duration_seconds"],
+# # # #                 duration_formatted = meta["duration_formatted"],
+# # # #                 fps                = meta["fps"],
+# # # #                 size_mb            = meta["size_mb"],
+# # # #                 original_s3_key    = vj.s3_key,
+# # # #                 violations         = violation_results,
+# # # #             )
+# # # #         )
+
+# # # #     if failed_video_ids:
+# # # #         print(
+# # # #             f"[Analyzer:{job_id}]  Journey analysis complete with "
+# # # #             f"{len(failed_video_ids)} skipped video(s): {sorted(failed_video_ids)}"
+# # # #         )
+
+# # # #     # ── Fix 6: explicit garbage collection at end of journey ─────────────────
+# # # #     # By this point every violation's annotated_frame has already been
+# # # #     # uploaded and cleared (set to None) above, and every per-video pipeline
+# # # #     # (executor + MediaPipe graphs) has already been explicitly shut down /
+# # # #     # closed inside GadgetDetectionPipeline.run(). gc.collect() here is a
+# # # #     # belt-and-suspenders step to promptly reclaim any reference cycles
+# # # #     # (e.g. exception tracebacks) before the next journey starts.
+# # # #     n_violations_final = len(shared_vstore._violations)
+# # # #     _log_resource_snapshot("JOURNEY END (pre-GC)", job_id=job_id,
+# # # #                             violations=n_violations_final)
+# # # #     gc.collect()
+# # # #     _log_resource_snapshot("JOURNEY END (post-GC)", job_id=job_id,
+# # # #                             violations=n_violations_final)
+
+# # # #     return video_results, total_wall_seconds
+
+
+# # # # # ── Private helpers ───────────────────────────────────────────────────────────
+
+# # # # def _frame_filename(v) -> str:
+# # # #     """Derive a JPEG filename from a _Violation object (matches _save_frame logic)."""
+# # # #     distraction   = "_".join(sorted(v.events))
+# # # #     filename_time = v.time_str.replace(":", "-")
+# # # #     return f"{distraction}_{filename_time}.jpg"
+
+
+# # # from __future__ import annotations
+
+# # # import gc
+# # # import logging
+# # # import os
+# # # import threading
+# # # import time
+# # # from typing import Dict, List, Tuple
+
+# # # import cv2
+
+# # # try:
+# # #     import psutil
+# # #     _PSUTIL_AVAILABLE = True
+# # # except ImportError:
+# # #     psutil = None
+# # #     _PSUTIL_AVAILABLE = False
+
+# # # from models import VideoJob, VideoResult, ViolationResult
+# # # from s3_service import upload_frame, upload_frame_from_path
+
+# # # # Import the existing pipeline and store — unchanged
+# # # from main import GadgetDetectionPipeline
+# # # from utils.violation_store import ViolationStore
+
+# # # log = logging.getLogger("analyzer")
+
+# # # # OUTPUTS_ROOT mirrors the constant inside violation_store.py
+# # # OUTPUTS_ROOT = "outputs"
+
+
+# # # # ── Memory / resource diagnostics (Fix 5) ──────────────────────────────────────
+
+# # # _PROCESS = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+
+
+# # # def _rss_gb() -> float:
+# # #     """Current process resident set size, in GB. Returns -1.0 if psutil is unavailable."""
+# # #     if _PROCESS is None:
+# # #         return -1.0
+# # #     try:
+# # #         return _PROCESS.memory_info().rss / (1024 ** 3)
+# # #     except Exception:
+# # #         return -1.0
+
+
+# # # def _log_resource_snapshot(label: str, job_id: str = "", violations: int = -1) -> None:
+# # #     """
+# # #     Emit a single-line resource snapshot. `label` is one of:
+# # #     'VIDEO START', 'VIDEO END', 'JOURNEY START', 'JOURNEY END'.
+
+# # #     Also reports GPU memory state (via resource_manager, imported lazily
+# # #     so analyzer.py has no hard dependency on it being importable) — this
+# # #     gives Phase 9 leak-detection visibility into CUDA usage alongside the
+# # #     existing RSS/thread numbers, without changing what this function
+# # #     already logs for RSS/threads.
+# # #     """
+# # #     rss        = _rss_gb()
+# # #     thread_cnt = threading.active_count()
+# # #     rss_str    = f"{rss:.3f}GB" if rss >= 0 else "n/a (psutil unavailable)"
+# # #     viol_str   = f"  VIOLATIONS={violations}" if violations >= 0 else ""
+
+# # #     gpu_str = ""
+# # #     try:
+# # #         from resource_manager import get_gpu_memory_info
+# # #         gpu_info = get_gpu_memory_info()
+# # #         if gpu_info.available:
+# # #             gpu_str = (
+# # #                 f"  GPU_reserved={gpu_info.reserved_gb:.3f}GB"
+# # #                 f"/{gpu_info.total_gb:.3f}GB ({gpu_info.used_fraction*100:.1f}%)"
+# # #             )
+# # #     except Exception:
+# # #         pass
+
+# # #     print(
+# # #         f"[MEMORY {label}]  job={job_id}  RSS={rss_str}  THREADS={thread_cnt}"
+# # #         f"{viol_str}{gpu_str}"
+# # #     )
+
+
+# # # # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# # # def _video_meta(path: str) -> Tuple[float, float, int, float]:
+# # #     """Returns (duration_seconds, fps, total_frames, size_mb)."""
+# # #     cap = cv2.VideoCapture(path)
+# # #     if not cap.isOpened():
+# # #         return 0.0, 25.0, 0, 0.0
+# # #     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # #     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # #     cap.release()
+# # #     duration = total / fps if fps > 0 and total > 0 else 0.0
+# # #     size_mb  = round(os.path.getsize(path) / 1_000_000, 2) if os.path.isfile(path) else 0.0
+# # #     return duration, fps, total, size_mb
+
+
+# # # def _fmt_duration(seconds: float) -> str:
+# # #     """Converts float seconds to 'H:MM:SS' string."""
+# # #     t  = int(seconds)
+# # #     hh = t // 3600
+# # #     mm = (t % 3600) // 60
+# # #     ss = t % 60
+# # #     return f"{hh}:{mm:02d}:{ss:02d}"
+
+
+# # # def _event_type_to_violation_type(event_type: str) -> str:
+# # #     """
+# # #     Map internal event_type strings → CVVRS API ViolationType enum values.
+
+# # #     CVVRS types: PHONE_USAGE | DROWSY | DISTRACTION | EATING |
+# # #                  EYES_CLOSED | POSTURE_ALERT | HAND_TO_EAR | SEAT_ABSENCE
+# # #     """
+# # #     return {
+# # #         "phone_use":       "PHONE_USAGE",
+# # #         "seat_absence":    "SEAT_ABSENCE",
+# # #         "drowsy":          "DROWSY",
+# # #         "sleeping":        "DROWSY",
+# # #         "sleeping_absent": "DROWSY",
+# # #         "distraction":     "DISTRACTION",
+# # #         "eating":          "EATING",
+# # #         "eyes_closed":     "EYES_CLOSED",
+# # #         "posture_alert":   "POSTURE_ALERT",
+# # #         "hand_to_ear":     "HAND_TO_EAR",
+# # #     }.get(event_type.lower(), event_type.upper())
+
+
+# # # def _severity_for_risk(risk_score: float) -> str:
+# # #     """
+# # #     Map risk score → severity string.
+
+# # #     Tiers (aligned with CVVRS severity reference):
+# # #         >= 95  → CRITICAL
+# # #         >= 80  → HIGH
+# # #         >= 50  → MEDIUM
+# # #         <  50  → LOW
+# # #     """
+# # #     if risk_score >= 95:
+# # #         return "CRITICAL"
+# # #     if risk_score >= 80:
+# # #         return "HIGH"
+# # #     if risk_score >= 50:
+# # #         return "MEDIUM"
+# # #     return "LOW"
+
+
+# # # def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
+# # #     """
+# # #     Convert the relative frame path stored by ViolationStore._save_frame()
+# # #     back to an absolute local disk path.
+
+# # #     _save_frame() returns:  "<analysis_id>/frames/<filename>"
+# # #     The actual disk path is: "outputs/<analysis_id>/frames/<filename>"
+# # #     """
+# # #     filename = os.path.basename(relative_path)
+# # #     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+# # # def _hms_to_seconds(hms: str) -> float:
+# # #     """
+# # #     Convert "H:MM:SS" or "HH:MM:SS" to float seconds.
+# # #     Returns 0.0 on any parse error.
+# # #     """
+# # #     try:
+# # #         parts = hms.strip().split(":")
+# # #         if len(parts) == 3:
+# # #             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+# # #         if len(parts) == 2:
+# # #             return int(parts[0]) * 60 + float(parts[1])
+# # #         return float(parts[0])
+# # #     except Exception:
+# # #         return 0.0
+
+
+# # # # ── Main entry point ──────────────────────────────────────────────────────────
+
+# # # def analyze_journey(
+# # #     job_id:        str,
+# # #     journey_id:    int,
+# # #     folder_name:   str,                  # e.g. "journeys/1/2026-06-10/JRN-..."
+# # #     video_jobs:    List[VideoJob],
+# # #     tmp_paths:     Dict[int, str],       # video_id → local tmp file path
+# # #     progress_cb    = None,               # optional callable(pct, msg, current_video)
+# # #     video_done_cb  = None,               # optional callable(video_id, ok, error, error_type, stack_trace, reason)
+# # # ) -> Tuple[List[VideoResult], float, Dict[int, str]]:
+# # #     """
+# # #     Run the full detection pipeline over all videos in a journey.
+
+# # #     Parameters
+# # #     ──────────
+# # #     job_id        : RabbitMQ job ID (used for logging only).
+# # #     journey_id    : Journey ID.
+# # #     folder_name   : Journey folder prefix used for S3 frame key construction,
+# # #                     e.g. "journeys/1/2026-06-10/JRN-20260610-1-ABC123".
+# # #     video_jobs    : List of VideoJob objects (will be sorted by sequence_no).
+# # #     tmp_paths     : Mapping of video_id → absolute local temp file path.
+# # #     progress_cb   : Optional callable(pct, msg, current_video_idx) for updates.
+# # #     video_done_cb : Optional callable(video_id, ok, error, error_type,
+# # #                     stack_trace, reason) fired immediately after each video
+# # #                     finishes (success or failure). Used by journey_runner.py
+# # #                     to push per-video progress events to the parent process via
+# # #                     a multiprocessing.Queue so the parent knows which videos
+# # #                     completed before a native crash kills the child.
+
+# # #     Returns
+# # #     ───────
+# # #     (video_results, total_wall_clock_seconds)
+# # #     """
+# # #     # Sort by sequence_no — critical for correct time/frame offset continuity
+# # #     ordered  = sorted(video_jobs, key=lambda v: v.sequence_no)
+# # #     n_videos = len(ordered)
+
+# # #     # One shared ViolationStore for the whole journey.
+# # #     analysis_id   = f"journey_{journey_id}"
+# # #     shared_vstore = ViolationStore(
+# # #         analysis_id     = analysis_id,
+# # #         train_detail_id = journey_id,
+# # #     )
+
+# # #     time_offset  = 0.0
+# # #     frame_offset = 0
+# # #     wall_start   = time.time()
+
+# # #     # Per-video metadata cache (keyed by video_id)
+# # #     meta_by_id: Dict[int, dict] = {}
+
+# # #     # Track which videos were skipped due to a per-video error so we can
+# # #     # still include them in the VideoResult list with zero violations.
+# # #     failed_video_ids: set = set()
+
+# # #     # ── Fix 5: memory/resource snapshot — journey start ──────────────────────
+# # #     _log_resource_snapshot("JOURNEY START", job_id=job_id,
+# # #                             violations=len(shared_vstore._violations))
+
+# # #     # ── Run the AI pipeline over each video ──────────────────────────────────
+# # #     for idx, vj in enumerate(ordered):
+# # #         tmp_path    = tmp_paths[vj.video_id]
+# # #         db_filename = os.path.basename(vj.s3_key)
+
+# # #         duration, fps, total_frames, size_mb = _video_meta(tmp_path)
+
+# # #         meta_by_id[vj.video_id] = {
+# # #             "duration_seconds":   duration,
+# # #             "duration_formatted": _fmt_duration(duration),
+# # #             "fps":                fps,
+# # #             "size_mb":            size_mb,
+# # #             "total_frames":       total_frames,
+# # #         }
+
+# # #         print(
+# # #             f"[Analyzer:{job_id}]  [{idx + 1}/{n_videos}]  "
+# # #             f"video_id={vj.video_id}  seq={vj.sequence_no}  "
+# # #             f"file={db_filename}  "
+# # #             f"time_offset={time_offset:.2f}s  frame_offset={frame_offset}"
+# # #         )
+
+# # #         # ── Fix 5: memory/resource snapshot — before this video ──────────────
+# # #         _log_resource_snapshot("VIDEO START", job_id=job_id,
+# # #                                 violations=len(shared_vstore._violations))
+
+# # #         # ── Resource lifecycle (Phase 3): GPU threshold safety check ─────────
+# # #         # If CUDA memory usage is already at/above the configured threshold
+# # #         # before this video even starts, attempting inference is very likely
+# # #         # to OOM anyway. Skip this video safely (mark it failed with a clear
+# # #         # reason) rather than letting a near-certain CUDA crash take down the
+# # #         # whole journey/process. is_gpu_over_threshold() is a no-op (returns
+# # #         # False) when CUDA isn't available, so this never affects CPU-only
+# # #         # environments.
+# # #         try:
+# # #             from resource_manager import is_gpu_over_threshold, gpu_cleanup, CUDA_ABORT_THRESHOLD
+# # #             if is_gpu_over_threshold():
+# # #                 print(
+# # #                     f"[Analyzer:{job_id}]  GPU memory usage at/above "
+# # #                     f"{CUDA_ABORT_THRESHOLD*100:.0f}% threshold — attempting "
+# # #                     f"cleanup before video_id={vj.video_id}..."
+# # #                 )
+# # #                 gpu_cleanup()
+# # #                 if is_gpu_over_threshold():
+# # #                     print(
+# # #                         f"[Analyzer:{job_id}]  GPU still over threshold after "
+# # #                         f"cleanup — skipping video_id={vj.video_id} "
+# # #                         f"seq={vj.sequence_no} to avoid a near-certain CUDA OOM."
+# # #                     )
+# # #                     failed_video_ids.add(vj.video_id)
+# # #                     if video_done_cb is not None:
+# # #                         try:
+# # #                             video_done_cb(
+# # #                                 vj.video_id, False,
+# # #                                 "Not Processed - Worker Resource Exhaustion",
+# # #                                 "NOT_PROCESSED", None,
+# # #                                 "Not Processed - Worker Resource Exhaustion",
+# # #                             )
+# # #                         except Exception:
+# # #                             pass
+# # #                     time_offset  += duration
+# # #                     frame_offset += total_frames
+# # #                     if progress_cb:
+# # #                         pct = 10 + int(((idx + 1) / n_videos) * 80)
+# # #                         try:
+# # #                             progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# # #                         except Exception as exc:
+# # #                             print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+# # #                     continue
+# # #         except ImportError:
+# # #             pass  # resource_manager unavailable — proceed without the check
+
+# # #         pipeline = GadgetDetectionPipeline(
+# # #             source           = tmp_path,
+# # #             analysis_id      = analysis_id,
+# # #             train_detail_id  = journey_id,
+# # #             save             = False,
+# # #             display          = False,
+# # #             shared_vstore    = shared_vstore,
+# # #             time_offset      = time_offset,
+# # #             frame_offset     = frame_offset,
+# # #             source_filename  = db_filename,
+# # #         )
+
+# # #         # ── FIX — Issue #2: per-video error isolation ─────────────────────────
+# # #         # Wrap pipeline.run() so a failure for one video is logged and skipped,
+# # #         # allowing the remaining videos in the journey to be processed normally.
+# # #         #
+# # #         # We catch BaseException (not just Exception) because
+# # #         # GadgetDetectionPipeline.run() calls sys.exit(1) when it cannot open
+# # #         # a video file — sys.exit raises SystemExit which is a BaseException
+# # #         # subclass and would otherwise escape an "except Exception" guard.
+# # #         #
+# # #         # KeyboardInterrupt is explicitly re-raised so Ctrl-C still works.
+# # #         # SystemExit is also re-raised so a genuine fatal signal propagates to
+# # #         # the consumer's outer handler (nack + DLQ) instead of being swallowed.
+# # #         #
+# # #         # video_done_cb is called after every video — success or failure —
+# # #         # so that journey_runner.py's parent process learns which videos
+# # #         # completed before a native crash kills the child. It is best-effort:
+# # #         # a failure inside the callback is swallowed so it never disrupts the
+# # #         # remaining video loop.
+# # #         _video_exc_for_cb: BaseException | None = None
+# # #         try:
+# # #             pipeline.run()
+# # #         except KeyboardInterrupt:
+# # #             raise
+# # #         except SystemExit:
+# # #             raise
+# # #         except BaseException as video_exc:
+# # #             _video_exc_for_cb = video_exc
+# # #             print(
+# # #                 f"[Analyzer:{job_id}]  WARNING — video_id={vj.video_id} "
+# # #                 f"seq={vj.sequence_no} FAILED (skipping): {video_exc!r}"
+# # #             )
+# # #             failed_video_ids.add(vj.video_id)
+# # #             # Fall through: advance offsets and continue with the next video.
+
+# # #         # Fire video_done_cb (best-effort) so the parent process can track
+# # #         # per-video completion before a native crash terminates the child.
+# # #         if video_done_cb is not None:
+# # #             try:
+# # #                 if _video_exc_for_cb is None:
+# # #                     video_done_cb(
+# # #                         vj.video_id,
+# # #                         True,   # ok
+# # #                         None,   # error
+# # #                         None,   # error_type
+# # #                         None,   # stack_trace
+# # #                         None,   # reason
+# # #                     )
+# # #                 else:
+# # #                     import traceback as _tb
+# # #                     video_done_cb(
+# # #                         vj.video_id,
+# # #                         False,                          # ok
+# # #                         str(_video_exc_for_cb),         # error
+# # #                         "PROCESSING_ERROR",             # error_type
+# # #                         _tb.format_exc(),               # stack_trace
+# # #                         None,                           # reason
+# # #                     )
+# # #             except Exception:
+# # #                 pass  # never let a callback error kill the analysis loop
+
+# # #         # Drop our reference to the finished pipeline so it (and the
+# # #         # ThreadPoolExecutor/MediaPipe resources it owned, which run() has
+# # #         # already explicitly shut down/closed) can be collected promptly
+# # #         # rather than living until the next loop iteration reassigns it.
+# # #         del pipeline
+
+# # #         # Advance offsets for the next video regardless of success/failure.
+# # #         # Using the metadata we already captured keeps offsets consistent for
+# # #         # subsequent videos even when this one's pipeline run was skipped.
+# # #         time_offset  += duration
+# # #         frame_offset += total_frames
+
+# # #         # ── Fix 5: memory/resource snapshot — after this video ───────────────
+# # #         _log_resource_snapshot("VIDEO END", job_id=job_id,
+# # #                                 violations=len(shared_vstore._violations))
+
+# # #         # Report per-video progress (10%–90% band)
+# # #         if progress_cb:
+# # #             pct = 10 + int(((idx + 1) / n_videos) * 80)
+# # #             try:
+# # #                 progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# # #             except Exception as exc:
+# # #                 print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+
+# # #     total_wall_seconds = time.time() - wall_start
+
+# # #     # ── Dedup + merge ─────────────────────────────────────────────────────────
+# # #     shared_vstore._deduplicate_by_frame()
+# # #     shared_vstore._merge_by_time_window()
+
+# # #     # ── Extract frames + upload to S3 ───────────────────────────────────────
+# # #     #
+# # #     # BUG FIX — Wrong frames in violation evidence
+# # #     # ─────────────────────────────────────────────
+# # #     # The old code called:
+# # #     #   for vj in ordered:
+# # #     #       shared_vstore.extract_violation_frames(tmp_path)
+# # #     #
+# # #     # extract_violation_frames() iterates ALL violations in the shared store
+# # #     # and seeks to v.frame_index (a GLOBAL frame number across all videos).
+# # #     # When called with video_2's path, it seeks to e.g. frame 4500 in video_2
+# # #     # — but frame 4500 is from video_1 (frame_index was global, not local).
+# # #     # Result: every violation gets a frame from the WRONG video.
+# # #     #
+# # #     # Fix: build a per-filename path map, then for each violation use its
+# # #     # source_filename to open the correct video and seek using local_time_str
+# # #     # (seconds within that specific video file) — which is correct regardless
+# # #     # of how many videos precede it in the journey.
+
+# # #     # Map db_filename → local tmp path
+# # #     path_by_filename: Dict[str, str] = {
+# # #         os.path.basename(vj.s3_key): tmp_paths[vj.video_id]
+# # #         for vj in ordered
+# # #     }
+
+# # #     for v in shared_vstore._violations:
+# # #         # ── Case 1: annotated frame already in memory — upload directly ──────
+# # #         if v.annotated_frame is not None:
+# # #             filename = _frame_filename(v)
+# # #             try:
+# # #                 s3_key            = upload_frame(v.annotated_frame, journey_id,
+# # #                                                  filename, folder_name=folder_name)
+# # #                 v.frame_path      = s3_key
+# # #                 v.annotated_frame = None
+# # #             except Exception as exc:
+# # #                 print(f"[Analyzer:{job_id}]  In-memory frame upload failed ({filename}): {exc}")
+# # #             continue
+
+# # #         # ── Case 2: no frame yet — extract from the correct source video ─────
+# # #         if v.frame_path:
+# # #             # Already extracted to disk by a previous extract_violation_frames()
+# # #             # call (e.g. standalone mode). Upload it.
+# # #             local_path = _local_frame_path(shared_vstore, v.frame_path)
+# # #             if os.path.isfile(local_path):
+# # #                 try:
+# # #                     s3_key       = upload_frame_from_path(local_path, journey_id,
+# # #                                                           folder_name=folder_name)
+# # #                     v.frame_path = s3_key
+# # #                 except Exception as exc:
+# # #                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
+# # #             else:
+# # #                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+# # #             continue
+
+# # #         # ── Case 3: no frame at all — seek into the correct source video ─────
+# # #         src_file = getattr(v, "source_filename", "")
+# # #         tmp_path = path_by_filename.get(src_file, "")
+# # #         if not tmp_path or not os.path.isfile(tmp_path):
+# # #             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
+# # #                   f"(source_filename={src_file!r}) — skipping frame extraction")
+# # #             continue
+
+# # #         # Use local_time_str (seconds within this video) to seek correctly.
+# # #         # v.local_time_str is set by record_violation(local_video_time=...) and
+# # #         # stored as an "H:MM:SS" string. Convert back to seconds for cv2 seek.
+# # #         local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # #         cap = cv2.VideoCapture(tmp_path)
+# # #         frame_img = None
+# # #         if cap.isOpened():
+# # #             cap.set(cv2.CAP_PROP_POS_MSEC, local_secs * 1000.0)
+# # #             ret, frame_img = cap.read()
+# # #             if not ret:
+# # #                 # Fallback: try seeking by fraction of duration
+# # #                 fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # #                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # #                 local_frame = int(local_secs * fps)
+# # #                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(local_frame, max(0, total - 1)))
+# # #                 ret, frame_img = cap.read()
+# # #         cap.release()
+
+# # #         if frame_img is None:
+# # #             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
+# # #                   f"@ local_time={local_secs:.2f}s — skipping")
+# # #             continue
+
+# # #         filename = _frame_filename(v)
+# # #         try:
+# # #             s3_key       = upload_frame(frame_img, journey_id,
+# # #                                         filename, folder_name=folder_name)
+# # #             v.frame_path = s3_key
+# # #         except Exception as exc:
+# # #             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
+
+# # #     # ── Build VideoResult / ViolationResult objects ───────────────────────────
+# # #     violations_by_filename: Dict[str, list] = {}
+# # #     for v in shared_vstore._violations:
+# # #         violations_by_filename.setdefault(v.source_filename, []).append(v)
+
+# # #     video_results: List[VideoResult] = []
+
+# # #     for vj in ordered:
+# # #         meta        = meta_by_id[vj.video_id]
+# # #         db_filename = os.path.basename(vj.s3_key)
+# # #         raw_viols   = violations_by_filename.get(db_filename, [])
+
+# # #         violation_results = []
+# # #         for v in raw_viols:
+# # #             # timestamp_seconds: float seconds from journey start (global)
+# # #             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+
+# # #             # original_video_timestamp: float seconds within the source video (local)
+# # #             local_ts = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # #             violation_results.append(
+# # #                 ViolationResult(
+# # #                     violation_type           = _event_type_to_violation_type(v.type),
+# # #                     severity                 = _severity_for_risk(v.risk_score),
+# # #                     confidence               = round(v.confidence * 100, 2),
+# # #                     risk_score               = float(v.risk_score),
+# # #                     timestamp_seconds        = _fmt_duration(journey_ts),
+# # #                     original_video_timestamp = _fmt_duration(local_ts),
+# # #                     frame_paths              = [v.frame_path] if v.frame_path else [],
+# # #                 )
+# # #             )
+
+# # #         video_results.append(
+# # #             VideoResult(
+# # #                 video_id           = vj.video_id,
+# # #                 video_name         = db_filename,
+# # #                 sequence_no        = vj.sequence_no,
+# # #                 duration_seconds   = meta["duration_seconds"],
+# # #                 duration_formatted = meta["duration_formatted"],
+# # #                 fps                = meta["fps"],
+# # #                 size_mb            = meta["size_mb"],
+# # #                 original_s3_key    = vj.s3_key,
+# # #                 violations         = violation_results,
+# # #             )
+# # #         )
+
+# # #     if failed_video_ids:
+# # #         print(
+# # #             f"[Analyzer:{job_id}]  Journey analysis complete with "
+# # #             f"{len(failed_video_ids)} skipped video(s): {sorted(failed_video_ids)}"
+# # #         )
+
+# # #     # Build the failed_videos dict (video_id → error message) that
+# # #     # journey_runner.py and consumer.py both expect as the third return value.
+# # #     # Videos in failed_video_ids were skipped due to a caught per-video
+# # #     # exception; the error message is a generic processing failure string
+# # #     # because the specific exception was already printed above at skip time.
+# # #     failed_videos: Dict[int, str] = {
+# # #         vid: "Video processing failed — see worker log for details"
+# # #         for vid in failed_video_ids
+# # #     }
+
+# # #     # ── Fix 6: explicit garbage collection at end of journey ─────────────────
+# # #     # By this point every violation's annotated_frame has already been
+# # #     # uploaded and cleared (set to None) above, and every per-video pipeline
+# # #     # (executor + MediaPipe graphs) has already been explicitly shut down /
+# # #     # closed inside GadgetDetectionPipeline.run(). gc.collect() here is a
+# # #     # belt-and-suspenders step to promptly reclaim any reference cycles
+# # #     # (e.g. exception tracebacks) before the next journey starts.
+# # #     n_violations_final = len(shared_vstore._violations)
+# # #     _log_resource_snapshot("JOURNEY END (pre-GC)", job_id=job_id,
+# # #                             violations=n_violations_final)
+# # #     gc.collect()
+# # #     _log_resource_snapshot("JOURNEY END (post-GC)", job_id=job_id,
+# # #                             violations=n_violations_final)
+
+# # #     return video_results, total_wall_seconds, failed_videos
+
+
+# # # # ── Private helpers ───────────────────────────────────────────────────────────
+
+# # # def _frame_filename(v) -> str:
+# # #     """Derive a JPEG filename from a _Violation object (matches _save_frame logic)."""
+# # #     distraction   = "_".join(sorted(v.events))
+# # #     filename_time = v.time_str.replace(":", "-")
+# # #     return f"{distraction}_{filename_time}.jpg"
+
+
+
+
+# # # # from __future__ import annotations
+
+# # # # import gc
+# # # # import logging
+# # # # import os
+# # # # import threading
+# # # # import time
+# # # # from typing import Dict, List, Tuple
+
+# # # # import cv2
+
+# # # # try:
+# # # #     import psutil
+# # # #     _PSUTIL_AVAILABLE = True
+# # # # except ImportError:
+# # # #     psutil = None
+# # # #     _PSUTIL_AVAILABLE = False
+
+# # # # from models import VideoJob, VideoResult, ViolationResult
+# # # # from s3_service import upload_frame, upload_frame_from_path
+
+# # # # # Import the existing pipeline and store — unchanged
+# # # # from main import GadgetDetectionPipeline
+# # # # from utils.violation_store import ViolationStore
+
+# # # # log = logging.getLogger("analyzer")
+
+# # # # # OUTPUTS_ROOT mirrors the constant inside violation_store.py
+# # # # OUTPUTS_ROOT = "outputs"
+
+
+# # # # # ── Memory / resource diagnostics (Fix 5) ──────────────────────────────────────
+
+# # # # _PROCESS = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+
+
+# # # # def _rss_gb() -> float:
+# # # #     """Current process resident set size, in GB. Returns -1.0 if psutil is unavailable."""
+# # # #     if _PROCESS is None:
+# # # #         return -1.0
+# # # #     try:
+# # # #         return _PROCESS.memory_info().rss / (1024 ** 3)
+# # # #     except Exception:
+# # # #         return -1.0
+
+
+# # # # def _log_resource_snapshot(label: str, job_id: str = "", violations: int = -1) -> None:
+# # # #     """
+# # # #     Emit a single-line resource snapshot. `label` is one of:
+# # # #     'VIDEO START', 'VIDEO END', 'JOURNEY START', 'JOURNEY END'.
+# # # #     """
+# # # #     rss        = _rss_gb()
+# # # #     thread_cnt = threading.active_count()
+# # # #     rss_str    = f"{rss:.3f}GB" if rss >= 0 else "n/a (psutil unavailable)"
+# # # #     viol_str   = f"  VIOLATIONS={violations}" if violations >= 0 else ""
+# # # #     print(
+# # # #         f"[MEMORY {label}]  job={job_id}  RSS={rss_str}  THREADS={thread_cnt}{viol_str}"
+# # # #     )
+
+
+# # # # # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# # # # def _video_meta(path: str) -> Tuple[float, float, int, float]:
+# # # #     """Returns (duration_seconds, fps, total_frames, size_mb)."""
+# # # #     cap = cv2.VideoCapture(path)
+# # # #     if not cap.isOpened():
+# # # #         return 0.0, 25.0, 0, 0.0
+# # # #     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # # #     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # # #     cap.release()
+# # # #     duration = total / fps if fps > 0 and total > 0 else 0.0
+# # # #     size_mb  = round(os.path.getsize(path) / 1_000_000, 2) if os.path.isfile(path) else 0.0
+# # # #     return duration, fps, total, size_mb
+
+
+# # # # def _fmt_duration(seconds: float) -> str:
+# # # #     """Converts float seconds to 'H:MM:SS' string."""
+# # # #     t  = int(seconds)
+# # # #     hh = t // 3600
+# # # #     mm = (t % 3600) // 60
+# # # #     ss = t % 60
+# # # #     return f"{hh}:{mm:02d}:{ss:02d}"
+
+
+# # # # def _event_type_to_violation_type(event_type: str) -> str:
+# # # #     """
+# # # #     Map internal event_type strings → CVVRS API ViolationType enum values.
+
+# # # #     CVVRS types: PHONE_USAGE | DROWSY | DISTRACTION | EATING |
+# # # #                  EYES_CLOSED | POSTURE_ALERT | HAND_TO_EAR | SEAT_ABSENCE
+# # # #     """
+# # # #     return {
+# # # #         "phone_use":       "PHONE_USAGE",
+# # # #         "seat_absence":    "SEAT_ABSENCE",
+# # # #         "drowsy":          "DROWSY",
+# # # #         "sleeping":        "DROWSY",
+# # # #         "sleeping_absent": "DROWSY",
+# # # #         "distraction":     "DISTRACTION",
+# # # #         "eating":          "EATING",
+# # # #         "eyes_closed":     "EYES_CLOSED",
+# # # #         "posture_alert":   "POSTURE_ALERT",
+# # # #         "hand_to_ear":     "HAND_TO_EAR",
+# # # #     }.get(event_type.lower(), event_type.upper())
+
+
+# # # # def _severity_for_risk(risk_score: float) -> str:
+# # # #     """
+# # # #     Map risk score → severity string.
+
+# # # #     Tiers (aligned with CVVRS severity reference):
+# # # #         >= 95  → CRITICAL
+# # # #         >= 80  → HIGH
+# # # #         >= 50  → MEDIUM
+# # # #         <  50  → LOW
+# # # #     """
+# # # #     if risk_score >= 95:
+# # # #         return "CRITICAL"
+# # # #     if risk_score >= 80:
+# # # #         return "HIGH"
+# # # #     if risk_score >= 50:
+# # # #         return "MEDIUM"
+# # # #     return "LOW"
+
+
+# # # # def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
+# # # #     """
+# # # #     Convert the relative frame path stored by ViolationStore._save_frame()
+# # # #     back to an absolute local disk path.
+
+# # # #     _save_frame() returns:  "<analysis_id>/frames/<filename>"
+# # # #     The actual disk path is: "outputs/<analysis_id>/frames/<filename>"
+# # # #     """
+# # # #     filename = os.path.basename(relative_path)
+# # # #     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+# # # # def _hms_to_seconds(hms: str) -> float:
+# # # #     """
+# # # #     Convert "H:MM:SS" or "HH:MM:SS" to float seconds.
+# # # #     Returns 0.0 on any parse error.
+# # # #     """
+# # # #     try:
+# # # #         parts = hms.strip().split(":")
+# # # #         if len(parts) == 3:
+# # # #             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+# # # #         if len(parts) == 2:
+# # # #             return int(parts[0]) * 60 + float(parts[1])
+# # # #         return float(parts[0])
+# # # #     except Exception:
+# # # #         return 0.0
+
+
+# # # # # ── Main entry point ──────────────────────────────────────────────────────────
+
+# # # # def analyze_journey(
+# # # #     job_id:      str,
+# # # #     journey_id:  int,
+# # # #     folder_name: str,                  # e.g. "journeys/1/2026-06-10/JRN-..."
+# # # #     video_jobs:  List[VideoJob],
+# # # #     tmp_paths:   Dict[int, str],       # video_id → local tmp file path
+# # # #     progress_cb  = None,               # optional callable(pct, msg, current_video)
+# # # #     rabbit_connection = None,
+# # # # ) -> Tuple[List[VideoResult], float]:
+# # # #     """
+# # # #     Run the full detection pipeline over all videos in a journey.
+
+# # # #     Parameters
+# # # #     ──────────
+# # # #     job_id      : RabbitMQ job ID (used for logging only).
+# # # #     journey_id  : Journey ID.
+# # # #     folder_name : Journey folder prefix used for S3 frame key construction,
+# # # #                   e.g. "journeys/1/2026-06-10/JRN-20260610-1-ABC123".
+# # # #     video_jobs  : List of VideoJob objects (will be sorted by sequence_no).
+# # # #     tmp_paths   : Mapping of video_id → absolute local temp file path.
+# # # #     progress_cb : Optional callable(pct, msg, current_video_idx) for updates.
+
+# # # #     Returns
+# # # #     ───────
+# # # #     (video_results, total_wall_clock_seconds)
+# # # #     """
+# # # #     # Sort by sequence_no — critical for correct time/frame offset continuity
+# # # #     ordered  = sorted(video_jobs, key=lambda v: v.sequence_no)
+# # # #     n_videos = len(ordered)
+
+# # # #     # One shared ViolationStore for the whole journey.
+# # # #     analysis_id   = f"journey_{journey_id}"
+# # # #     shared_vstore = ViolationStore(
+# # # #         analysis_id     = analysis_id,
+# # # #         train_detail_id = journey_id,
+# # # #     )
+
+# # # #     time_offset  = 0.0
+# # # #     frame_offset = 0
+# # # #     wall_start   = time.time()
+
+# # # #     # Per-video metadata cache (keyed by video_id)
+# # # #     meta_by_id: Dict[int, dict] = {}
+
+# # # #     # Track which videos were skipped due to a per-video error so we can
+# # # #     # still include them in the VideoResult list with zero violations.
+# # # #     failed_video_ids: set = set()
+
+# # # #     # ── Fix 5: memory/resource snapshot — journey start ──────────────────────
+# # # #     _log_resource_snapshot("JOURNEY START", job_id=job_id,
+# # # #                             violations=len(shared_vstore._violations))
+
+# # # #     # ── Run the AI pipeline over each video ──────────────────────────────────
+# # # #     for idx, vj in enumerate(ordered):
+# # # #         tmp_path    = tmp_paths[vj.video_id]
+# # # #         db_filename = os.path.basename(vj.s3_key)
+
+# # # #         duration, fps, total_frames, size_mb = _video_meta(tmp_path)
+
+# # # #         meta_by_id[vj.video_id] = {
+# # # #             "duration_seconds":   duration,
+# # # #             "duration_formatted": _fmt_duration(duration),
+# # # #             "fps":                fps,
+# # # #             "size_mb":            size_mb,
+# # # #             "total_frames":       total_frames,
+# # # #         }
+
+# # # #         print(
+# # # #             f"[Analyzer:{job_id}]  [{idx + 1}/{n_videos}]  "
+# # # #             f"video_id={vj.video_id}  seq={vj.sequence_no}  "
+# # # #             f"file={db_filename}  "
+# # # #             f"time_offset={time_offset:.2f}s  frame_offset={frame_offset}"
+# # # #         )
+
+# # # #         # ── Fix 5: memory/resource snapshot — before this video ──────────────
+# # # #         _log_resource_snapshot("VIDEO START", job_id=job_id,
+# # # #                                 violations=len(shared_vstore._violations))
+
+# # # #         pipeline = GadgetDetectionPipeline(
+# # # #             source           = tmp_path,
+# # # #             analysis_id      = analysis_id,
+# # # #             train_detail_id  = journey_id,
+# # # #             save             = False,
+# # # #             display          = False,
+# # # #             shared_vstore    = shared_vstore,
+# # # #             time_offset      = time_offset,
+# # # #             frame_offset     = frame_offset,
+# # # #             source_filename  = db_filename,
+# # # #         )
+
+# # # #         # ── FIX — Issue #2: per-video error isolation ─────────────────────────
+# # # #         # Wrap pipeline.run() so a failure for one video is logged and skipped,
+# # # #         # allowing the remaining videos in the journey to be processed normally.
+# # # #         #
+# # # #         # We catch BaseException (not just Exception) because
+# # # #         # GadgetDetectionPipeline.run() calls sys.exit(1) when it cannot open
+# # # #         # a video file — sys.exit raises SystemExit which is a BaseException
+# # # #         # subclass and would otherwise escape an "except Exception" guard.
+# # # #         #
+# # # #         # KeyboardInterrupt is explicitly re-raised so Ctrl-C still works.
+# # # #         # SystemExit is also re-raised so a genuine fatal signal propagates to
+# # # #         # the consumer's outer handler (nack + DLQ) instead of being swallowed.
+# # # #         try:
+# # # #             pipeline.run()
+# # # #         except KeyboardInterrupt:
+# # # #             raise
+# # # #         except SystemExit:
+# # # #             raise
+# # # #         except BaseException as video_exc:
+# # # #             print(
+# # # #                 f"[Analyzer:{job_id}]  WARNING — video_id={vj.video_id} "
+# # # #                 f"seq={vj.sequence_no} FAILED (skipping): {video_exc!r}"
+# # # #             )
+# # # #             failed_video_ids.add(vj.video_id)
+# # # #             # Fall through: advance offsets and continue with the next video.
+
+# # # #         # Drop our reference to the finished pipeline so it (and the
+# # # #         # ThreadPoolExecutor/MediaPipe resources it owned, which run() has
+# # # #         # already explicitly shut down/closed) can be collected promptly
+# # # #         # rather than living until the next loop iteration reassigns it.
+# # # #         del pipeline
+
+# # # #         # Advance offsets for the next video regardless of success/failure.
+# # # #         # Using the metadata we already captured keeps offsets consistent for
+# # # #         # subsequent videos even when this one's pipeline run was skipped.
+# # # #         time_offset  += duration
+# # # #         frame_offset += total_frames
+
+# # # #         # ── Fix 5: memory/resource snapshot — after this video ───────────────
+# # # #         _log_resource_snapshot("VIDEO END", job_id=job_id,
+# # # #                                 violations=len(shared_vstore._violations))
+
+# # # #         # Report per-video progress (10%–90% band)
+# # # #         if progress_cb:
+# # # #             pct = 10 + int(((idx + 1) / n_videos) * 80)
+# # # #             try:
+# # # #                 progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# # # #             except Exception as exc:
+# # # #                 print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+
+# # # #     total_wall_seconds = time.time() - wall_start
+
+# # # #     # ── Dedup + merge ─────────────────────────────────────────────────────────
+# # # #     shared_vstore._deduplicate_by_frame()
+# # # #     shared_vstore._merge_by_time_window()
+
+# # # #     # ── Extract frames + upload to S3 ───────────────────────────────────────
+# # # #     #
+# # # #     # BUG FIX — Wrong frames in violation evidence
+# # # #     # ─────────────────────────────────────────────
+# # # #     # The old code called:
+# # # #     #   for vj in ordered:
+# # # #     #       shared_vstore.extract_violation_frames(tmp_path)
+# # # #     #
+# # # #     # extract_violation_frames() iterates ALL violations in the shared store
+# # # #     # and seeks to v.frame_index (a GLOBAL frame number across all videos).
+# # # #     # When called with video_2's path, it seeks to e.g. frame 4500 in video_2
+# # # #     # — but frame 4500 is from video_1 (frame_index was global, not local).
+# # # #     # Result: every violation gets a frame from the WRONG video.
+# # # #     #
+# # # #     # Fix: build a per-filename path map, then for each violation use its
+# # # #     # source_filename to open the correct video and seek using local_time_str
+# # # #     # (seconds within that specific video file) — which is correct regardless
+# # # #     # of how many videos precede it in the journey.
+
+# # # #     # Map db_filename → local tmp path
+# # # #     path_by_filename: Dict[str, str] = {
+# # # #         os.path.basename(vj.s3_key): tmp_paths[vj.video_id]
+# # # #         for vj in ordered
+# # # #     }
+
+# # # #     for v in shared_vstore._violations:
+# # # #         # ── Case 1: annotated frame already in memory — upload directly ──────
+# # # #         if v.annotated_frame is not None:
+# # # #             filename = _frame_filename(v)
+# # # #             try:
+# # # #                 s3_key            = upload_frame(v.annotated_frame, journey_id,
+# # # #                                                  filename, folder_name=folder_name)
+# # # #                 v.frame_path      = s3_key
+# # # #                 v.annotated_frame = None
+# # # #             except Exception as exc:
+# # # #                 print(f"[Analyzer:{job_id}]  In-memory frame upload failed ({filename}): {exc}")
+# # # #             continue
+
+# # # #         # ── Case 2: no frame yet — extract from the correct source video ─────
+# # # #         if v.frame_path:
+# # # #             # Already extracted to disk by a previous extract_violation_frames()
+# # # #             # call (e.g. standalone mode). Upload it.
+# # # #             local_path = _local_frame_path(shared_vstore, v.frame_path)
+# # # #             if os.path.isfile(local_path):
+# # # #                 try:
+# # # #                     s3_key       = upload_frame_from_path(local_path, journey_id,
+# # # #                                                           folder_name=folder_name)
+# # # #                     v.frame_path = s3_key
+# # # #                 except Exception as exc:
+# # # #                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
+# # # #             else:
+# # # #                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+# # # #             continue
+
+# # # #         # ── Case 3: no frame at all — seek into the correct source video ─────
+# # # #         src_file = getattr(v, "source_filename", "")
+# # # #         tmp_path = path_by_filename.get(src_file, "")
+# # # #         if not tmp_path or not os.path.isfile(tmp_path):
+# # # #             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
+# # # #                   f"(source_filename={src_file!r}) — skipping frame extraction")
+# # # #             continue
+
+# # # #         # Use local_time_str (seconds within this video) to seek correctly.
+# # # #         # v.local_time_str is set by record_violation(local_video_time=...) and
+# # # #         # stored as an "H:MM:SS" string. Convert back to seconds for cv2 seek.
+# # # #         local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # # #         cap = cv2.VideoCapture(tmp_path)
+# # # #         frame_img = None
+# # # #         if cap.isOpened():
+# # # #             cap.set(cv2.CAP_PROP_POS_MSEC, local_secs * 1000.0)
+# # # #             ret, frame_img = cap.read()
+# # # #             if not ret:
+# # # #                 # Fallback: try seeking by fraction of duration
+# # # #                 fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # # #                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # # #                 local_frame = int(local_secs * fps)
+# # # #                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(local_frame, max(0, total - 1)))
+# # # #                 ret, frame_img = cap.read()
+# # # #         cap.release()
+
+# # # #         if frame_img is None:
+# # # #             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
+# # # #                   f"@ local_time={local_secs:.2f}s — skipping")
+# # # #             continue
+
+# # # #         filename = _frame_filename(v)
+# # # #         try:
+# # # #             s3_key       = upload_frame(frame_img, journey_id,
+# # # #                                         filename, folder_name=folder_name)
+# # # #             v.frame_path = s3_key
+# # # #         except Exception as exc:
+# # # #             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
+
+# # # #     # ── Build VideoResult / ViolationResult objects ───────────────────────────
+# # # #     violations_by_filename: Dict[str, list] = {}
+# # # #     for v in shared_vstore._violations:
+# # # #         violations_by_filename.setdefault(v.source_filename, []).append(v)
+
+# # # #     video_results: List[VideoResult] = []
+
+# # # #     for vj in ordered:
+# # # #         meta        = meta_by_id[vj.video_id]
+# # # #         db_filename = os.path.basename(vj.s3_key)
+# # # #         raw_viols   = violations_by_filename.get(db_filename, [])
+
+# # # #         violation_results = []
+# # # #         for v in raw_viols:
+# # # #             # timestamp_seconds: float seconds from journey start (global)
+# # # #             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+
+# # # #             # original_video_timestamp: float seconds within the source video (local)
+# # # #             local_ts = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # # #             violation_results.append(
+# # # #                 ViolationResult(
+# # # #                     violation_type           = _event_type_to_violation_type(v.type),
+# # # #                     severity                 = _severity_for_risk(v.risk_score),
+# # # #                     confidence               = round(v.confidence * 100, 2),
+# # # #                     risk_score               = float(v.risk_score),
+# # # #                     timestamp_seconds        = _fmt_duration(journey_ts),
+# # # #                     original_video_timestamp = _fmt_duration(local_ts),
+# # # #                     frame_paths              = [v.frame_path] if v.frame_path else [],
+# # # #                 )
+# # # #             )
+
+# # # #         video_results.append(
+# # # #             VideoResult(
+# # # #                 video_id           = vj.video_id,
+# # # #                 video_name         = db_filename,
+# # # #                 sequence_no        = vj.sequence_no,
+# # # #                 duration_seconds   = meta["duration_seconds"],
+# # # #                 duration_formatted = meta["duration_formatted"],
+# # # #                 fps                = meta["fps"],
+# # # #                 size_mb            = meta["size_mb"],
+# # # #                 original_s3_key    = vj.s3_key,
+# # # #                 violations         = violation_results,
+# # # #             )
+# # # #         )
+
+# # # #     if failed_video_ids:
+# # # #         print(
+# # # #             f"[Analyzer:{job_id}]  Journey analysis complete with "
+# # # #             f"{len(failed_video_ids)} skipped video(s): {sorted(failed_video_ids)}"
+# # # #         )
+
+# # # #     # ── Fix 6: explicit garbage collection at end of journey ─────────────────
+# # # #     # By this point every violation's annotated_frame has already been
+# # # #     # uploaded and cleared (set to None) above, and every per-video pipeline
+# # # #     # (executor + MediaPipe graphs) has already been explicitly shut down /
+# # # #     # closed inside GadgetDetectionPipeline.run(). gc.collect() here is a
+# # # #     # belt-and-suspenders step to promptly reclaim any reference cycles
+# # # #     # (e.g. exception tracebacks) before the next journey starts.
+# # # #     n_violations_final = len(shared_vstore._violations)
+# # # #     _log_resource_snapshot("JOURNEY END (pre-GC)", job_id=job_id,
+# # # #                             violations=n_violations_final)
+# # # #     gc.collect()
+# # # #     _log_resource_snapshot("JOURNEY END (post-GC)", job_id=job_id,
+# # # #                             violations=n_violations_final)
+
+# # # #     return video_results, total_wall_seconds
+
+
+# # # # # ── Private helpers ───────────────────────────────────────────────────────────
+
+# # # # def _frame_filename(v) -> str:
+# # # #     """Derive a JPEG filename from a _Violation object (matches _save_frame logic)."""
+# # # #     distraction   = "_".join(sorted(v.events))
+# # # #     filename_time = v.time_str.replace(":", "-")
+# # # #     return f"{distraction}_{filename_time}.jpg"
+
+
+# # # from __future__ import annotations
+
+# # # import gc
+# # # import logging
+# # # import os
+# # # import threading
+# # # import time
+# # # from typing import Dict, List, Tuple
+
+# # # import cv2
+
+# # # try:
+# # #     import psutil
+# # #     _PSUTIL_AVAILABLE = True
+# # # except ImportError:
+# # #     psutil = None
+# # #     _PSUTIL_AVAILABLE = False
+
+# # # from models import VideoJob, VideoResult, ViolationResult
+# # # from s3_service import upload_frame, upload_frame_from_path
+
+# # # # Import the existing pipeline and store — unchanged
+# # # from main import GadgetDetectionPipeline
+# # # from utils.violation_store import ViolationStore
+
+# # # log = logging.getLogger("analyzer")
+
+# # # # OUTPUTS_ROOT mirrors the constant inside violation_store.py
+# # # OUTPUTS_ROOT = "outputs"
+
+
+# # # # ── Memory / resource diagnostics (Fix 5) ──────────────────────────────────────
+
+# # # _PROCESS = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+
+
+# # # def _rss_gb() -> float:
+# # #     """Current process resident set size, in GB. Returns -1.0 if psutil is unavailable."""
+# # #     if _PROCESS is None:
+# # #         return -1.0
+# # #     try:
+# # #         return _PROCESS.memory_info().rss / (1024 ** 3)
+# # #     except Exception:
+# # #         return -1.0
+
+
+# # # def _log_resource_snapshot(label: str, job_id: str = "", violations: int = -1) -> None:
+# # #     """
+# # #     Emit a single-line resource snapshot. `label` is one of:
+# # #     'VIDEO START', 'VIDEO END', 'JOURNEY START', 'JOURNEY END'.
+# # #     """
+# # #     rss        = _rss_gb()
+# # #     thread_cnt = threading.active_count()
+# # #     rss_str    = f"{rss:.3f}GB" if rss >= 0 else "n/a (psutil unavailable)"
+# # #     viol_str   = f"  VIOLATIONS={violations}" if violations >= 0 else ""
+# # #     print(
+# # #         f"[MEMORY {label}]  job={job_id}  RSS={rss_str}  THREADS={thread_cnt}{viol_str}"
+# # #     )
+
+
+# # # # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# # # def _video_meta(path: str) -> Tuple[float, float, int, float]:
+# # #     """Returns (duration_seconds, fps, total_frames, size_mb)."""
+# # #     cap = cv2.VideoCapture(path)
+# # #     if not cap.isOpened():
+# # #         return 0.0, 25.0, 0, 0.0
+# # #     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # #     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # #     cap.release()
+# # #     duration = total / fps if fps > 0 and total > 0 else 0.0
+# # #     size_mb  = round(os.path.getsize(path) / 1_000_000, 2) if os.path.isfile(path) else 0.0
+# # #     return duration, fps, total, size_mb
+
+
+# # # def _fmt_duration(seconds: float) -> str:
+# # #     """Converts float seconds to 'H:MM:SS' string."""
+# # #     t  = int(seconds)
+# # #     hh = t // 3600
+# # #     mm = (t % 3600) // 60
+# # #     ss = t % 60
+# # #     return f"{hh}:{mm:02d}:{ss:02d}"
+
+
+# # # def _event_type_to_violation_type(event_type: str) -> str:
+# # #     """
+# # #     Map internal event_type strings → CVVRS API ViolationType enum values.
+
+# # #     CVVRS types: PHONE_USAGE | DROWSY | DISTRACTION | EATING |
+# # #                  EYES_CLOSED | POSTURE_ALERT | HAND_TO_EAR | SEAT_ABSENCE
+# # #     """
+# # #     return {
+# # #         "phone_use":       "PHONE_USAGE",
+# # #         "seat_absence":    "SEAT_ABSENCE",
+# # #         "drowsy":          "DROWSY",
+# # #         "sleeping":        "DROWSY",
+# # #         "sleeping_absent": "DROWSY",
+# # #         "distraction":     "DISTRACTION",
+# # #         "eating":          "EATING",
+# # #         "eyes_closed":     "EYES_CLOSED",
+# # #         "posture_alert":   "POSTURE_ALERT",
+# # #         "hand_to_ear":     "HAND_TO_EAR",
+# # #     }.get(event_type.lower(), event_type.upper())
+
+
+# # # def _severity_for_risk(risk_score: float) -> str:
+# # #     """
+# # #     Map risk score → severity string.
+
+# # #     Tiers (aligned with CVVRS severity reference):
+# # #         >= 95  → CRITICAL
+# # #         >= 80  → HIGH
+# # #         >= 50  → MEDIUM
+# # #         <  50  → LOW
+# # #     """
+# # #     if risk_score >= 95:
+# # #         return "CRITICAL"
+# # #     if risk_score >= 80:
+# # #         return "HIGH"
+# # #     if risk_score >= 50:
+# # #         return "MEDIUM"
+# # #     return "LOW"
+
+
+# # # def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
+# # #     """
+# # #     Convert the relative frame path stored by ViolationStore._save_frame()
+# # #     back to an absolute local disk path.
+
+# # #     _save_frame() returns:  "<analysis_id>/frames/<filename>"
+# # #     The actual disk path is: "outputs/<analysis_id>/frames/<filename>"
+# # #     """
+# # #     filename = os.path.basename(relative_path)
+# # #     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+# # # def _hms_to_seconds(hms: str) -> float:
+# # #     """
+# # #     Convert "H:MM:SS" or "HH:MM:SS" to float seconds.
+# # #     Returns 0.0 on any parse error.
+# # #     """
+# # #     try:
+# # #         parts = hms.strip().split(":")
+# # #         if len(parts) == 3:
+# # #             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+# # #         if len(parts) == 2:
+# # #             return int(parts[0]) * 60 + float(parts[1])
+# # #         return float(parts[0])
+# # #     except Exception:
+# # #         return 0.0
+
+
+# # # # ── Main entry point ──────────────────────────────────────────────────────────
+
+# # # def analyze_journey(
+# # #     job_id:        str,
+# # #     journey_id:    int,
+# # #     folder_name:   str,                  # e.g. "journeys/1/2026-06-10/JRN-..."
+# # #     video_jobs:    List[VideoJob],
+# # #     tmp_paths:     Dict[int, str],       # video_id → local tmp file path
+# # #     progress_cb    = None,               # optional callable(pct, msg, current_video)
+# # #     video_done_cb  = None,               # optional callable(video_id, ok, error, error_type, stack_trace, reason)
+# # # ) -> Tuple[List[VideoResult], float]:
+# # #     """
+# # #     Run the full detection pipeline over all videos in a journey.
+
+# # #     Parameters
+# # #     ──────────
+# # #     job_id        : RabbitMQ job ID (used for logging only).
+# # #     journey_id    : Journey ID.
+# # #     folder_name   : Journey folder prefix used for S3 frame key construction,
+# # #                     e.g. "journeys/1/2026-06-10/JRN-20260610-1-ABC123".
+# # #     video_jobs    : List of VideoJob objects (will be sorted by sequence_no).
+# # #     tmp_paths     : Mapping of video_id → absolute local temp file path.
+# # #     progress_cb   : Optional callable(pct, msg, current_video_idx) for updates.
+# # #     video_done_cb : Optional callable(video_id, ok, error, error_type,
+# # #                     stack_trace, reason) fired immediately after each video
+# # #                     finishes (success or failure). Used by journey_runner.py
+# # #                     to push per-video progress events to the parent process via
+# # #                     a multiprocessing.Queue so the parent knows which videos
+# # #                     completed before a native crash kills the child.
+
+# # #     Returns
+# # #     ───────
+# # #     (video_results, total_wall_clock_seconds)
+# # #     """
+# # #     # Sort by sequence_no — critical for correct time/frame offset continuity
+# # #     ordered  = sorted(video_jobs, key=lambda v: v.sequence_no)
+# # #     n_videos = len(ordered)
+
+# # #     # One shared ViolationStore for the whole journey.
+# # #     analysis_id   = f"journey_{journey_id}"
+# # #     shared_vstore = ViolationStore(
+# # #         analysis_id     = analysis_id,
+# # #         train_detail_id = journey_id,
+# # #     )
+
+# # #     time_offset  = 0.0
+# # #     frame_offset = 0
+# # #     wall_start   = time.time()
+
+# # #     # Per-video metadata cache (keyed by video_id)
+# # #     meta_by_id: Dict[int, dict] = {}
+
+# # #     # Track which videos were skipped due to a per-video error so we can
+# # #     # still include them in the VideoResult list with zero violations.
+# # #     failed_video_ids: set = set()
+
+# # #     # ── Fix 5: memory/resource snapshot — journey start ──────────────────────
+# # #     _log_resource_snapshot("JOURNEY START", job_id=job_id,
+# # #                             violations=len(shared_vstore._violations))
+
+# # #     # ── Run the AI pipeline over each video ──────────────────────────────────
+# # #     for idx, vj in enumerate(ordered):
+# # #         tmp_path    = tmp_paths[vj.video_id]
+# # #         db_filename = os.path.basename(vj.s3_key)
+
+# # #         duration, fps, total_frames, size_mb = _video_meta(tmp_path)
+
+# # #         meta_by_id[vj.video_id] = {
+# # #             "duration_seconds":   duration,
+# # #             "duration_formatted": _fmt_duration(duration),
+# # #             "fps":                fps,
+# # #             "size_mb":            size_mb,
+# # #             "total_frames":       total_frames,
+# # #         }
+
+# # #         print(
+# # #             f"[Analyzer:{job_id}]  [{idx + 1}/{n_videos}]  "
+# # #             f"video_id={vj.video_id}  seq={vj.sequence_no}  "
+# # #             f"file={db_filename}  "
+# # #             f"time_offset={time_offset:.2f}s  frame_offset={frame_offset}"
+# # #         )
+
+# # #         # ── Fix 5: memory/resource snapshot — before this video ──────────────
+# # #         _log_resource_snapshot("VIDEO START", job_id=job_id,
+# # #                                 violations=len(shared_vstore._violations))
+
+# # #         pipeline = GadgetDetectionPipeline(
+# # #             source           = tmp_path,
+# # #             analysis_id      = analysis_id,
+# # #             train_detail_id  = journey_id,
+# # #             save             = False,
+# # #             display          = False,
+# # #             shared_vstore    = shared_vstore,
+# # #             time_offset      = time_offset,
+# # #             frame_offset     = frame_offset,
+# # #             source_filename  = db_filename,
+# # #         )
+
+# # #         # ── FIX — Issue #2: per-video error isolation ─────────────────────────
+# # #         # Wrap pipeline.run() so a failure for one video is logged and skipped,
+# # #         # allowing the remaining videos in the journey to be processed normally.
+# # #         #
+# # #         # We catch BaseException (not just Exception) because
+# # #         # GadgetDetectionPipeline.run() calls sys.exit(1) when it cannot open
+# # #         # a video file — sys.exit raises SystemExit which is a BaseException
+# # #         # subclass and would otherwise escape an "except Exception" guard.
+# # #         #
+# # #         # KeyboardInterrupt is explicitly re-raised so Ctrl-C still works.
+# # #         # SystemExit is also re-raised so a genuine fatal signal propagates to
+# # #         # the consumer's outer handler (nack + DLQ) instead of being swallowed.
+# # #         #
+# # #         # video_done_cb is called after every video — success or failure —
+# # #         # so that journey_runner.py's parent process learns which videos
+# # #         # completed before a native crash kills the child. It is best-effort:
+# # #         # a failure inside the callback is swallowed so it never disrupts the
+# # #         # remaining video loop.
+# # #         _video_exc_for_cb: BaseException | None = None
+# # #         try:
+# # #             pipeline.run()
+# # #         except KeyboardInterrupt:
+# # #             raise
+# # #         except SystemExit:
+# # #             raise
+# # #         except BaseException as video_exc:
+# # #             _video_exc_for_cb = video_exc
+# # #             print(
+# # #                 f"[Analyzer:{job_id}]  WARNING — video_id={vj.video_id} "
+# # #                 f"seq={vj.sequence_no} FAILED (skipping): {video_exc!r}"
+# # #             )
+# # #             failed_video_ids.add(vj.video_id)
+# # #             # Fall through: advance offsets and continue with the next video.
+
+# # #         # Fire video_done_cb (best-effort) so the parent process can track
+# # #         # per-video completion before a native crash terminates the child.
+# # #         if video_done_cb is not None:
+# # #             try:
+# # #                 if _video_exc_for_cb is None:
+# # #                     video_done_cb(
+# # #                         vj.video_id,
+# # #                         True,   # ok
+# # #                         None,   # error
+# # #                         None,   # error_type
+# # #                         None,   # stack_trace
+# # #                         None,   # reason
+# # #                     )
+# # #                 else:
+# # #                     import traceback as _tb
+# # #                     video_done_cb(
+# # #                         vj.video_id,
+# # #                         False,                          # ok
+# # #                         str(_video_exc_for_cb),         # error
+# # #                         "PROCESSING_ERROR",             # error_type
+# # #                         _tb.format_exc(),               # stack_trace
+# # #                         None,                           # reason
+# # #                     )
+# # #             except Exception:
+# # #                 pass  # never let a callback error kill the analysis loop
+
+# # #         # Drop our reference to the finished pipeline so it (and the
+# # #         # ThreadPoolExecutor/MediaPipe resources it owned, which run() has
+# # #         # already explicitly shut down/closed) can be collected promptly
+# # #         # rather than living until the next loop iteration reassigns it.
+# # #         del pipeline
+
+# # #         # Advance offsets for the next video regardless of success/failure.
+# # #         # Using the metadata we already captured keeps offsets consistent for
+# # #         # subsequent videos even when this one's pipeline run was skipped.
+# # #         time_offset  += duration
+# # #         frame_offset += total_frames
+
+# # #         # ── Fix 5: memory/resource snapshot — after this video ───────────────
+# # #         _log_resource_snapshot("VIDEO END", job_id=job_id,
+# # #                                 violations=len(shared_vstore._violations))
+
+# # #         # Report per-video progress (10%–90% band)
+# # #         if progress_cb:
+# # #             pct = 10 + int(((idx + 1) / n_videos) * 80)
+# # #             try:
+# # #                 progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# # #             except Exception as exc:
+# # #                 print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+
+# # #     total_wall_seconds = time.time() - wall_start
+
+# # #     # ── Dedup + merge ─────────────────────────────────────────────────────────
+# # #     shared_vstore._deduplicate_by_frame()
+# # #     shared_vstore._merge_by_time_window()
+
+# # #     # ── Extract frames + upload to S3 ───────────────────────────────────────
+# # #     #
+# # #     # BUG FIX — Wrong frames in violation evidence
+# # #     # ─────────────────────────────────────────────
+# # #     # The old code called:
+# # #     #   for vj in ordered:
+# # #     #       shared_vstore.extract_violation_frames(tmp_path)
+# # #     #
+# # #     # extract_violation_frames() iterates ALL violations in the shared store
+# # #     # and seeks to v.frame_index (a GLOBAL frame number across all videos).
+# # #     # When called with video_2's path, it seeks to e.g. frame 4500 in video_2
+# # #     # — but frame 4500 is from video_1 (frame_index was global, not local).
+# # #     # Result: every violation gets a frame from the WRONG video.
+# # #     #
+# # #     # Fix: build a per-filename path map, then for each violation use its
+# # #     # source_filename to open the correct video and seek using local_time_str
+# # #     # (seconds within that specific video file) — which is correct regardless
+# # #     # of how many videos precede it in the journey.
+
+# # #     # Map db_filename → local tmp path
+# # #     path_by_filename: Dict[str, str] = {
+# # #         os.path.basename(vj.s3_key): tmp_paths[vj.video_id]
+# # #         for vj in ordered
+# # #     }
+
+# # #     for v in shared_vstore._violations:
+# # #         # ── Case 1: annotated frame already in memory — upload directly ──────
+# # #         if v.annotated_frame is not None:
+# # #             filename = _frame_filename(v)
+# # #             try:
+# # #                 s3_key            = upload_frame(v.annotated_frame, journey_id,
+# # #                                                  filename, folder_name=folder_name)
+# # #                 v.frame_path      = s3_key
+# # #                 v.annotated_frame = None
+# # #             except Exception as exc:
+# # #                 print(f"[Analyzer:{job_id}]  In-memory frame upload failed ({filename}): {exc}")
+# # #             continue
+
+# # #         # ── Case 2: no frame yet — extract from the correct source video ─────
+# # #         if v.frame_path:
+# # #             # Already extracted to disk by a previous extract_violation_frames()
+# # #             # call (e.g. standalone mode). Upload it.
+# # #             local_path = _local_frame_path(shared_vstore, v.frame_path)
+# # #             if os.path.isfile(local_path):
+# # #                 try:
+# # #                     s3_key       = upload_frame_from_path(local_path, journey_id,
+# # #                                                           folder_name=folder_name)
+# # #                     v.frame_path = s3_key
+# # #                 except Exception as exc:
+# # #                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
+# # #             else:
+# # #                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+# # #             continue
+
+# # #         # ── Case 3: no frame at all — seek into the correct source video ─────
+# # #         src_file = getattr(v, "source_filename", "")
+# # #         tmp_path = path_by_filename.get(src_file, "")
+# # #         if not tmp_path or not os.path.isfile(tmp_path):
+# # #             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
+# # #                   f"(source_filename={src_file!r}) — skipping frame extraction")
+# # #             continue
+
+# # #         # Use local_time_str (seconds within this video) to seek correctly.
+# # #         # v.local_time_str is set by record_violation(local_video_time=...) and
+# # #         # stored as an "H:MM:SS" string. Convert back to seconds for cv2 seek.
+# # #         local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # #         cap = cv2.VideoCapture(tmp_path)
+# # #         frame_img = None
+# # #         if cap.isOpened():
+# # #             cap.set(cv2.CAP_PROP_POS_MSEC, local_secs * 1000.0)
+# # #             ret, frame_img = cap.read()
+# # #             if not ret:
+# # #                 # Fallback: try seeking by fraction of duration
+# # #                 fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # #                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # #                 local_frame = int(local_secs * fps)
+# # #                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(local_frame, max(0, total - 1)))
+# # #                 ret, frame_img = cap.read()
+# # #         cap.release()
+
+# # #         if frame_img is None:
+# # #             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
+# # #                   f"@ local_time={local_secs:.2f}s — skipping")
+# # #             continue
+
+# # #         filename = _frame_filename(v)
+# # #         try:
+# # #             s3_key       = upload_frame(frame_img, journey_id,
+# # #                                         filename, folder_name=folder_name)
+# # #             v.frame_path = s3_key
+# # #         except Exception as exc:
+# # #             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
+
+# # #     # ── Build VideoResult / ViolationResult objects ───────────────────────────
+# # #     violations_by_filename: Dict[str, list] = {}
+# # #     for v in shared_vstore._violations:
+# # #         violations_by_filename.setdefault(v.source_filename, []).append(v)
+
+# # #     video_results: List[VideoResult] = []
+
+# # #     for vj in ordered:
+# # #         meta        = meta_by_id[vj.video_id]
+# # #         db_filename = os.path.basename(vj.s3_key)
+# # #         raw_viols   = violations_by_filename.get(db_filename, [])
+
+# # #         violation_results = []
+# # #         for v in raw_viols:
+# # #             # timestamp_seconds: float seconds from journey start (global)
+# # #             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+
+# # #             # original_video_timestamp: float seconds within the source video (local)
+# # #             local_ts = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # #             violation_results.append(
+# # #                 ViolationResult(
+# # #                     violation_type           = _event_type_to_violation_type(v.type),
+# # #                     severity                 = _severity_for_risk(v.risk_score),
+# # #                     confidence               = round(v.confidence * 100, 2),
+# # #                     risk_score               = float(v.risk_score),
+# # #                     timestamp_seconds        = _fmt_duration(journey_ts),
+# # #                     original_video_timestamp = _fmt_duration(local_ts),
+# # #                     frame_paths              = [v.frame_path] if v.frame_path else [],
+# # #                 )
+# # #             )
+
+# # #         video_results.append(
+# # #             VideoResult(
+# # #                 video_id           = vj.video_id,
+# # #                 video_name         = db_filename,
+# # #                 sequence_no        = vj.sequence_no,
+# # #                 duration_seconds   = meta["duration_seconds"],
+# # #                 duration_formatted = meta["duration_formatted"],
+# # #                 fps                = meta["fps"],
+# # #                 size_mb            = meta["size_mb"],
+# # #                 original_s3_key    = vj.s3_key,
+# # #                 violations         = violation_results,
+# # #             )
+# # #         )
+
+# # #     if failed_video_ids:
+# # #         print(
+# # #             f"[Analyzer:{job_id}]  Journey analysis complete with "
+# # #             f"{len(failed_video_ids)} skipped video(s): {sorted(failed_video_ids)}"
+# # #         )
+
+# # #     # ── Fix 6: explicit garbage collection at end of journey ─────────────────
+# # #     # By this point every violation's annotated_frame has already been
+# # #     # uploaded and cleared (set to None) above, and every per-video pipeline
+# # #     # (executor + MediaPipe graphs) has already been explicitly shut down /
+# # #     # closed inside GadgetDetectionPipeline.run(). gc.collect() here is a
+# # #     # belt-and-suspenders step to promptly reclaim any reference cycles
+# # #     # (e.g. exception tracebacks) before the next journey starts.
+# # #     n_violations_final = len(shared_vstore._violations)
+# # #     _log_resource_snapshot("JOURNEY END (pre-GC)", job_id=job_id,
+# # #                             violations=n_violations_final)
+# # #     gc.collect()
+# # #     _log_resource_snapshot("JOURNEY END (post-GC)", job_id=job_id,
+# # #                             violations=n_violations_final)
+
+# # #     return video_results, total_wall_seconds
+
+
+# # # # ── Private helpers ───────────────────────────────────────────────────────────
+
+# # # def _frame_filename(v) -> str:
+# # #     """Derive a JPEG filename from a _Violation object (matches _save_frame logic)."""
+# # #     distraction   = "_".join(sorted(v.events))
+# # #     filename_time = v.time_str.replace(":", "-")
+# # #     return f"{distraction}_{filename_time}.jpg"
+
+
+# # from __future__ import annotations
+
+# # import gc
+# # import logging
+# # import os
+# # import threading
+# # import time
+# # from typing import Dict, List, Tuple
+
+# # import cv2
+
+# # try:
+# #     import psutil
+# #     _PSUTIL_AVAILABLE = True
+# # except ImportError:
+# #     psutil = None
+# #     _PSUTIL_AVAILABLE = False
+
+# # from models import VideoJob, VideoResult, ViolationResult
+# # from s3_service import upload_frame, upload_frame_from_path
+
+# # # Import the existing pipeline and store — unchanged
+# # from main import GadgetDetectionPipeline
+# # from utils.violation_store import ViolationStore
+
+# # log = logging.getLogger("analyzer")
+
+# # # OUTPUTS_ROOT mirrors the constant inside violation_store.py
+# # OUTPUTS_ROOT = "outputs"
+
+
+# # # ── Memory / resource diagnostics (Fix 5) ──────────────────────────────────────
+
+# # _PROCESS = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+
+
+# # def _rss_gb() -> float:
+# #     """Current process resident set size, in GB. Returns -1.0 if psutil is unavailable."""
+# #     if _PROCESS is None:
+# #         return -1.0
+# #     try:
+# #         return _PROCESS.memory_info().rss / (1024 ** 3)
+# #     except Exception:
+# #         return -1.0
+
+
+# # def _log_resource_snapshot(label: str, job_id: str = "", violations: int = -1) -> None:
+# #     """
+# #     Emit a single-line resource snapshot. `label` is one of:
+# #     'VIDEO START', 'VIDEO END', 'JOURNEY START', 'JOURNEY END'.
+
+# #     Also reports GPU memory state (via resource_manager, imported lazily
+# #     so analyzer.py has no hard dependency on it being importable) — this
+# #     gives Phase 9 leak-detection visibility into CUDA usage alongside the
+# #     existing RSS/thread numbers, without changing what this function
+# #     already logs for RSS/threads.
+# #     """
+# #     rss        = _rss_gb()
+# #     thread_cnt = threading.active_count()
+# #     rss_str    = f"{rss:.3f}GB" if rss >= 0 else "n/a (psutil unavailable)"
+# #     viol_str   = f"  VIOLATIONS={violations}" if violations >= 0 else ""
+
+# #     gpu_str = ""
+# #     try:
+# #         from resource_manager import get_gpu_memory_info
+# #         gpu_info = get_gpu_memory_info()
+# #         if gpu_info.available:
+# #             gpu_str = (
+# #                 f"  GPU_reserved={gpu_info.reserved_gb:.3f}GB"
+# #                 f"/{gpu_info.total_gb:.3f}GB ({gpu_info.used_fraction*100:.1f}%)"
+# #             )
+# #     except Exception:
+# #         pass
+
+# #     print(
+# #         f"[MEMORY {label}]  job={job_id}  RSS={rss_str}  THREADS={thread_cnt}"
+# #         f"{viol_str}{gpu_str}"
+# #     )
+
+
+# # # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# # def _video_meta(path: str) -> Tuple[float, float, int, float]:
+# #     """Returns (duration_seconds, fps, total_frames, size_mb)."""
+# #     cap = cv2.VideoCapture(path)
+# #     if not cap.isOpened():
+# #         return 0.0, 25.0, 0, 0.0
+# #     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# #     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# #     cap.release()
+# #     duration = total / fps if fps > 0 and total > 0 else 0.0
+# #     size_mb  = round(os.path.getsize(path) / 1_000_000, 2) if os.path.isfile(path) else 0.0
+# #     return duration, fps, total, size_mb
+
+
+# # def _fmt_duration(seconds: float) -> str:
+# #     """Converts float seconds to 'H:MM:SS' string."""
+# #     t  = int(seconds)
+# #     hh = t // 3600
+# #     mm = (t % 3600) // 60
+# #     ss = t % 60
+# #     return f"{hh}:{mm:02d}:{ss:02d}"
+
+
+# # def _event_type_to_violation_type(event_type: str) -> str:
+# #     """
+# #     Map internal event_type strings → CVVRS API ViolationType enum values.
+
+# #     CVVRS types: PHONE_USAGE | DROWSY | DISTRACTION | EATING |
+# #                  EYES_CLOSED | POSTURE_ALERT | HAND_TO_EAR | SEAT_ABSENCE
+# #     """
+# #     return {
+# #         "phone_use":       "PHONE_USAGE",
+# #         "seat_absence":    "SEAT_ABSENCE",
+# #         "drowsy":          "DROWSY",
+# #         "sleeping":        "DROWSY",
+# #         "sleeping_absent": "DROWSY",
+# #         "distraction":     "DISTRACTION",
+# #         "eating":          "EATING",
+# #         "eyes_closed":     "EYES_CLOSED",
+# #         "posture_alert":   "POSTURE_ALERT",
+# #         "hand_to_ear":     "HAND_TO_EAR",
+# #     }.get(event_type.lower(), event_type.upper())
+
+
+# # def _severity_for_risk(risk_score: float) -> str:
+# #     """
+# #     Map risk score → severity string.
+
+# #     Tiers (aligned with CVVRS severity reference):
+# #         >= 95  → CRITICAL
+# #         >= 80  → HIGH
+# #         >= 50  → MEDIUM
+# #         <  50  → LOW
+# #     """
+# #     if risk_score >= 95:
+# #         return "CRITICAL"
+# #     if risk_score >= 80:
+# #         return "HIGH"
+# #     if risk_score >= 50:
+# #         return "MEDIUM"
+# #     return "LOW"
+
+
+# # def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
+# #     """
+# #     Convert the relative frame path stored by ViolationStore._save_frame()
+# #     back to an absolute local disk path.
+
+# #     _save_frame() returns:  "<analysis_id>/frames/<filename>"
+# #     The actual disk path is: "outputs/<analysis_id>/frames/<filename>"
+# #     """
+# #     filename = os.path.basename(relative_path)
+# #     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+# # def _hms_to_seconds(hms: str) -> float:
+# #     """
+# #     Convert "H:MM:SS" or "HH:MM:SS" to float seconds.
+# #     Returns 0.0 on any parse error.
+# #     """
+# #     try:
+# #         parts = hms.strip().split(":")
+# #         if len(parts) == 3:
+# #             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+# #         if len(parts) == 2:
+# #             return int(parts[0]) * 60 + float(parts[1])
+# #         return float(parts[0])
+# #     except Exception:
+# #         return 0.0
+
+
+# # # ── Main entry point ──────────────────────────────────────────────────────────
+
+# # def analyze_journey(
+# #     job_id:        str,
+# #     journey_id:    int,
+# #     folder_name:   str,                  # e.g. "journeys/1/2026-06-10/JRN-..."
+# #     video_jobs:    List[VideoJob],
+# #     tmp_paths:     Dict[int, str],       # video_id → local tmp file path
+# #     progress_cb    = None,               # optional callable(pct, msg, current_video)
+# #     video_done_cb  = None,               # optional callable(video_id, ok, error, error_type, stack_trace, reason)
+# # ) -> Tuple[List[VideoResult], float, Dict[int, str]]:
+# #     """
+# #     Run the full detection pipeline over all videos in a journey.
+
+# #     Parameters
+# #     ──────────
+# #     job_id        : RabbitMQ job ID (used for logging only).
+# #     journey_id    : Journey ID.
+# #     folder_name   : Journey folder prefix used for S3 frame key construction,
+# #                     e.g. "journeys/1/2026-06-10/JRN-20260610-1-ABC123".
+# #     video_jobs    : List of VideoJob objects (will be sorted by sequence_no).
+# #     tmp_paths     : Mapping of video_id → absolute local temp file path.
+# #     progress_cb   : Optional callable(pct, msg, current_video_idx) for updates.
+# #     video_done_cb : Optional callable(video_id, ok, error, error_type,
+# #                     stack_trace, reason) fired immediately after each video
+# #                     finishes (success or failure). Used by journey_runner.py
+# #                     to push per-video progress events to the parent process via
+# #                     a multiprocessing.Queue so the parent knows which videos
+# #                     completed before a native crash kills the child.
+
+# #     Returns
+# #     ───────
+# #     (video_results, total_wall_clock_seconds)
+# #     """
+# #     # Sort by sequence_no — critical for correct time/frame offset continuity
+# #     ordered  = sorted(video_jobs, key=lambda v: v.sequence_no)
+# #     n_videos = len(ordered)
+
+# #     # One shared ViolationStore for the whole journey.
+# #     analysis_id   = f"journey_{journey_id}"
+# #     shared_vstore = ViolationStore(
+# #         analysis_id     = analysis_id,
+# #         train_detail_id = journey_id,
+# #     )
+
+# #     time_offset  = 0.0
+# #     frame_offset = 0
+# #     wall_start   = time.time()
+
+# #     # Per-video metadata cache (keyed by video_id)
+# #     meta_by_id: Dict[int, dict] = {}
+
+# #     # Track which videos were skipped due to a per-video error so we can
+# #     # still include them in the VideoResult list with zero violations.
+# #     failed_video_ids: set = set()
+
+# #     # ── Fix 5: memory/resource snapshot — journey start ──────────────────────
+# #     _log_resource_snapshot("JOURNEY START", job_id=job_id,
+# #                             violations=len(shared_vstore._violations))
+
+# #     # ── Run the AI pipeline over each video ──────────────────────────────────
+# #     for idx, vj in enumerate(ordered):
+# #         tmp_path    = tmp_paths[vj.video_id]
+# #         db_filename = os.path.basename(vj.s3_key)
+
+# #         duration, fps, total_frames, size_mb = _video_meta(tmp_path)
+
+# #         meta_by_id[vj.video_id] = {
+# #             "duration_seconds":   duration,
+# #             "duration_formatted": _fmt_duration(duration),
+# #             "fps":                fps,
+# #             "size_mb":            size_mb,
+# #             "total_frames":       total_frames,
+# #         }
+
+# #         print(
+# #             f"[Analyzer:{job_id}]  [{idx + 1}/{n_videos}]  "
+# #             f"video_id={vj.video_id}  seq={vj.sequence_no}  "
+# #             f"file={db_filename}  "
+# #             f"time_offset={time_offset:.2f}s  frame_offset={frame_offset}"
+# #         )
+
+# #         # ── Fix 5: memory/resource snapshot — before this video ──────────────
+# #         _log_resource_snapshot("VIDEO START", job_id=job_id,
+# #                                 violations=len(shared_vstore._violations))
+
+# #         # ── Resource lifecycle (Phase 3): GPU threshold safety check ─────────
+# #         # If CUDA memory usage is already at/above the configured threshold
+# #         # before this video even starts, attempting inference is very likely
+# #         # to OOM anyway. Skip this video safely (mark it failed with a clear
+# #         # reason) rather than letting a near-certain CUDA crash take down the
+# #         # whole journey/process. is_gpu_over_threshold() is a no-op (returns
+# #         # False) when CUDA isn't available, so this never affects CPU-only
+# #         # environments.
+# #         try:
+# #             from resource_manager import is_gpu_over_threshold, gpu_cleanup, CUDA_ABORT_THRESHOLD
+# #             if is_gpu_over_threshold():
+# #                 print(
+# #                     f"[Analyzer:{job_id}]  GPU memory usage at/above "
+# #                     f"{CUDA_ABORT_THRESHOLD*100:.0f}% threshold — attempting "
+# #                     f"cleanup before video_id={vj.video_id}..."
+# #                 )
+# #                 gpu_cleanup()
+# #                 if is_gpu_over_threshold():
+# #                     print(
+# #                         f"[Analyzer:{job_id}]  GPU still over threshold after "
+# #                         f"cleanup — skipping video_id={vj.video_id} "
+# #                         f"seq={vj.sequence_no} to avoid a near-certain CUDA OOM."
+# #                     )
+# #                     failed_video_ids.add(vj.video_id)
+# #                     if video_done_cb is not None:
+# #                         try:
+# #                             video_done_cb(
+# #                                 vj.video_id, False,
+# #                                 "Not Processed - Worker Resource Exhaustion",
+# #                                 "NOT_PROCESSED", None,
+# #                                 "Not Processed - Worker Resource Exhaustion",
+# #                             )
+# #                         except Exception:
+# #                             pass
+# #                     time_offset  += duration
+# #                     frame_offset += total_frames
+# #                     if progress_cb:
+# #                         pct = 10 + int(((idx + 1) / n_videos) * 80)
+# #                         try:
+# #                             progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# #                         except Exception as exc:
+# #                             print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+# #                     continue
+# #         except ImportError:
+# #             pass  # resource_manager unavailable — proceed without the check
+
+# #         pipeline = GadgetDetectionPipeline(
+# #             source           = tmp_path,
+# #             analysis_id      = analysis_id,
+# #             train_detail_id  = journey_id,
+# #             save             = False,
+# #             display          = False,
+# #             shared_vstore    = shared_vstore,
+# #             time_offset      = time_offset,
+# #             frame_offset     = frame_offset,
+# #             source_filename  = db_filename,
+# #         )
+
+# #         # ── Per-video error isolation (Scenario 1 & 2) ───────────────────────
+# #         #
+# #         # Two distinct failure classes require different treatment:
+# #         #
+# #         # SCENARIO 2 — Video-specific failures (corrupted file, bad codec,
+# #         # FFmpeg error, decode error, etc.):
+# #         #   • Mark only this video as FAILED.
+# #         #   • Fire video_done_cb with ok=False and error_type=PROCESSING_ERROR
+# #         #     (or a more specific classifier via classify_video_error).
+# #         #   • Continue processing the next video in the loop.
+# #         #
+# #         # SCENARIO 1 — Worker/memory-level failures (CUDA OOM, OpenCV
+# #         # OutOfMemoryError, MemoryError, std::bad_alloc, "Failed to allocate",
+# #         # etc.) that Python CAN still raise as exceptions (as opposed to the
+# #         # native crash that kills the process outright — that is handled by
+# #         # the subprocess isolation in journey_runner.py/consumer.py):
+# #         #   • Mark this video as FAILED with error_type=RESOURCE_EXHAUSTION.
+# #         #   • Mark EVERY REMAINING video (not yet processed) as NOT_PROCESSED
+# #         #     via video_done_cb with reason="Not Processed - Worker Resource
+# #         #     Exhaustion", so the parent immediately calls the Failure API for
+# #         #     each one — preserving all work done before this point.
+# #         #   • Break out of the loop — do NOT attempt any more videos.
+# #         #   • Preserved: all VideoResult / violation data for videos 1..idx-1.
+# #         #
+# #         # We catch BaseException (not just Exception) because pipeline.run()
+# #         # calls sys.exit(1) on unreadable files — SystemExit is a BaseException.
+# #         # KeyboardInterrupt and SystemExit are re-raised so they propagate
+# #         # to the consumer's outer handler (nack + DLQ) instead of being
+# #         # treated as per-video errors.
+# #         #
+# #         # video_done_cb is fired after every video (success OR failure) so the
+# #         # parent subprocess monitor always knows which videos finished before a
+# #         # native crash kills the child process. It is best-effort: errors inside
+# #         # the callback are swallowed so they never disrupt the processing loop.
+# #         import traceback as _tb
+# #         try:
+# #             from callback_client import is_resource_exhaustion_error, classify_video_error
+# #             _have_classifier = True
+# #         except ImportError:
+# #             _have_classifier = False
+
+# #         _worker_oom    = False   # True when this video hit a resource-exhaustion error
+# #         _video_exc_for_cb: BaseException | None = None
+# #         try:
+# #             pipeline.run()
+# #         except KeyboardInterrupt:
+# #             raise
+# #         except SystemExit:
+# #             raise
+# #         except BaseException as video_exc:
+# #             _video_exc_for_cb = video_exc
+# #             # Classify: is this a worker-level memory failure (Scenario 1) or
+# #             # an ordinary video-specific failure (Scenario 2)?
+# #             if _have_classifier and is_resource_exhaustion_error(video_exc):
+# #                 _worker_oom = True
+# #                 error_type_for_cb = "RESOURCE_EXHAUSTION"
+# #             elif _have_classifier:
+# #                 error_type_for_cb = classify_video_error(video_exc)
+# #             else:
+# #                 # Fallback classification without callback_client available
+# #                 _worker_oom = isinstance(video_exc, MemoryError) or any(
+# #                     sig in f"{type(video_exc).__name__}: {video_exc}".lower()
+# #                     for sig in ("outofmemoryerror", "out of memory",
+# #                                 "failed to allocate", "bad_alloc",
+# #                                 "cannot allocate memory", "resource exhaust")
+# #                 )
+# #                 error_type_for_cb = "RESOURCE_EXHAUSTION" if _worker_oom else "PROCESSING_ERROR"
+
+# #             print(
+# #                 f"[Analyzer:{job_id}]  {'WORKER OOM' if _worker_oom else 'WARNING'} "
+# #                 f"— video_id={vj.video_id} seq={vj.sequence_no} "
+# #                 f"{'RESOURCE EXHAUSTION' if _worker_oom else 'FAILED (skipping)'}: "
+# #                 f"{video_exc!r}"
+# #             )
+# #             failed_video_ids.add(vj.video_id)
+
+# #         # ── Fire video_done_cb for the video that just finished ───────────────
+# #         # Called regardless of success or failure so the parent process always
+# #         # has an up-to-date picture of which videos completed before any crash.
+# #         if video_done_cb is not None:
+# #             try:
+# #                 if _video_exc_for_cb is None:
+# #                     # Success
+# #                     video_done_cb(
+# #                         vj.video_id,
+# #                         True,   # ok
+# #                         None,   # error
+# #                         None,   # error_type
+# #                         None,   # stack_trace
+# #                         None,   # reason
+# #                     )
+# #                 else:
+# #                     # Per-video failure OR resource-exhaustion failure
+# #                     video_done_cb(
+# #                         vj.video_id,
+# #                         False,                            # ok
+# #                         str(_video_exc_for_cb),           # error
+# #                         error_type_for_cb,                # error_type
+# #                         _tb.format_exc(),                 # stack_trace
+# #                         "Not Processed - Worker Resource Exhaustion"
+# #                             if _worker_oom else None,     # reason
+# #                     )
+# #             except Exception:
+# #                 pass  # never let a callback error kill the analysis loop
+
+# #         # ── Scenario 1: worker OOM — stop the loop, report remaining as NOT_PROCESSED
+# #         if _worker_oom:
+# #             # Advance offsets for this video so accounting is consistent before we stop.
+# #             time_offset  += duration
+# #             frame_offset += total_frames
+# #             del pipeline
+
+# #             # Report every video that comes AFTER this one as NOT_PROCESSED.
+# #             # "After" = sequence_no > current vj's position in the ordered list.
+# #             # We iterate from the NEXT video to the end of ordered.
+# #             remaining_reason = "Not Processed - Worker Resource Exhaustion"
+# #             for remaining_vj in ordered[idx + 1:]:
+# #                 remaining_vid = remaining_vj.video_id
+# #                 failed_video_ids.add(remaining_vid)
+# #                 print(
+# #                     f"[Analyzer:{job_id}]  Marking video_id={remaining_vid} "
+# #                     f"seq={remaining_vj.sequence_no} as NOT_PROCESSED due to "
+# #                     "worker resource exhaustion on a prior video."
+# #                 )
+# #                 if video_done_cb is not None:
+# #                     try:
+# #                         video_done_cb(
+# #                             remaining_vid,
+# #                             False,                    # ok
+# #                             "Processing stopped due to worker memory failure",
+# #                             "NOT_PROCESSED",          # error_type
+# #                             None,                     # stack_trace
+# #                             remaining_reason,         # reason
+# #                         )
+# #                     except Exception:
+# #                         pass
+
+# #             # Stop processing further videos in this journey.
+# #             _log_resource_snapshot("VIDEO END (OOM-STOP)", job_id=job_id,
+# #                                     violations=len(shared_vstore._violations))
+# #             # Break out of the for-loop so we move straight to dedup/upload/build.
+# #             break
+
+# #         # Drop our reference to the finished pipeline so it (and the
+# #         # ThreadPoolExecutor/MediaPipe resources it owned, which run() has
+# #         # already explicitly shut down/closed) can be collected promptly
+# #         # rather than living until the next loop iteration reassigns it.
+# #         del pipeline
+
+# #         # Advance offsets for the next video regardless of success/failure.
+# #         # Using the metadata we already captured keeps offsets consistent for
+# #         # subsequent videos even when this one's pipeline run was skipped.
+# #         time_offset  += duration
+# #         frame_offset += total_frames
+
+# #         # ── Fix 5: memory/resource snapshot — after this video ───────────────
+# #         _log_resource_snapshot("VIDEO END", job_id=job_id,
+# #                                 violations=len(shared_vstore._violations))
+
+# #         # Report per-video progress (10%–90% band)
+# #         if progress_cb:
+# #             pct = 10 + int(((idx + 1) / n_videos) * 80)
+# #             try:
+# #                 progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# #             except Exception as exc:
+# #                 print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+
+# #     total_wall_seconds = time.time() - wall_start
+
+# #     # ── Dedup + merge ─────────────────────────────────────────────────────────
+# #     shared_vstore._deduplicate_by_frame()
+# #     shared_vstore._merge_by_time_window()
+
+# #     # ── Extract frames + upload to S3 ───────────────────────────────────────
+# #     #
+# #     # BUG FIX — Wrong frames in violation evidence
+# #     # ─────────────────────────────────────────────
+# #     # The old code called:
+# #     #   for vj in ordered:
+# #     #       shared_vstore.extract_violation_frames(tmp_path)
+# #     #
+# #     # extract_violation_frames() iterates ALL violations in the shared store
+# #     # and seeks to v.frame_index (a GLOBAL frame number across all videos).
+# #     # When called with video_2's path, it seeks to e.g. frame 4500 in video_2
+# #     # — but frame 4500 is from video_1 (frame_index was global, not local).
+# #     # Result: every violation gets a frame from the WRONG video.
+# #     #
+# #     # Fix: build a per-filename path map, then for each violation use its
+# #     # source_filename to open the correct video and seek using local_time_str
+# #     # (seconds within that specific video file) — which is correct regardless
+# #     # of how many videos precede it in the journey.
+
+# #     # Map db_filename → local tmp path
+# #     path_by_filename: Dict[str, str] = {
+# #         os.path.basename(vj.s3_key): tmp_paths[vj.video_id]
+# #         for vj in ordered
+# #     }
+
+# #     for v in shared_vstore._violations:
+# #         # ── Case 1: annotated frame already in memory — upload directly ──────
+# #         if v.annotated_frame is not None:
+# #             filename = _frame_filename(v)
+# #             try:
+# #                 s3_key            = upload_frame(v.annotated_frame, journey_id,
+# #                                                  filename, folder_name=folder_name)
+# #                 v.frame_path      = s3_key
+# #                 v.annotated_frame = None
+# #             except Exception as exc:
+# #                 print(f"[Analyzer:{job_id}]  In-memory frame upload failed ({filename}): {exc}")
+# #             continue
+
+# #         # ── Case 2: no frame yet — extract from the correct source video ─────
+# #         if v.frame_path:
+# #             # Already extracted to disk by a previous extract_violation_frames()
+# #             # call (e.g. standalone mode). Upload it.
+# #             local_path = _local_frame_path(shared_vstore, v.frame_path)
+# #             if os.path.isfile(local_path):
+# #                 try:
+# #                     s3_key       = upload_frame_from_path(local_path, journey_id,
+# #                                                           folder_name=folder_name)
+# #                     v.frame_path = s3_key
+# #                 except Exception as exc:
+# #                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
+# #             else:
+# #                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+# #             continue
+
+# #         # ── Case 3: no frame at all — seek into the correct source video ─────
+# #         src_file = getattr(v, "source_filename", "")
+# #         tmp_path = path_by_filename.get(src_file, "")
+# #         if not tmp_path or not os.path.isfile(tmp_path):
+# #             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
+# #                   f"(source_filename={src_file!r}) — skipping frame extraction")
+# #             continue
+
+# #         # Use local_time_str (seconds within this video) to seek correctly.
+# #         # v.local_time_str is set by record_violation(local_video_time=...) and
+# #         # stored as an "H:MM:SS" string. Convert back to seconds for cv2 seek.
+# #         local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# #         cap = cv2.VideoCapture(tmp_path)
+# #         frame_img = None
+# #         if cap.isOpened():
+# #             cap.set(cv2.CAP_PROP_POS_MSEC, local_secs * 1000.0)
+# #             ret, frame_img = cap.read()
+# #             if not ret:
+# #                 # Fallback: try seeking by fraction of duration
+# #                 fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# #                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# #                 local_frame = int(local_secs * fps)
+# #                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(local_frame, max(0, total - 1)))
+# #                 ret, frame_img = cap.read()
+# #         cap.release()
+
+# #         if frame_img is None:
+# #             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
+# #                   f"@ local_time={local_secs:.2f}s — skipping")
+# #             continue
+
+# #         filename = _frame_filename(v)
+# #         try:
+# #             s3_key       = upload_frame(frame_img, journey_id,
+# #                                         filename, folder_name=folder_name)
+# #             v.frame_path = s3_key
+# #         except Exception as exc:
+# #             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
+
+# #     # ── Build VideoResult / ViolationResult objects ───────────────────────────
+# #     violations_by_filename: Dict[str, list] = {}
+# #     for v in shared_vstore._violations:
+# #         violations_by_filename.setdefault(v.source_filename, []).append(v)
+
+# #     video_results: List[VideoResult] = []
+
+# #     for vj in ordered:
+# #         meta        = meta_by_id[vj.video_id]
+# #         db_filename = os.path.basename(vj.s3_key)
+# #         raw_viols   = violations_by_filename.get(db_filename, [])
+
+# #         violation_results = []
+# #         for v in raw_viols:
+# #             # timestamp_seconds: float seconds from journey start (global)
+# #             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+
+# #             # original_video_timestamp: float seconds within the source video (local)
+# #             local_ts = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# #             violation_results.append(
+# #                 ViolationResult(
+# #                     violation_type           = _event_type_to_violation_type(v.type),
+# #                     severity                 = _severity_for_risk(v.risk_score),
+# #                     confidence               = round(v.confidence * 100, 2),
+# #                     risk_score               = float(v.risk_score),
+# #                     timestamp_seconds        = _fmt_duration(journey_ts),
+# #                     original_video_timestamp = _fmt_duration(local_ts),
+# #                     frame_paths              = [v.frame_path] if v.frame_path else [],
+# #                 )
+# #             )
+
+# #         video_results.append(
+# #             VideoResult(
+# #                 video_id           = vj.video_id,
+# #                 video_name         = db_filename,
+# #                 sequence_no        = vj.sequence_no,
+# #                 duration_seconds   = meta["duration_seconds"],
+# #                 duration_formatted = meta["duration_formatted"],
+# #                 fps                = meta["fps"],
+# #                 size_mb            = meta["size_mb"],
+# #                 original_s3_key    = vj.s3_key,
+# #                 violations         = violation_results,
+# #             )
+# #         )
+
+# #     if failed_video_ids:
+# #         print(
+# #             f"[Analyzer:{job_id}]  Journey analysis complete with "
+# #             f"{len(failed_video_ids)} skipped video(s): {sorted(failed_video_ids)}"
+# #         )
+
+# #     # Build the failed_videos dict (video_id → error message) that
+# #     # journey_runner.py and consumer.py both expect as the third return value.
+# #     #
+# #     # failed_video_ids is the union of:
+# #     #   • Per-video failures (Scenario 2): exceptions isolated to one video;
+# #     #     the specific exception was already printed above at skip time.
+# #     #   • NOT_PROCESSED videos (Scenario 1): videos AFTER a worker-level OOM
+# #     #     that were never reached; their video_done_cb already fired with
+# #     #     error_type="NOT_PROCESSED" so the Failure API was called immediately.
+# #     #     We still record them here so the caller has a complete picture.
+# #     #
+# #     # Use a specific message for NOT_PROCESSED videos (no meta_by_id entry
+# #     # means the video loop never reached _video_meta for them — they are
+# #     # definitely post-OOM unstarted videos, not per-video failures).
+# #     failed_videos: Dict[int, str] = {}
+# #     for vid in failed_video_ids:
+# #         if vid not in meta_by_id:
+# #             # Never reached — stopped by worker memory failure on a prior video.
+# #             failed_videos[vid] = "Processing stopped due to worker memory failure"
+# #         else:
+# #             # Per-video failure (Scenario 2) or OOM video itself (Scenario 1).
+# #             failed_videos[vid] = "Video processing failed — see worker log for details"
+
+# #     # ── Fix 6: explicit garbage collection at end of journey ─────────────────
+# #     # By this point every violation's annotated_frame has already been
+# #     # uploaded and cleared (set to None) above, and every per-video pipeline
+# #     # (executor + MediaPipe graphs) has already been explicitly shut down /
+# #     # closed inside GadgetDetectionPipeline.run(). gc.collect() here is a
+# #     # belt-and-suspenders step to promptly reclaim any reference cycles
+# #     # (e.g. exception tracebacks) before the next journey starts.
+# #     n_violations_final = len(shared_vstore._violations)
+# #     _log_resource_snapshot("JOURNEY END (pre-GC)", job_id=job_id,
+# #                             violations=n_violations_final)
+# #     gc.collect()
+# #     _log_resource_snapshot("JOURNEY END (post-GC)", job_id=job_id,
+# #                             violations=n_violations_final)
+
+# #     return video_results, total_wall_seconds, failed_videos
+
+
+# # # ── Private helpers ───────────────────────────────────────────────────────────
+
+# # def _frame_filename(v) -> str:
+# #     """Derive a JPEG filename from a _Violation object (matches _save_frame logic)."""
+# #     distraction   = "_".join(sorted(v.events))
+# #     filename_time = v.time_str.replace(":", "-")
+# #     return f"{distraction}_{filename_time}.jpg"
+
+
+# # # # from __future__ import annotations
+
+# # # # import gc
+# # # # import logging
+# # # # import os
+# # # # import threading
+# # # # import time
+# # # # from typing import Dict, List, Tuple
+
+# # # # import cv2
+
+# # # # try:
+# # # #     import psutil
+# # # #     _PSUTIL_AVAILABLE = True
+# # # # except ImportError:
+# # # #     psutil = None
+# # # #     _PSUTIL_AVAILABLE = False
+
+# # # # from models import VideoJob, VideoResult, ViolationResult
+# # # # from s3_service import upload_frame, upload_frame_from_path
+
+# # # # # Import the existing pipeline and store — unchanged
+# # # # from main import GadgetDetectionPipeline
+# # # # from utils.violation_store import ViolationStore
+
+# # # # log = logging.getLogger("analyzer")
+
+# # # # # OUTPUTS_ROOT mirrors the constant inside violation_store.py
+# # # # OUTPUTS_ROOT = "outputs"
+
+
+# # # # # ── Memory / resource diagnostics (Fix 5) ──────────────────────────────────────
+
+# # # # _PROCESS = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+
+
+# # # # def _rss_gb() -> float:
+# # # #     """Current process resident set size, in GB. Returns -1.0 if psutil is unavailable."""
+# # # #     if _PROCESS is None:
+# # # #         return -1.0
+# # # #     try:
+# # # #         return _PROCESS.memory_info().rss / (1024 ** 3)
+# # # #     except Exception:
+# # # #         return -1.0
+
+
+# # # # def _log_resource_snapshot(label: str, job_id: str = "", violations: int = -1) -> None:
+# # # #     """
+# # # #     Emit a single-line resource snapshot. `label` is one of:
+# # # #     'VIDEO START', 'VIDEO END', 'JOURNEY START', 'JOURNEY END'.
+# # # #     """
+# # # #     rss        = _rss_gb()
+# # # #     thread_cnt = threading.active_count()
+# # # #     rss_str    = f"{rss:.3f}GB" if rss >= 0 else "n/a (psutil unavailable)"
+# # # #     viol_str   = f"  VIOLATIONS={violations}" if violations >= 0 else ""
+# # # #     print(
+# # # #         f"[MEMORY {label}]  job={job_id}  RSS={rss_str}  THREADS={thread_cnt}{viol_str}"
+# # # #     )
+
+
+# # # # # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# # # # def _video_meta(path: str) -> Tuple[float, float, int, float]:
+# # # #     """Returns (duration_seconds, fps, total_frames, size_mb)."""
+# # # #     cap = cv2.VideoCapture(path)
+# # # #     if not cap.isOpened():
+# # # #         return 0.0, 25.0, 0, 0.0
+# # # #     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # # #     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # # #     cap.release()
+# # # #     duration = total / fps if fps > 0 and total > 0 else 0.0
+# # # #     size_mb  = round(os.path.getsize(path) / 1_000_000, 2) if os.path.isfile(path) else 0.0
+# # # #     return duration, fps, total, size_mb
+
+
+# # # # def _fmt_duration(seconds: float) -> str:
+# # # #     """Converts float seconds to 'H:MM:SS' string."""
+# # # #     t  = int(seconds)
+# # # #     hh = t // 3600
+# # # #     mm = (t % 3600) // 60
+# # # #     ss = t % 60
+# # # #     return f"{hh}:{mm:02d}:{ss:02d}"
+
+
+# # # # def _event_type_to_violation_type(event_type: str) -> str:
+# # # #     """
+# # # #     Map internal event_type strings → CVVRS API ViolationType enum values.
+
+# # # #     CVVRS types: PHONE_USAGE | DROWSY | DISTRACTION | EATING |
+# # # #                  EYES_CLOSED | POSTURE_ALERT | HAND_TO_EAR | SEAT_ABSENCE
+# # # #     """
+# # # #     return {
+# # # #         "phone_use":       "PHONE_USAGE",
+# # # #         "seat_absence":    "SEAT_ABSENCE",
+# # # #         "drowsy":          "DROWSY",
+# # # #         "sleeping":        "DROWSY",
+# # # #         "sleeping_absent": "DROWSY",
+# # # #         "distraction":     "DISTRACTION",
+# # # #         "eating":          "EATING",
+# # # #         "eyes_closed":     "EYES_CLOSED",
+# # # #         "posture_alert":   "POSTURE_ALERT",
+# # # #         "hand_to_ear":     "HAND_TO_EAR",
+# # # #     }.get(event_type.lower(), event_type.upper())
+
+
+# # # # def _severity_for_risk(risk_score: float) -> str:
+# # # #     """
+# # # #     Map risk score → severity string.
+
+# # # #     Tiers (aligned with CVVRS severity reference):
+# # # #         >= 95  → CRITICAL
+# # # #         >= 80  → HIGH
+# # # #         >= 50  → MEDIUM
+# # # #         <  50  → LOW
+# # # #     """
+# # # #     if risk_score >= 95:
+# # # #         return "CRITICAL"
+# # # #     if risk_score >= 80:
+# # # #         return "HIGH"
+# # # #     if risk_score >= 50:
+# # # #         return "MEDIUM"
+# # # #     return "LOW"
+
+
+# # # # def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
+# # # #     """
+# # # #     Convert the relative frame path stored by ViolationStore._save_frame()
+# # # #     back to an absolute local disk path.
+
+# # # #     _save_frame() returns:  "<analysis_id>/frames/<filename>"
+# # # #     The actual disk path is: "outputs/<analysis_id>/frames/<filename>"
+# # # #     """
+# # # #     filename = os.path.basename(relative_path)
+# # # #     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+# # # # def _hms_to_seconds(hms: str) -> float:
+# # # #     """
+# # # #     Convert "H:MM:SS" or "HH:MM:SS" to float seconds.
+# # # #     Returns 0.0 on any parse error.
+# # # #     """
+# # # #     try:
+# # # #         parts = hms.strip().split(":")
+# # # #         if len(parts) == 3:
+# # # #             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+# # # #         if len(parts) == 2:
+# # # #             return int(parts[0]) * 60 + float(parts[1])
+# # # #         return float(parts[0])
+# # # #     except Exception:
+# # # #         return 0.0
+
+
+# # # # # ── Main entry point ──────────────────────────────────────────────────────────
+
+# # # # def analyze_journey(
+# # # #     job_id:      str,
+# # # #     journey_id:  int,
+# # # #     folder_name: str,                  # e.g. "journeys/1/2026-06-10/JRN-..."
+# # # #     video_jobs:  List[VideoJob],
+# # # #     tmp_paths:   Dict[int, str],       # video_id → local tmp file path
+# # # #     progress_cb  = None,               # optional callable(pct, msg, current_video)
+# # # #     rabbit_connection = None,
+# # # # ) -> Tuple[List[VideoResult], float]:
+# # # #     """
+# # # #     Run the full detection pipeline over all videos in a journey.
+
+# # # #     Parameters
+# # # #     ──────────
+# # # #     job_id      : RabbitMQ job ID (used for logging only).
+# # # #     journey_id  : Journey ID.
+# # # #     folder_name : Journey folder prefix used for S3 frame key construction,
+# # # #                   e.g. "journeys/1/2026-06-10/JRN-20260610-1-ABC123".
+# # # #     video_jobs  : List of VideoJob objects (will be sorted by sequence_no).
+# # # #     tmp_paths   : Mapping of video_id → absolute local temp file path.
+# # # #     progress_cb : Optional callable(pct, msg, current_video_idx) for updates.
+
+# # # #     Returns
+# # # #     ───────
+# # # #     (video_results, total_wall_clock_seconds)
+# # # #     """
+# # # #     # Sort by sequence_no — critical for correct time/frame offset continuity
+# # # #     ordered  = sorted(video_jobs, key=lambda v: v.sequence_no)
+# # # #     n_videos = len(ordered)
+
+# # # #     # One shared ViolationStore for the whole journey.
+# # # #     analysis_id   = f"journey_{journey_id}"
+# # # #     shared_vstore = ViolationStore(
+# # # #         analysis_id     = analysis_id,
+# # # #         train_detail_id = journey_id,
+# # # #     )
+
+# # # #     time_offset  = 0.0
+# # # #     frame_offset = 0
+# # # #     wall_start   = time.time()
+
+# # # #     # Per-video metadata cache (keyed by video_id)
+# # # #     meta_by_id: Dict[int, dict] = {}
+
+# # # #     # Track which videos were skipped due to a per-video error so we can
+# # # #     # still include them in the VideoResult list with zero violations.
+# # # #     failed_video_ids: set = set()
+
+# # # #     # ── Fix 5: memory/resource snapshot — journey start ──────────────────────
+# # # #     _log_resource_snapshot("JOURNEY START", job_id=job_id,
+# # # #                             violations=len(shared_vstore._violations))
+
+# # # #     # ── Run the AI pipeline over each video ──────────────────────────────────
+# # # #     for idx, vj in enumerate(ordered):
+# # # #         tmp_path    = tmp_paths[vj.video_id]
+# # # #         db_filename = os.path.basename(vj.s3_key)
+
+# # # #         duration, fps, total_frames, size_mb = _video_meta(tmp_path)
+
+# # # #         meta_by_id[vj.video_id] = {
+# # # #             "duration_seconds":   duration,
+# # # #             "duration_formatted": _fmt_duration(duration),
+# # # #             "fps":                fps,
+# # # #             "size_mb":            size_mb,
+# # # #             "total_frames":       total_frames,
+# # # #         }
+
+# # # #         print(
+# # # #             f"[Analyzer:{job_id}]  [{idx + 1}/{n_videos}]  "
+# # # #             f"video_id={vj.video_id}  seq={vj.sequence_no}  "
+# # # #             f"file={db_filename}  "
+# # # #             f"time_offset={time_offset:.2f}s  frame_offset={frame_offset}"
+# # # #         )
+
+# # # #         # ── Fix 5: memory/resource snapshot — before this video ──────────────
+# # # #         _log_resource_snapshot("VIDEO START", job_id=job_id,
+# # # #                                 violations=len(shared_vstore._violations))
+
+# # # #         pipeline = GadgetDetectionPipeline(
+# # # #             source           = tmp_path,
+# # # #             analysis_id      = analysis_id,
+# # # #             train_detail_id  = journey_id,
+# # # #             save             = False,
+# # # #             display          = False,
+# # # #             shared_vstore    = shared_vstore,
+# # # #             time_offset      = time_offset,
+# # # #             frame_offset     = frame_offset,
+# # # #             source_filename  = db_filename,
+# # # #         )
+
+# # # #         # ── FIX — Issue #2: per-video error isolation ─────────────────────────
+# # # #         # Wrap pipeline.run() so a failure for one video is logged and skipped,
+# # # #         # allowing the remaining videos in the journey to be processed normally.
+# # # #         #
+# # # #         # We catch BaseException (not just Exception) because
+# # # #         # GadgetDetectionPipeline.run() calls sys.exit(1) when it cannot open
+# # # #         # a video file — sys.exit raises SystemExit which is a BaseException
+# # # #         # subclass and would otherwise escape an "except Exception" guard.
+# # # #         #
+# # # #         # KeyboardInterrupt is explicitly re-raised so Ctrl-C still works.
+# # # #         # SystemExit is also re-raised so a genuine fatal signal propagates to
+# # # #         # the consumer's outer handler (nack + DLQ) instead of being swallowed.
+# # # #         try:
+# # # #             pipeline.run()
+# # # #         except KeyboardInterrupt:
+# # # #             raise
+# # # #         except SystemExit:
+# # # #             raise
+# # # #         except BaseException as video_exc:
+# # # #             print(
+# # # #                 f"[Analyzer:{job_id}]  WARNING — video_id={vj.video_id} "
+# # # #                 f"seq={vj.sequence_no} FAILED (skipping): {video_exc!r}"
+# # # #             )
+# # # #             failed_video_ids.add(vj.video_id)
+# # # #             # Fall through: advance offsets and continue with the next video.
+
+# # # #         # Drop our reference to the finished pipeline so it (and the
+# # # #         # ThreadPoolExecutor/MediaPipe resources it owned, which run() has
+# # # #         # already explicitly shut down/closed) can be collected promptly
+# # # #         # rather than living until the next loop iteration reassigns it.
+# # # #         del pipeline
+
+# # # #         # Advance offsets for the next video regardless of success/failure.
+# # # #         # Using the metadata we already captured keeps offsets consistent for
+# # # #         # subsequent videos even when this one's pipeline run was skipped.
+# # # #         time_offset  += duration
+# # # #         frame_offset += total_frames
+
+# # # #         # ── Fix 5: memory/resource snapshot — after this video ───────────────
+# # # #         _log_resource_snapshot("VIDEO END", job_id=job_id,
+# # # #                                 violations=len(shared_vstore._violations))
+
+# # # #         # Report per-video progress (10%–90% band)
+# # # #         if progress_cb:
+# # # #             pct = 10 + int(((idx + 1) / n_videos) * 80)
+# # # #             try:
+# # # #                 progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# # # #             except Exception as exc:
+# # # #                 print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+
+# # # #     total_wall_seconds = time.time() - wall_start
+
+# # # #     # ── Dedup + merge ─────────────────────────────────────────────────────────
+# # # #     shared_vstore._deduplicate_by_frame()
+# # # #     shared_vstore._merge_by_time_window()
+
+# # # #     # ── Extract frames + upload to S3 ───────────────────────────────────────
+# # # #     #
+# # # #     # BUG FIX — Wrong frames in violation evidence
+# # # #     # ─────────────────────────────────────────────
+# # # #     # The old code called:
+# # # #     #   for vj in ordered:
+# # # #     #       shared_vstore.extract_violation_frames(tmp_path)
+# # # #     #
+# # # #     # extract_violation_frames() iterates ALL violations in the shared store
+# # # #     # and seeks to v.frame_index (a GLOBAL frame number across all videos).
+# # # #     # When called with video_2's path, it seeks to e.g. frame 4500 in video_2
+# # # #     # — but frame 4500 is from video_1 (frame_index was global, not local).
+# # # #     # Result: every violation gets a frame from the WRONG video.
+# # # #     #
+# # # #     # Fix: build a per-filename path map, then for each violation use its
+# # # #     # source_filename to open the correct video and seek using local_time_str
+# # # #     # (seconds within that specific video file) — which is correct regardless
+# # # #     # of how many videos precede it in the journey.
+
+# # # #     # Map db_filename → local tmp path
+# # # #     path_by_filename: Dict[str, str] = {
+# # # #         os.path.basename(vj.s3_key): tmp_paths[vj.video_id]
+# # # #         for vj in ordered
+# # # #     }
+
+# # # #     for v in shared_vstore._violations:
+# # # #         # ── Case 1: annotated frame already in memory — upload directly ──────
+# # # #         if v.annotated_frame is not None:
+# # # #             filename = _frame_filename(v)
+# # # #             try:
+# # # #                 s3_key            = upload_frame(v.annotated_frame, journey_id,
+# # # #                                                  filename, folder_name=folder_name)
+# # # #                 v.frame_path      = s3_key
+# # # #                 v.annotated_frame = None
+# # # #             except Exception as exc:
+# # # #                 print(f"[Analyzer:{job_id}]  In-memory frame upload failed ({filename}): {exc}")
+# # # #             continue
+
+# # # #         # ── Case 2: no frame yet — extract from the correct source video ─────
+# # # #         if v.frame_path:
+# # # #             # Already extracted to disk by a previous extract_violation_frames()
+# # # #             # call (e.g. standalone mode). Upload it.
+# # # #             local_path = _local_frame_path(shared_vstore, v.frame_path)
+# # # #             if os.path.isfile(local_path):
+# # # #                 try:
+# # # #                     s3_key       = upload_frame_from_path(local_path, journey_id,
+# # # #                                                           folder_name=folder_name)
+# # # #                     v.frame_path = s3_key
+# # # #                 except Exception as exc:
+# # # #                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
+# # # #             else:
+# # # #                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+# # # #             continue
+
+# # # #         # ── Case 3: no frame at all — seek into the correct source video ─────
+# # # #         src_file = getattr(v, "source_filename", "")
+# # # #         tmp_path = path_by_filename.get(src_file, "")
+# # # #         if not tmp_path or not os.path.isfile(tmp_path):
+# # # #             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
+# # # #                   f"(source_filename={src_file!r}) — skipping frame extraction")
+# # # #             continue
+
+# # # #         # Use local_time_str (seconds within this video) to seek correctly.
+# # # #         # v.local_time_str is set by record_violation(local_video_time=...) and
+# # # #         # stored as an "H:MM:SS" string. Convert back to seconds for cv2 seek.
+# # # #         local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # # #         cap = cv2.VideoCapture(tmp_path)
+# # # #         frame_img = None
+# # # #         if cap.isOpened():
+# # # #             cap.set(cv2.CAP_PROP_POS_MSEC, local_secs * 1000.0)
+# # # #             ret, frame_img = cap.read()
+# # # #             if not ret:
+# # # #                 # Fallback: try seeking by fraction of duration
+# # # #                 fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # # #                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # # #                 local_frame = int(local_secs * fps)
+# # # #                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(local_frame, max(0, total - 1)))
+# # # #                 ret, frame_img = cap.read()
+# # # #         cap.release()
+
+# # # #         if frame_img is None:
+# # # #             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
+# # # #                   f"@ local_time={local_secs:.2f}s — skipping")
+# # # #             continue
+
+# # # #         filename = _frame_filename(v)
+# # # #         try:
+# # # #             s3_key       = upload_frame(frame_img, journey_id,
+# # # #                                         filename, folder_name=folder_name)
+# # # #             v.frame_path = s3_key
+# # # #         except Exception as exc:
+# # # #             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
+
+# # # #     # ── Build VideoResult / ViolationResult objects ───────────────────────────
+# # # #     violations_by_filename: Dict[str, list] = {}
+# # # #     for v in shared_vstore._violations:
+# # # #         violations_by_filename.setdefault(v.source_filename, []).append(v)
+
+# # # #     video_results: List[VideoResult] = []
+
+# # # #     for vj in ordered:
+# # # #         meta        = meta_by_id[vj.video_id]
+# # # #         db_filename = os.path.basename(vj.s3_key)
+# # # #         raw_viols   = violations_by_filename.get(db_filename, [])
+
+# # # #         violation_results = []
+# # # #         for v in raw_viols:
+# # # #             # timestamp_seconds: float seconds from journey start (global)
+# # # #             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+
+# # # #             # original_video_timestamp: float seconds within the source video (local)
+# # # #             local_ts = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # # #             violation_results.append(
+# # # #                 ViolationResult(
+# # # #                     violation_type           = _event_type_to_violation_type(v.type),
+# # # #                     severity                 = _severity_for_risk(v.risk_score),
+# # # #                     confidence               = round(v.confidence * 100, 2),
+# # # #                     risk_score               = float(v.risk_score),
+# # # #                     timestamp_seconds        = _fmt_duration(journey_ts),
+# # # #                     original_video_timestamp = _fmt_duration(local_ts),
+# # # #                     frame_paths              = [v.frame_path] if v.frame_path else [],
+# # # #                 )
+# # # #             )
+
+# # # #         video_results.append(
+# # # #             VideoResult(
+# # # #                 video_id           = vj.video_id,
+# # # #                 video_name         = db_filename,
+# # # #                 sequence_no        = vj.sequence_no,
+# # # #                 duration_seconds   = meta["duration_seconds"],
+# # # #                 duration_formatted = meta["duration_formatted"],
+# # # #                 fps                = meta["fps"],
+# # # #                 size_mb            = meta["size_mb"],
+# # # #                 original_s3_key    = vj.s3_key,
+# # # #                 violations         = violation_results,
+# # # #             )
+# # # #         )
+
+# # # #     if failed_video_ids:
+# # # #         print(
+# # # #             f"[Analyzer:{job_id}]  Journey analysis complete with "
+# # # #             f"{len(failed_video_ids)} skipped video(s): {sorted(failed_video_ids)}"
+# # # #         )
+
+# # # #     # ── Fix 6: explicit garbage collection at end of journey ─────────────────
+# # # #     # By this point every violation's annotated_frame has already been
+# # # #     # uploaded and cleared (set to None) above, and every per-video pipeline
+# # # #     # (executor + MediaPipe graphs) has already been explicitly shut down /
+# # # #     # closed inside GadgetDetectionPipeline.run(). gc.collect() here is a
+# # # #     # belt-and-suspenders step to promptly reclaim any reference cycles
+# # # #     # (e.g. exception tracebacks) before the next journey starts.
+# # # #     n_violations_final = len(shared_vstore._violations)
+# # # #     _log_resource_snapshot("JOURNEY END (pre-GC)", job_id=job_id,
+# # # #                             violations=n_violations_final)
+# # # #     gc.collect()
+# # # #     _log_resource_snapshot("JOURNEY END (post-GC)", job_id=job_id,
+# # # #                             violations=n_violations_final)
+
+# # # #     return video_results, total_wall_seconds
+
+
+# # # # # ── Private helpers ───────────────────────────────────────────────────────────
+
+# # # # def _frame_filename(v) -> str:
+# # # #     """Derive a JPEG filename from a _Violation object (matches _save_frame logic)."""
+# # # #     distraction   = "_".join(sorted(v.events))
+# # # #     filename_time = v.time_str.replace(":", "-")
+# # # #     return f"{distraction}_{filename_time}.jpg"
+
+
+# # # from __future__ import annotations
+
+# # # import gc
+# # # import logging
+# # # import os
+# # # import threading
+# # # import time
+# # # from typing import Dict, List, Tuple
+
+# # # import cv2
+
+# # # try:
+# # #     import psutil
+# # #     _PSUTIL_AVAILABLE = True
+# # # except ImportError:
+# # #     psutil = None
+# # #     _PSUTIL_AVAILABLE = False
+
+# # # from models import VideoJob, VideoResult, ViolationResult
+# # # from s3_service import upload_frame, upload_frame_from_path
+
+# # # # Import the existing pipeline and store — unchanged
+# # # from main import GadgetDetectionPipeline
+# # # from utils.violation_store import ViolationStore
+
+# # # log = logging.getLogger("analyzer")
+
+# # # # OUTPUTS_ROOT mirrors the constant inside violation_store.py
+# # # OUTPUTS_ROOT = "outputs"
+
+
+# # # # ── Memory / resource diagnostics (Fix 5) ──────────────────────────────────────
+
+# # # _PROCESS = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+
+
+# # # def _rss_gb() -> float:
+# # #     """Current process resident set size, in GB. Returns -1.0 if psutil is unavailable."""
+# # #     if _PROCESS is None:
+# # #         return -1.0
+# # #     try:
+# # #         return _PROCESS.memory_info().rss / (1024 ** 3)
+# # #     except Exception:
+# # #         return -1.0
+
+
+# # # def _log_resource_snapshot(label: str, job_id: str = "", violations: int = -1) -> None:
+# # #     """
+# # #     Emit a single-line resource snapshot. `label` is one of:
+# # #     'VIDEO START', 'VIDEO END', 'JOURNEY START', 'JOURNEY END'.
+# # #     """
+# # #     rss        = _rss_gb()
+# # #     thread_cnt = threading.active_count()
+# # #     rss_str    = f"{rss:.3f}GB" if rss >= 0 else "n/a (psutil unavailable)"
+# # #     viol_str   = f"  VIOLATIONS={violations}" if violations >= 0 else ""
+# # #     print(
+# # #         f"[MEMORY {label}]  job={job_id}  RSS={rss_str}  THREADS={thread_cnt}{viol_str}"
+# # #     )
+
+
+# # # # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# # # def _video_meta(path: str) -> Tuple[float, float, int, float]:
+# # #     """Returns (duration_seconds, fps, total_frames, size_mb)."""
+# # #     cap = cv2.VideoCapture(path)
+# # #     if not cap.isOpened():
+# # #         return 0.0, 25.0, 0, 0.0
+# # #     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # #     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # #     cap.release()
+# # #     duration = total / fps if fps > 0 and total > 0 else 0.0
+# # #     size_mb  = round(os.path.getsize(path) / 1_000_000, 2) if os.path.isfile(path) else 0.0
+# # #     return duration, fps, total, size_mb
+
+
+# # # def _fmt_duration(seconds: float) -> str:
+# # #     """Converts float seconds to 'H:MM:SS' string."""
+# # #     t  = int(seconds)
+# # #     hh = t // 3600
+# # #     mm = (t % 3600) // 60
+# # #     ss = t % 60
+# # #     return f"{hh}:{mm:02d}:{ss:02d}"
+
+
+# # # def _event_type_to_violation_type(event_type: str) -> str:
+# # #     """
+# # #     Map internal event_type strings → CVVRS API ViolationType enum values.
+
+# # #     CVVRS types: PHONE_USAGE | DROWSY | DISTRACTION | EATING |
+# # #                  EYES_CLOSED | POSTURE_ALERT | HAND_TO_EAR | SEAT_ABSENCE
+# # #     """
+# # #     return {
+# # #         "phone_use":       "PHONE_USAGE",
+# # #         "seat_absence":    "SEAT_ABSENCE",
+# # #         "drowsy":          "DROWSY",
+# # #         "sleeping":        "DROWSY",
+# # #         "sleeping_absent": "DROWSY",
+# # #         "distraction":     "DISTRACTION",
+# # #         "eating":          "EATING",
+# # #         "eyes_closed":     "EYES_CLOSED",
+# # #         "posture_alert":   "POSTURE_ALERT",
+# # #         "hand_to_ear":     "HAND_TO_EAR",
+# # #     }.get(event_type.lower(), event_type.upper())
+
+
+# # # def _severity_for_risk(risk_score: float) -> str:
+# # #     """
+# # #     Map risk score → severity string.
+
+# # #     Tiers (aligned with CVVRS severity reference):
+# # #         >= 95  → CRITICAL
+# # #         >= 80  → HIGH
+# # #         >= 50  → MEDIUM
+# # #         <  50  → LOW
+# # #     """
+# # #     if risk_score >= 95:
+# # #         return "CRITICAL"
+# # #     if risk_score >= 80:
+# # #         return "HIGH"
+# # #     if risk_score >= 50:
+# # #         return "MEDIUM"
+# # #     return "LOW"
+
+
+# # # def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
+# # #     """
+# # #     Convert the relative frame path stored by ViolationStore._save_frame()
+# # #     back to an absolute local disk path.
+
+# # #     _save_frame() returns:  "<analysis_id>/frames/<filename>"
+# # #     The actual disk path is: "outputs/<analysis_id>/frames/<filename>"
+# # #     """
+# # #     filename = os.path.basename(relative_path)
+# # #     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+# # # def _hms_to_seconds(hms: str) -> float:
+# # #     """
+# # #     Convert "H:MM:SS" or "HH:MM:SS" to float seconds.
+# # #     Returns 0.0 on any parse error.
+# # #     """
+# # #     try:
+# # #         parts = hms.strip().split(":")
+# # #         if len(parts) == 3:
+# # #             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+# # #         if len(parts) == 2:
+# # #             return int(parts[0]) * 60 + float(parts[1])
+# # #         return float(parts[0])
+# # #     except Exception:
+# # #         return 0.0
+
+
+# # # # ── Main entry point ──────────────────────────────────────────────────────────
+
+# # # def analyze_journey(
+# # #     job_id:        str,
+# # #     journey_id:    int,
+# # #     folder_name:   str,                  # e.g. "journeys/1/2026-06-10/JRN-..."
+# # #     video_jobs:    List[VideoJob],
+# # #     tmp_paths:     Dict[int, str],       # video_id → local tmp file path
+# # #     progress_cb    = None,               # optional callable(pct, msg, current_video)
+# # #     video_done_cb  = None,               # optional callable(video_id, ok, error, error_type, stack_trace, reason)
+# # # ) -> Tuple[List[VideoResult], float]:
+# # #     """
+# # #     Run the full detection pipeline over all videos in a journey.
+
+# # #     Parameters
+# # #     ──────────
+# # #     job_id        : RabbitMQ job ID (used for logging only).
+# # #     journey_id    : Journey ID.
+# # #     folder_name   : Journey folder prefix used for S3 frame key construction,
+# # #                     e.g. "journeys/1/2026-06-10/JRN-20260610-1-ABC123".
+# # #     video_jobs    : List of VideoJob objects (will be sorted by sequence_no).
+# # #     tmp_paths     : Mapping of video_id → absolute local temp file path.
+# # #     progress_cb   : Optional callable(pct, msg, current_video_idx) for updates.
+# # #     video_done_cb : Optional callable(video_id, ok, error, error_type,
+# # #                     stack_trace, reason) fired immediately after each video
+# # #                     finishes (success or failure). Used by journey_runner.py
+# # #                     to push per-video progress events to the parent process via
+# # #                     a multiprocessing.Queue so the parent knows which videos
+# # #                     completed before a native crash kills the child.
+
+# # #     Returns
+# # #     ───────
+# # #     (video_results, total_wall_clock_seconds)
+# # #     """
+# # #     # Sort by sequence_no — critical for correct time/frame offset continuity
+# # #     ordered  = sorted(video_jobs, key=lambda v: v.sequence_no)
+# # #     n_videos = len(ordered)
+
+# # #     # One shared ViolationStore for the whole journey.
+# # #     analysis_id   = f"journey_{journey_id}"
+# # #     shared_vstore = ViolationStore(
+# # #         analysis_id     = analysis_id,
+# # #         train_detail_id = journey_id,
+# # #     )
+
+# # #     time_offset  = 0.0
+# # #     frame_offset = 0
+# # #     wall_start   = time.time()
+
+# # #     # Per-video metadata cache (keyed by video_id)
+# # #     meta_by_id: Dict[int, dict] = {}
+
+# # #     # Track which videos were skipped due to a per-video error so we can
+# # #     # still include them in the VideoResult list with zero violations.
+# # #     failed_video_ids: set = set()
+
+# # #     # ── Fix 5: memory/resource snapshot — journey start ──────────────────────
+# # #     _log_resource_snapshot("JOURNEY START", job_id=job_id,
+# # #                             violations=len(shared_vstore._violations))
+
+# # #     # ── Run the AI pipeline over each video ──────────────────────────────────
+# # #     for idx, vj in enumerate(ordered):
+# # #         tmp_path    = tmp_paths[vj.video_id]
+# # #         db_filename = os.path.basename(vj.s3_key)
+
+# # #         duration, fps, total_frames, size_mb = _video_meta(tmp_path)
+
+# # #         meta_by_id[vj.video_id] = {
+# # #             "duration_seconds":   duration,
+# # #             "duration_formatted": _fmt_duration(duration),
+# # #             "fps":                fps,
+# # #             "size_mb":            size_mb,
+# # #             "total_frames":       total_frames,
+# # #         }
+
+# # #         print(
+# # #             f"[Analyzer:{job_id}]  [{idx + 1}/{n_videos}]  "
+# # #             f"video_id={vj.video_id}  seq={vj.sequence_no}  "
+# # #             f"file={db_filename}  "
+# # #             f"time_offset={time_offset:.2f}s  frame_offset={frame_offset}"
+# # #         )
+
+# # #         # ── Fix 5: memory/resource snapshot — before this video ──────────────
+# # #         _log_resource_snapshot("VIDEO START", job_id=job_id,
+# # #                                 violations=len(shared_vstore._violations))
+
+# # #         pipeline = GadgetDetectionPipeline(
+# # #             source           = tmp_path,
+# # #             analysis_id      = analysis_id,
+# # #             train_detail_id  = journey_id,
+# # #             save             = False,
+# # #             display          = False,
+# # #             shared_vstore    = shared_vstore,
+# # #             time_offset      = time_offset,
+# # #             frame_offset     = frame_offset,
+# # #             source_filename  = db_filename,
+# # #         )
+
+# # #         # ── FIX — Issue #2: per-video error isolation ─────────────────────────
+# # #         # Wrap pipeline.run() so a failure for one video is logged and skipped,
+# # #         # allowing the remaining videos in the journey to be processed normally.
+# # #         #
+# # #         # We catch BaseException (not just Exception) because
+# # #         # GadgetDetectionPipeline.run() calls sys.exit(1) when it cannot open
+# # #         # a video file — sys.exit raises SystemExit which is a BaseException
+# # #         # subclass and would otherwise escape an "except Exception" guard.
+# # #         #
+# # #         # KeyboardInterrupt is explicitly re-raised so Ctrl-C still works.
+# # #         # SystemExit is also re-raised so a genuine fatal signal propagates to
+# # #         # the consumer's outer handler (nack + DLQ) instead of being swallowed.
+# # #         #
+# # #         # video_done_cb is called after every video — success or failure —
+# # #         # so that journey_runner.py's parent process learns which videos
+# # #         # completed before a native crash kills the child. It is best-effort:
+# # #         # a failure inside the callback is swallowed so it never disrupts the
+# # #         # remaining video loop.
+# # #         _video_exc_for_cb: BaseException | None = None
+# # #         try:
+# # #             pipeline.run()
+# # #         except KeyboardInterrupt:
+# # #             raise
+# # #         except SystemExit:
+# # #             raise
+# # #         except BaseException as video_exc:
+# # #             _video_exc_for_cb = video_exc
+# # #             print(
+# # #                 f"[Analyzer:{job_id}]  WARNING — video_id={vj.video_id} "
+# # #                 f"seq={vj.sequence_no} FAILED (skipping): {video_exc!r}"
+# # #             )
+# # #             failed_video_ids.add(vj.video_id)
+# # #             # Fall through: advance offsets and continue with the next video.
+
+# # #         # Fire video_done_cb (best-effort) so the parent process can track
+# # #         # per-video completion before a native crash terminates the child.
+# # #         if video_done_cb is not None:
+# # #             try:
+# # #                 if _video_exc_for_cb is None:
+# # #                     video_done_cb(
+# # #                         vj.video_id,
+# # #                         True,   # ok
+# # #                         None,   # error
+# # #                         None,   # error_type
+# # #                         None,   # stack_trace
+# # #                         None,   # reason
+# # #                     )
+# # #                 else:
+# # #                     import traceback as _tb
+# # #                     video_done_cb(
+# # #                         vj.video_id,
+# # #                         False,                          # ok
+# # #                         str(_video_exc_for_cb),         # error
+# # #                         "PROCESSING_ERROR",             # error_type
+# # #                         _tb.format_exc(),               # stack_trace
+# # #                         None,                           # reason
+# # #                     )
+# # #             except Exception:
+# # #                 pass  # never let a callback error kill the analysis loop
+
+# # #         # Drop our reference to the finished pipeline so it (and the
+# # #         # ThreadPoolExecutor/MediaPipe resources it owned, which run() has
+# # #         # already explicitly shut down/closed) can be collected promptly
+# # #         # rather than living until the next loop iteration reassigns it.
+# # #         del pipeline
+
+# # #         # Advance offsets for the next video regardless of success/failure.
+# # #         # Using the metadata we already captured keeps offsets consistent for
+# # #         # subsequent videos even when this one's pipeline run was skipped.
+# # #         time_offset  += duration
+# # #         frame_offset += total_frames
+
+# # #         # ── Fix 5: memory/resource snapshot — after this video ───────────────
+# # #         _log_resource_snapshot("VIDEO END", job_id=job_id,
+# # #                                 violations=len(shared_vstore._violations))
+
+# # #         # Report per-video progress (10%–90% band)
+# # #         if progress_cb:
+# # #             pct = 10 + int(((idx + 1) / n_videos) * 80)
+# # #             try:
+# # #                 progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# # #             except Exception as exc:
+# # #                 print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+
+# # #     total_wall_seconds = time.time() - wall_start
+
+# # #     # ── Dedup + merge ─────────────────────────────────────────────────────────
+# # #     shared_vstore._deduplicate_by_frame()
+# # #     shared_vstore._merge_by_time_window()
+
+# # #     # ── Extract frames + upload to S3 ───────────────────────────────────────
+# # #     #
+# # #     # BUG FIX — Wrong frames in violation evidence
+# # #     # ─────────────────────────────────────────────
+# # #     # The old code called:
+# # #     #   for vj in ordered:
+# # #     #       shared_vstore.extract_violation_frames(tmp_path)
+# # #     #
+# # #     # extract_violation_frames() iterates ALL violations in the shared store
+# # #     # and seeks to v.frame_index (a GLOBAL frame number across all videos).
+# # #     # When called with video_2's path, it seeks to e.g. frame 4500 in video_2
+# # #     # — but frame 4500 is from video_1 (frame_index was global, not local).
+# # #     # Result: every violation gets a frame from the WRONG video.
+# # #     #
+# # #     # Fix: build a per-filename path map, then for each violation use its
+# # #     # source_filename to open the correct video and seek using local_time_str
+# # #     # (seconds within that specific video file) — which is correct regardless
+# # #     # of how many videos precede it in the journey.
+
+# # #     # Map db_filename → local tmp path
+# # #     path_by_filename: Dict[str, str] = {
+# # #         os.path.basename(vj.s3_key): tmp_paths[vj.video_id]
+# # #         for vj in ordered
+# # #     }
+
+# # #     for v in shared_vstore._violations:
+# # #         # ── Case 1: annotated frame already in memory — upload directly ──────
+# # #         if v.annotated_frame is not None:
+# # #             filename = _frame_filename(v)
+# # #             try:
+# # #                 s3_key            = upload_frame(v.annotated_frame, journey_id,
+# # #                                                  filename, folder_name=folder_name)
+# # #                 v.frame_path      = s3_key
+# # #                 v.annotated_frame = None
+# # #             except Exception as exc:
+# # #                 print(f"[Analyzer:{job_id}]  In-memory frame upload failed ({filename}): {exc}")
+# # #             continue
+
+# # #         # ── Case 2: no frame yet — extract from the correct source video ─────
+# # #         if v.frame_path:
+# # #             # Already extracted to disk by a previous extract_violation_frames()
+# # #             # call (e.g. standalone mode). Upload it.
+# # #             local_path = _local_frame_path(shared_vstore, v.frame_path)
+# # #             if os.path.isfile(local_path):
+# # #                 try:
+# # #                     s3_key       = upload_frame_from_path(local_path, journey_id,
+# # #                                                           folder_name=folder_name)
+# # #                     v.frame_path = s3_key
+# # #                 except Exception as exc:
+# # #                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
+# # #             else:
+# # #                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+# # #             continue
+
+# # #         # ── Case 3: no frame at all — seek into the correct source video ─────
+# # #         src_file = getattr(v, "source_filename", "")
+# # #         tmp_path = path_by_filename.get(src_file, "")
+# # #         if not tmp_path or not os.path.isfile(tmp_path):
+# # #             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
+# # #                   f"(source_filename={src_file!r}) — skipping frame extraction")
+# # #             continue
+
+# # #         # Use local_time_str (seconds within this video) to seek correctly.
+# # #         # v.local_time_str is set by record_violation(local_video_time=...) and
+# # #         # stored as an "H:MM:SS" string. Convert back to seconds for cv2 seek.
+# # #         local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # #         cap = cv2.VideoCapture(tmp_path)
+# # #         frame_img = None
+# # #         if cap.isOpened():
+# # #             cap.set(cv2.CAP_PROP_POS_MSEC, local_secs * 1000.0)
+# # #             ret, frame_img = cap.read()
+# # #             if not ret:
+# # #                 # Fallback: try seeking by fraction of duration
+# # #                 fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # #                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # #                 local_frame = int(local_secs * fps)
+# # #                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(local_frame, max(0, total - 1)))
+# # #                 ret, frame_img = cap.read()
+# # #         cap.release()
+
+# # #         if frame_img is None:
+# # #             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
+# # #                   f"@ local_time={local_secs:.2f}s — skipping")
+# # #             continue
+
+# # #         filename = _frame_filename(v)
+# # #         try:
+# # #             s3_key       = upload_frame(frame_img, journey_id,
+# # #                                         filename, folder_name=folder_name)
+# # #             v.frame_path = s3_key
+# # #         except Exception as exc:
+# # #             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
+
+# # #     # ── Build VideoResult / ViolationResult objects ───────────────────────────
+# # #     violations_by_filename: Dict[str, list] = {}
+# # #     for v in shared_vstore._violations:
+# # #         violations_by_filename.setdefault(v.source_filename, []).append(v)
+
+# # #     video_results: List[VideoResult] = []
+
+# # #     for vj in ordered:
+# # #         meta        = meta_by_id[vj.video_id]
+# # #         db_filename = os.path.basename(vj.s3_key)
+# # #         raw_viols   = violations_by_filename.get(db_filename, [])
+
+# # #         violation_results = []
+# # #         for v in raw_viols:
+# # #             # timestamp_seconds: float seconds from journey start (global)
+# # #             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+
+# # #             # original_video_timestamp: float seconds within the source video (local)
+# # #             local_ts = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # #             violation_results.append(
+# # #                 ViolationResult(
+# # #                     violation_type           = _event_type_to_violation_type(v.type),
+# # #                     severity                 = _severity_for_risk(v.risk_score),
+# # #                     confidence               = round(v.confidence * 100, 2),
+# # #                     risk_score               = float(v.risk_score),
+# # #                     timestamp_seconds        = _fmt_duration(journey_ts),
+# # #                     original_video_timestamp = _fmt_duration(local_ts),
+# # #                     frame_paths              = [v.frame_path] if v.frame_path else [],
+# # #                 )
+# # #             )
+
+# # #         video_results.append(
+# # #             VideoResult(
+# # #                 video_id           = vj.video_id,
+# # #                 video_name         = db_filename,
+# # #                 sequence_no        = vj.sequence_no,
+# # #                 duration_seconds   = meta["duration_seconds"],
+# # #                 duration_formatted = meta["duration_formatted"],
+# # #                 fps                = meta["fps"],
+# # #                 size_mb            = meta["size_mb"],
+# # #                 original_s3_key    = vj.s3_key,
+# # #                 violations         = violation_results,
+# # #             )
+# # #         )
+
+# # #     if failed_video_ids:
+# # #         print(
+# # #             f"[Analyzer:{job_id}]  Journey analysis complete with "
+# # #             f"{len(failed_video_ids)} skipped video(s): {sorted(failed_video_ids)}"
+# # #         )
+
+# # #     # ── Fix 6: explicit garbage collection at end of journey ─────────────────
+# # #     # By this point every violation's annotated_frame has already been
+# # #     # uploaded and cleared (set to None) above, and every per-video pipeline
+# # #     # (executor + MediaPipe graphs) has already been explicitly shut down /
+# # #     # closed inside GadgetDetectionPipeline.run(). gc.collect() here is a
+# # #     # belt-and-suspenders step to promptly reclaim any reference cycles
+# # #     # (e.g. exception tracebacks) before the next journey starts.
+# # #     n_violations_final = len(shared_vstore._violations)
+# # #     _log_resource_snapshot("JOURNEY END (pre-GC)", job_id=job_id,
+# # #                             violations=n_violations_final)
+# # #     gc.collect()
+# # #     _log_resource_snapshot("JOURNEY END (post-GC)", job_id=job_id,
+# # #                             violations=n_violations_final)
+
+# # #     return video_results, total_wall_seconds
+
+
+# # # # ── Private helpers ───────────────────────────────────────────────────────────
+
+# # # def _frame_filename(v) -> str:
+# # #     """Derive a JPEG filename from a _Violation object (matches _save_frame logic)."""
+# # #     distraction   = "_".join(sorted(v.events))
+# # #     filename_time = v.time_str.replace(":", "-")
+# # #     return f"{distraction}_{filename_time}.jpg"
+
+
+# # from __future__ import annotations
+
+# # import gc
+# # import logging
+# # import os
+# # import threading
+# # import time
+# # from typing import Dict, List, Tuple
+
+# # import cv2
+
+# # try:
+# #     import psutil
+# #     _PSUTIL_AVAILABLE = True
+# # except ImportError:
+# #     psutil = None
+# #     _PSUTIL_AVAILABLE = False
+
+# # from models import VideoJob, VideoResult, ViolationResult
+# # from s3_service import upload_frame, upload_frame_from_path
+
+# # # Import the existing pipeline and store — unchanged
+# # from main import GadgetDetectionPipeline
+# # from utils.violation_store import ViolationStore
+
+# # log = logging.getLogger("analyzer")
+
+# # # OUTPUTS_ROOT mirrors the constant inside violation_store.py
+# # OUTPUTS_ROOT = "outputs"
+
+
+# # # ── Memory / resource diagnostics (Fix 5) ──────────────────────────────────────
+
+# # _PROCESS = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+
+
+# # def _rss_gb() -> float:
+# #     """Current process resident set size, in GB. Returns -1.0 if psutil is unavailable."""
+# #     if _PROCESS is None:
+# #         return -1.0
+# #     try:
+# #         return _PROCESS.memory_info().rss / (1024 ** 3)
+# #     except Exception:
+# #         return -1.0
+
+
+# # def _log_resource_snapshot(label: str, job_id: str = "", violations: int = -1) -> None:
+# #     """
+# #     Emit a single-line resource snapshot. `label` is one of:
+# #     'VIDEO START', 'VIDEO END', 'JOURNEY START', 'JOURNEY END'.
+
+# #     Also reports GPU memory state (via resource_manager, imported lazily
+# #     so analyzer.py has no hard dependency on it being importable) — this
+# #     gives Phase 9 leak-detection visibility into CUDA usage alongside the
+# #     existing RSS/thread numbers, without changing what this function
+# #     already logs for RSS/threads.
+# #     """
+# #     rss        = _rss_gb()
+# #     thread_cnt = threading.active_count()
+# #     rss_str    = f"{rss:.3f}GB" if rss >= 0 else "n/a (psutil unavailable)"
+# #     viol_str   = f"  VIOLATIONS={violations}" if violations >= 0 else ""
+
+# #     gpu_str = ""
+# #     try:
+# #         from resource_manager import get_gpu_memory_info
+# #         gpu_info = get_gpu_memory_info()
+# #         if gpu_info.available:
+# #             gpu_str = (
+# #                 f"  GPU_reserved={gpu_info.reserved_gb:.3f}GB"
+# #                 f"/{gpu_info.total_gb:.3f}GB ({gpu_info.used_fraction*100:.1f}%)"
+# #             )
+# #     except Exception:
+# #         pass
+
+# #     print(
+# #         f"[MEMORY {label}]  job={job_id}  RSS={rss_str}  THREADS={thread_cnt}"
+# #         f"{viol_str}{gpu_str}"
+# #     )
+
+
+# # # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# # def _video_meta(path: str) -> Tuple[float, float, int, float]:
+# #     """Returns (duration_seconds, fps, total_frames, size_mb)."""
+# #     cap = cv2.VideoCapture(path)
+# #     if not cap.isOpened():
+# #         return 0.0, 25.0, 0, 0.0
+# #     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# #     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# #     cap.release()
+# #     duration = total / fps if fps > 0 and total > 0 else 0.0
+# #     size_mb  = round(os.path.getsize(path) / 1_000_000, 2) if os.path.isfile(path) else 0.0
+# #     return duration, fps, total, size_mb
+
+
+# # def _fmt_duration(seconds: float) -> str:
+# #     """Converts float seconds to 'H:MM:SS' string."""
+# #     t  = int(seconds)
+# #     hh = t // 3600
+# #     mm = (t % 3600) // 60
+# #     ss = t % 60
+# #     return f"{hh}:{mm:02d}:{ss:02d}"
+
+
+# # def _event_type_to_violation_type(event_type: str) -> str:
+# #     """
+# #     Map internal event_type strings → CVVRS API ViolationType enum values.
+
+# #     CVVRS types: PHONE_USAGE | DROWSY | DISTRACTION | EATING |
+# #                  EYES_CLOSED | POSTURE_ALERT | HAND_TO_EAR | SEAT_ABSENCE
+# #     """
+# #     return {
+# #         "phone_use":       "PHONE_USAGE",
+# #         "seat_absence":    "SEAT_ABSENCE",
+# #         "drowsy":          "DROWSY",
+# #         "sleeping":        "DROWSY",
+# #         "sleeping_absent": "DROWSY",
+# #         "distraction":     "DISTRACTION",
+# #         "eating":          "EATING",
+# #         "eyes_closed":     "EYES_CLOSED",
+# #         "posture_alert":   "POSTURE_ALERT",
+# #         "hand_to_ear":     "HAND_TO_EAR",
+# #     }.get(event_type.lower(), event_type.upper())
+
+
+# # def _severity_for_risk(risk_score: float) -> str:
+# #     """
+# #     Map risk score → severity string.
+
+# #     Tiers (aligned with CVVRS severity reference):
+# #         >= 95  → CRITICAL
+# #         >= 80  → HIGH
+# #         >= 50  → MEDIUM
+# #         <  50  → LOW
+# #     """
+# #     if risk_score >= 95:
+# #         return "CRITICAL"
+# #     if risk_score >= 80:
+# #         return "HIGH"
+# #     if risk_score >= 50:
+# #         return "MEDIUM"
+# #     return "LOW"
+
+
+# # def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
+# #     """
+# #     Convert the relative frame path stored by ViolationStore._save_frame()
+# #     back to an absolute local disk path.
+
+# #     _save_frame() returns:  "<analysis_id>/frames/<filename>"
+# #     The actual disk path is: "outputs/<analysis_id>/frames/<filename>"
+# #     """
+# #     filename = os.path.basename(relative_path)
+# #     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+# # def _hms_to_seconds(hms: str) -> float:
+# #     """
+# #     Convert "H:MM:SS" or "HH:MM:SS" to float seconds.
+# #     Returns 0.0 on any parse error.
+# #     """
+# #     try:
+# #         parts = hms.strip().split(":")
+# #         if len(parts) == 3:
+# #             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+# #         if len(parts) == 2:
+# #             return int(parts[0]) * 60 + float(parts[1])
+# #         return float(parts[0])
+# #     except Exception:
+# #         return 0.0
+
+
+# # # ── Main entry point ──────────────────────────────────────────────────────────
+
+# # def analyze_journey(
+# #     job_id:        str,
+# #     journey_id:    int,
+# #     folder_name:   str,                  # e.g. "journeys/1/2026-06-10/JRN-..."
+# #     video_jobs:    List[VideoJob],
+# #     tmp_paths:     Dict[int, str],       # video_id → local tmp file path
+# #     progress_cb    = None,               # optional callable(pct, msg, current_video)
+# #     video_done_cb  = None,               # optional callable(video_id, ok, error, error_type, stack_trace, reason)
+# # ) -> Tuple[List[VideoResult], float, Dict[int, str]]:
+# #     """
+# #     Run the full detection pipeline over all videos in a journey.
+
+# #     Parameters
+# #     ──────────
+# #     job_id        : RabbitMQ job ID (used for logging only).
+# #     journey_id    : Journey ID.
+# #     folder_name   : Journey folder prefix used for S3 frame key construction,
+# #                     e.g. "journeys/1/2026-06-10/JRN-20260610-1-ABC123".
+# #     video_jobs    : List of VideoJob objects (will be sorted by sequence_no).
+# #     tmp_paths     : Mapping of video_id → absolute local temp file path.
+# #     progress_cb   : Optional callable(pct, msg, current_video_idx) for updates.
+# #     video_done_cb : Optional callable(video_id, ok, error, error_type,
+# #                     stack_trace, reason) fired immediately after each video
+# #                     finishes (success or failure). Used by journey_runner.py
+# #                     to push per-video progress events to the parent process via
+# #                     a multiprocessing.Queue so the parent knows which videos
+# #                     completed before a native crash kills the child.
+
+# #     Returns
+# #     ───────
+# #     (video_results, total_wall_clock_seconds)
+# #     """
+# #     # Sort by sequence_no — critical for correct time/frame offset continuity
+# #     ordered  = sorted(video_jobs, key=lambda v: v.sequence_no)
+# #     n_videos = len(ordered)
+
+# #     # One shared ViolationStore for the whole journey.
+# #     analysis_id   = f"journey_{journey_id}"
+# #     shared_vstore = ViolationStore(
+# #         analysis_id     = analysis_id,
+# #         train_detail_id = journey_id,
+# #     )
+
+# #     time_offset  = 0.0
+# #     frame_offset = 0
+# #     wall_start   = time.time()
+
+# #     # Per-video metadata cache (keyed by video_id)
+# #     meta_by_id: Dict[int, dict] = {}
+
+# #     # Track which videos were skipped due to a per-video error so we can
+# #     # still include them in the VideoResult list with zero violations.
+# #     failed_video_ids: set = set()
+
+# #     # ── Fix 5: memory/resource snapshot — journey start ──────────────────────
+# #     _log_resource_snapshot("JOURNEY START", job_id=job_id,
+# #                             violations=len(shared_vstore._violations))
+
+# #     # ── Run the AI pipeline over each video ──────────────────────────────────
+# #     for idx, vj in enumerate(ordered):
+# #         tmp_path    = tmp_paths[vj.video_id]
+# #         db_filename = os.path.basename(vj.s3_key)
+
+# #         duration, fps, total_frames, size_mb = _video_meta(tmp_path)
+
+# #         meta_by_id[vj.video_id] = {
+# #             "duration_seconds":   duration,
+# #             "duration_formatted": _fmt_duration(duration),
+# #             "fps":                fps,
+# #             "size_mb":            size_mb,
+# #             "total_frames":       total_frames,
+# #         }
+
+# #         print(
+# #             f"[Analyzer:{job_id}]  [{idx + 1}/{n_videos}]  "
+# #             f"video_id={vj.video_id}  seq={vj.sequence_no}  "
+# #             f"file={db_filename}  "
+# #             f"time_offset={time_offset:.2f}s  frame_offset={frame_offset}"
+# #         )
+
+# #         # ── Fix 5: memory/resource snapshot — before this video ──────────────
+# #         _log_resource_snapshot("VIDEO START", job_id=job_id,
+# #                                 violations=len(shared_vstore._violations))
+
+# #         # ── Resource lifecycle (Phase 3): GPU threshold safety check ─────────
+# #         # If CUDA memory usage is already at/above the configured threshold
+# #         # before this video even starts, attempting inference is very likely
+# #         # to OOM anyway. Skip this video safely (mark it failed with a clear
+# #         # reason) rather than letting a near-certain CUDA crash take down the
+# #         # whole journey/process. is_gpu_over_threshold() is a no-op (returns
+# #         # False) when CUDA isn't available, so this never affects CPU-only
+# #         # environments.
+# #         try:
+# #             from resource_manager import is_gpu_over_threshold, gpu_cleanup, CUDA_ABORT_THRESHOLD
+# #             if is_gpu_over_threshold():
+# #                 print(
+# #                     f"[Analyzer:{job_id}]  GPU memory usage at/above "
+# #                     f"{CUDA_ABORT_THRESHOLD*100:.0f}% threshold — attempting "
+# #                     f"cleanup before video_id={vj.video_id}..."
+# #                 )
+# #                 gpu_cleanup()
+# #                 if is_gpu_over_threshold():
+# #                     print(
+# #                         f"[Analyzer:{job_id}]  GPU still over threshold after "
+# #                         f"cleanup — skipping video_id={vj.video_id} "
+# #                         f"seq={vj.sequence_no} to avoid a near-certain CUDA OOM."
+# #                     )
+# #                     failed_video_ids.add(vj.video_id)
+# #                     if video_done_cb is not None:
+# #                         try:
+# #                             video_done_cb(
+# #                                 vj.video_id, False,
+# #                                 "Not Processed - Worker Resource Exhaustion",
+# #                                 "NOT_PROCESSED", None,
+# #                                 "Not Processed - Worker Resource Exhaustion",
+# #                             )
+# #                         except Exception:
+# #                             pass
+# #                     time_offset  += duration
+# #                     frame_offset += total_frames
+# #                     if progress_cb:
+# #                         pct = 10 + int(((idx + 1) / n_videos) * 80)
+# #                         try:
+# #                             progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# #                         except Exception as exc:
+# #                             print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+# #                     continue
+# #         except ImportError:
+# #             pass  # resource_manager unavailable — proceed without the check
+
+# #         pipeline = GadgetDetectionPipeline(
+# #             source           = tmp_path,
+# #             analysis_id      = analysis_id,
+# #             train_detail_id  = journey_id,
+# #             save             = False,
+# #             display          = False,
+# #             shared_vstore    = shared_vstore,
+# #             time_offset      = time_offset,
+# #             frame_offset     = frame_offset,
+# #             source_filename  = db_filename,
+# #         )
+
+# #         # ── FIX — Issue #2: per-video error isolation ─────────────────────────
+# #         # Wrap pipeline.run() so a failure for one video is logged and skipped,
+# #         # allowing the remaining videos in the journey to be processed normally.
+# #         #
+# #         # We catch BaseException (not just Exception) because
+# #         # GadgetDetectionPipeline.run() calls sys.exit(1) when it cannot open
+# #         # a video file — sys.exit raises SystemExit which is a BaseException
+# #         # subclass and would otherwise escape an "except Exception" guard.
+# #         #
+# #         # KeyboardInterrupt is explicitly re-raised so Ctrl-C still works.
+# #         # SystemExit is also re-raised so a genuine fatal signal propagates to
+# #         # the consumer's outer handler (nack + DLQ) instead of being swallowed.
+# #         #
+# #         # video_done_cb is called after every video — success or failure —
+# #         # so that journey_runner.py's parent process learns which videos
+# #         # completed before a native crash kills the child. It is best-effort:
+# #         # a failure inside the callback is swallowed so it never disrupts the
+# #         # remaining video loop.
+# #         _video_exc_for_cb: BaseException | None = None
+# #         try:
+# #             pipeline.run()
+# #         except KeyboardInterrupt:
+# #             raise
+# #         except SystemExit:
+# #             raise
+# #         except BaseException as video_exc:
+# #             _video_exc_for_cb = video_exc
+# #             print(
+# #                 f"[Analyzer:{job_id}]  WARNING — video_id={vj.video_id} "
+# #                 f"seq={vj.sequence_no} FAILED (skipping): {video_exc!r}"
+# #             )
+# #             failed_video_ids.add(vj.video_id)
+# #             # Fall through: advance offsets and continue with the next video.
+
+# #         # Fire video_done_cb (best-effort) so the parent process can track
+# #         # per-video completion before a native crash terminates the child.
+# #         if video_done_cb is not None:
+# #             try:
+# #                 if _video_exc_for_cb is None:
+# #                     video_done_cb(
+# #                         vj.video_id,
+# #                         True,   # ok
+# #                         None,   # error
+# #                         None,   # error_type
+# #                         None,   # stack_trace
+# #                         None,   # reason
+# #                     )
+# #                 else:
+# #                     import traceback as _tb
+# #                     video_done_cb(
+# #                         vj.video_id,
+# #                         False,                          # ok
+# #                         str(_video_exc_for_cb),         # error
+# #                         "PROCESSING_ERROR",             # error_type
+# #                         _tb.format_exc(),               # stack_trace
+# #                         None,                           # reason
+# #                     )
+# #             except Exception:
+# #                 pass  # never let a callback error kill the analysis loop
+
+# #         # Drop our reference to the finished pipeline so it (and the
+# #         # ThreadPoolExecutor/MediaPipe resources it owned, which run() has
+# #         # already explicitly shut down/closed) can be collected promptly
+# #         # rather than living until the next loop iteration reassigns it.
+# #         del pipeline
+
+# #         # Advance offsets for the next video regardless of success/failure.
+# #         # Using the metadata we already captured keeps offsets consistent for
+# #         # subsequent videos even when this one's pipeline run was skipped.
+# #         time_offset  += duration
+# #         frame_offset += total_frames
+
+# #         # ── Fix 5: memory/resource snapshot — after this video ───────────────
+# #         _log_resource_snapshot("VIDEO END", job_id=job_id,
+# #                                 violations=len(shared_vstore._violations))
+
+# #         # Report per-video progress (10%–90% band)
+# #         if progress_cb:
+# #             pct = 10 + int(((idx + 1) / n_videos) * 80)
+# #             try:
+# #                 progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# #             except Exception as exc:
+# #                 print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+
+# #     total_wall_seconds = time.time() - wall_start
+
+# #     # ── Dedup + merge ─────────────────────────────────────────────────────────
+# #     shared_vstore._deduplicate_by_frame()
+# #     shared_vstore._merge_by_time_window()
+
+# #     # ── Extract frames + upload to S3 ───────────────────────────────────────
+# #     #
+# #     # BUG FIX — Wrong frames in violation evidence
+# #     # ─────────────────────────────────────────────
+# #     # The old code called:
+# #     #   for vj in ordered:
+# #     #       shared_vstore.extract_violation_frames(tmp_path)
+# #     #
+# #     # extract_violation_frames() iterates ALL violations in the shared store
+# #     # and seeks to v.frame_index (a GLOBAL frame number across all videos).
+# #     # When called with video_2's path, it seeks to e.g. frame 4500 in video_2
+# #     # — but frame 4500 is from video_1 (frame_index was global, not local).
+# #     # Result: every violation gets a frame from the WRONG video.
+# #     #
+# #     # Fix: build a per-filename path map, then for each violation use its
+# #     # source_filename to open the correct video and seek using local_time_str
+# #     # (seconds within that specific video file) — which is correct regardless
+# #     # of how many videos precede it in the journey.
+
+# #     # Map db_filename → local tmp path
+# #     path_by_filename: Dict[str, str] = {
+# #         os.path.basename(vj.s3_key): tmp_paths[vj.video_id]
+# #         for vj in ordered
+# #     }
+
+# #     for v in shared_vstore._violations:
+# #         # ── Case 1: annotated frame already in memory — upload directly ──────
+# #         if v.annotated_frame is not None:
+# #             filename = _frame_filename(v)
+# #             try:
+# #                 s3_key            = upload_frame(v.annotated_frame, journey_id,
+# #                                                  filename, folder_name=folder_name)
+# #                 v.frame_path      = s3_key
+# #                 v.annotated_frame = None
+# #             except Exception as exc:
+# #                 print(f"[Analyzer:{job_id}]  In-memory frame upload failed ({filename}): {exc}")
+# #             continue
+
+# #         # ── Case 2: no frame yet — extract from the correct source video ─────
+# #         if v.frame_path:
+# #             # Already extracted to disk by a previous extract_violation_frames()
+# #             # call (e.g. standalone mode). Upload it.
+# #             local_path = _local_frame_path(shared_vstore, v.frame_path)
+# #             if os.path.isfile(local_path):
+# #                 try:
+# #                     s3_key       = upload_frame_from_path(local_path, journey_id,
+# #                                                           folder_name=folder_name)
+# #                     v.frame_path = s3_key
+# #                 except Exception as exc:
+# #                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
+# #             else:
+# #                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+# #             continue
+
+# #         # ── Case 3: no frame at all — seek into the correct source video ─────
+# #         src_file = getattr(v, "source_filename", "")
+# #         tmp_path = path_by_filename.get(src_file, "")
+# #         if not tmp_path or not os.path.isfile(tmp_path):
+# #             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
+# #                   f"(source_filename={src_file!r}) — skipping frame extraction")
+# #             continue
+
+# #         # Use local_time_str (seconds within this video) to seek correctly.
+# #         # v.local_time_str is set by record_violation(local_video_time=...) and
+# #         # stored as an "H:MM:SS" string. Convert back to seconds for cv2 seek.
+# #         local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# #         cap = cv2.VideoCapture(tmp_path)
+# #         frame_img = None
+# #         if cap.isOpened():
+# #             cap.set(cv2.CAP_PROP_POS_MSEC, local_secs * 1000.0)
+# #             ret, frame_img = cap.read()
+# #             if not ret:
+# #                 # Fallback: try seeking by fraction of duration
+# #                 fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# #                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# #                 local_frame = int(local_secs * fps)
+# #                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(local_frame, max(0, total - 1)))
+# #                 ret, frame_img = cap.read()
+# #         cap.release()
+
+# #         if frame_img is None:
+# #             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
+# #                   f"@ local_time={local_secs:.2f}s — skipping")
+# #             continue
+
+# #         filename = _frame_filename(v)
+# #         try:
+# #             s3_key       = upload_frame(frame_img, journey_id,
+# #                                         filename, folder_name=folder_name)
+# #             v.frame_path = s3_key
+# #         except Exception as exc:
+# #             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
+
+# #     # ── Build VideoResult / ViolationResult objects ───────────────────────────
+# #     violations_by_filename: Dict[str, list] = {}
+# #     for v in shared_vstore._violations:
+# #         violations_by_filename.setdefault(v.source_filename, []).append(v)
+
+# #     video_results: List[VideoResult] = []
+
+# #     for vj in ordered:
+# #         meta        = meta_by_id[vj.video_id]
+# #         db_filename = os.path.basename(vj.s3_key)
+# #         raw_viols   = violations_by_filename.get(db_filename, [])
+
+# #         violation_results = []
+# #         for v in raw_viols:
+# #             # timestamp_seconds: float seconds from journey start (global)
+# #             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+
+# #             # original_video_timestamp: float seconds within the source video (local)
+# #             local_ts = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# #             violation_results.append(
+# #                 ViolationResult(
+# #                     violation_type           = _event_type_to_violation_type(v.type),
+# #                     severity                 = _severity_for_risk(v.risk_score),
+# #                     confidence               = round(v.confidence * 100, 2),
+# #                     risk_score               = float(v.risk_score),
+# #                     timestamp_seconds        = _fmt_duration(journey_ts),
+# #                     original_video_timestamp = _fmt_duration(local_ts),
+# #                     frame_paths              = [v.frame_path] if v.frame_path else [],
+# #                 )
+# #             )
+
+# #         video_results.append(
+# #             VideoResult(
+# #                 video_id           = vj.video_id,
+# #                 video_name         = db_filename,
+# #                 sequence_no        = vj.sequence_no,
+# #                 duration_seconds   = meta["duration_seconds"],
+# #                 duration_formatted = meta["duration_formatted"],
+# #                 fps                = meta["fps"],
+# #                 size_mb            = meta["size_mb"],
+# #                 original_s3_key    = vj.s3_key,
+# #                 violations         = violation_results,
+# #             )
+# #         )
+
+# #     if failed_video_ids:
+# #         print(
+# #             f"[Analyzer:{job_id}]  Journey analysis complete with "
+# #             f"{len(failed_video_ids)} skipped video(s): {sorted(failed_video_ids)}"
+# #         )
+
+# #     # Build the failed_videos dict (video_id → error message) that
+# #     # journey_runner.py and consumer.py both expect as the third return value.
+# #     # Videos in failed_video_ids were skipped due to a caught per-video
+# #     # exception; the error message is a generic processing failure string
+# #     # because the specific exception was already printed above at skip time.
+# #     failed_videos: Dict[int, str] = {
+# #         vid: "Video processing failed — see worker log for details"
+# #         for vid in failed_video_ids
+# #     }
+
+# #     # ── Fix 6: explicit garbage collection at end of journey ─────────────────
+# #     # By this point every violation's annotated_frame has already been
+# #     # uploaded and cleared (set to None) above, and every per-video pipeline
+# #     # (executor + MediaPipe graphs) has already been explicitly shut down /
+# #     # closed inside GadgetDetectionPipeline.run(). gc.collect() here is a
+# #     # belt-and-suspenders step to promptly reclaim any reference cycles
+# #     # (e.g. exception tracebacks) before the next journey starts.
+# #     n_violations_final = len(shared_vstore._violations)
+# #     _log_resource_snapshot("JOURNEY END (pre-GC)", job_id=job_id,
+# #                             violations=n_violations_final)
+# #     gc.collect()
+# #     _log_resource_snapshot("JOURNEY END (post-GC)", job_id=job_id,
+# #                             violations=n_violations_final)
+
+# #     return video_results, total_wall_seconds, failed_videos
+
+
+# # # ── Private helpers ───────────────────────────────────────────────────────────
+
+# # def _frame_filename(v) -> str:
+# #     """Derive a JPEG filename from a _Violation object (matches _save_frame logic)."""
+# #     distraction   = "_".join(sorted(v.events))
+# #     filename_time = v.time_str.replace(":", "-")
+# #     return f"{distraction}_{filename_time}.jpg"
+
+
+
+
+# # # from __future__ import annotations
+
+# # # import gc
+# # # import logging
+# # # import os
+# # # import threading
+# # # import time
+# # # from typing import Dict, List, Tuple
+
+# # # import cv2
+
+# # # try:
+# # #     import psutil
+# # #     _PSUTIL_AVAILABLE = True
+# # # except ImportError:
+# # #     psutil = None
+# # #     _PSUTIL_AVAILABLE = False
+
+# # # from models import VideoJob, VideoResult, ViolationResult
+# # # from s3_service import upload_frame, upload_frame_from_path
+
+# # # # Import the existing pipeline and store — unchanged
+# # # from main import GadgetDetectionPipeline
+# # # from utils.violation_store import ViolationStore
+
+# # # log = logging.getLogger("analyzer")
+
+# # # # OUTPUTS_ROOT mirrors the constant inside violation_store.py
+# # # OUTPUTS_ROOT = "outputs"
+
+
+# # # # ── Memory / resource diagnostics (Fix 5) ──────────────────────────────────────
+
+# # # _PROCESS = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+
+
+# # # def _rss_gb() -> float:
+# # #     """Current process resident set size, in GB. Returns -1.0 if psutil is unavailable."""
+# # #     if _PROCESS is None:
+# # #         return -1.0
+# # #     try:
+# # #         return _PROCESS.memory_info().rss / (1024 ** 3)
+# # #     except Exception:
+# # #         return -1.0
+
+
+# # # def _log_resource_snapshot(label: str, job_id: str = "", violations: int = -1) -> None:
+# # #     """
+# # #     Emit a single-line resource snapshot. `label` is one of:
+# # #     'VIDEO START', 'VIDEO END', 'JOURNEY START', 'JOURNEY END'.
+# # #     """
+# # #     rss        = _rss_gb()
+# # #     thread_cnt = threading.active_count()
+# # #     rss_str    = f"{rss:.3f}GB" if rss >= 0 else "n/a (psutil unavailable)"
+# # #     viol_str   = f"  VIOLATIONS={violations}" if violations >= 0 else ""
+# # #     print(
+# # #         f"[MEMORY {label}]  job={job_id}  RSS={rss_str}  THREADS={thread_cnt}{viol_str}"
+# # #     )
+
+
+# # # # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# # # def _video_meta(path: str) -> Tuple[float, float, int, float]:
+# # #     """Returns (duration_seconds, fps, total_frames, size_mb)."""
+# # #     cap = cv2.VideoCapture(path)
+# # #     if not cap.isOpened():
+# # #         return 0.0, 25.0, 0, 0.0
+# # #     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # #     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # #     cap.release()
+# # #     duration = total / fps if fps > 0 and total > 0 else 0.0
+# # #     size_mb  = round(os.path.getsize(path) / 1_000_000, 2) if os.path.isfile(path) else 0.0
+# # #     return duration, fps, total, size_mb
+
+
+# # # def _fmt_duration(seconds: float) -> str:
+# # #     """Converts float seconds to 'H:MM:SS' string."""
+# # #     t  = int(seconds)
+# # #     hh = t // 3600
+# # #     mm = (t % 3600) // 60
+# # #     ss = t % 60
+# # #     return f"{hh}:{mm:02d}:{ss:02d}"
+
+
+# # # def _event_type_to_violation_type(event_type: str) -> str:
+# # #     """
+# # #     Map internal event_type strings → CVVRS API ViolationType enum values.
+
+# # #     CVVRS types: PHONE_USAGE | DROWSY | DISTRACTION | EATING |
+# # #                  EYES_CLOSED | POSTURE_ALERT | HAND_TO_EAR | SEAT_ABSENCE
+# # #     """
+# # #     return {
+# # #         "phone_use":       "PHONE_USAGE",
+# # #         "seat_absence":    "SEAT_ABSENCE",
+# # #         "drowsy":          "DROWSY",
+# # #         "sleeping":        "DROWSY",
+# # #         "sleeping_absent": "DROWSY",
+# # #         "distraction":     "DISTRACTION",
+# # #         "eating":          "EATING",
+# # #         "eyes_closed":     "EYES_CLOSED",
+# # #         "posture_alert":   "POSTURE_ALERT",
+# # #         "hand_to_ear":     "HAND_TO_EAR",
+# # #     }.get(event_type.lower(), event_type.upper())
+
+
+# # # def _severity_for_risk(risk_score: float) -> str:
+# # #     """
+# # #     Map risk score → severity string.
+
+# # #     Tiers (aligned with CVVRS severity reference):
+# # #         >= 95  → CRITICAL
+# # #         >= 80  → HIGH
+# # #         >= 50  → MEDIUM
+# # #         <  50  → LOW
+# # #     """
+# # #     if risk_score >= 95:
+# # #         return "CRITICAL"
+# # #     if risk_score >= 80:
+# # #         return "HIGH"
+# # #     if risk_score >= 50:
+# # #         return "MEDIUM"
+# # #     return "LOW"
+
+
+# # # def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
+# # #     """
+# # #     Convert the relative frame path stored by ViolationStore._save_frame()
+# # #     back to an absolute local disk path.
+
+# # #     _save_frame() returns:  "<analysis_id>/frames/<filename>"
+# # #     The actual disk path is: "outputs/<analysis_id>/frames/<filename>"
+# # #     """
+# # #     filename = os.path.basename(relative_path)
+# # #     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+# # # def _hms_to_seconds(hms: str) -> float:
+# # #     """
+# # #     Convert "H:MM:SS" or "HH:MM:SS" to float seconds.
+# # #     Returns 0.0 on any parse error.
+# # #     """
+# # #     try:
+# # #         parts = hms.strip().split(":")
+# # #         if len(parts) == 3:
+# # #             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+# # #         if len(parts) == 2:
+# # #             return int(parts[0]) * 60 + float(parts[1])
+# # #         return float(parts[0])
+# # #     except Exception:
+# # #         return 0.0
+
+
+# # # # ── Main entry point ──────────────────────────────────────────────────────────
+
+# # # def analyze_journey(
+# # #     job_id:      str,
+# # #     journey_id:  int,
+# # #     folder_name: str,                  # e.g. "journeys/1/2026-06-10/JRN-..."
+# # #     video_jobs:  List[VideoJob],
+# # #     tmp_paths:   Dict[int, str],       # video_id → local tmp file path
+# # #     progress_cb  = None,               # optional callable(pct, msg, current_video)
+# # #     rabbit_connection = None,
+# # # ) -> Tuple[List[VideoResult], float]:
+# # #     """
+# # #     Run the full detection pipeline over all videos in a journey.
+
+# # #     Parameters
+# # #     ──────────
+# # #     job_id      : RabbitMQ job ID (used for logging only).
+# # #     journey_id  : Journey ID.
+# # #     folder_name : Journey folder prefix used for S3 frame key construction,
+# # #                   e.g. "journeys/1/2026-06-10/JRN-20260610-1-ABC123".
+# # #     video_jobs  : List of VideoJob objects (will be sorted by sequence_no).
+# # #     tmp_paths   : Mapping of video_id → absolute local temp file path.
+# # #     progress_cb : Optional callable(pct, msg, current_video_idx) for updates.
+
+# # #     Returns
+# # #     ───────
+# # #     (video_results, total_wall_clock_seconds)
+# # #     """
+# # #     # Sort by sequence_no — critical for correct time/frame offset continuity
+# # #     ordered  = sorted(video_jobs, key=lambda v: v.sequence_no)
+# # #     n_videos = len(ordered)
+
+# # #     # One shared ViolationStore for the whole journey.
+# # #     analysis_id   = f"journey_{journey_id}"
+# # #     shared_vstore = ViolationStore(
+# # #         analysis_id     = analysis_id,
+# # #         train_detail_id = journey_id,
+# # #     )
+
+# # #     time_offset  = 0.0
+# # #     frame_offset = 0
+# # #     wall_start   = time.time()
+
+# # #     # Per-video metadata cache (keyed by video_id)
+# # #     meta_by_id: Dict[int, dict] = {}
+
+# # #     # Track which videos were skipped due to a per-video error so we can
+# # #     # still include them in the VideoResult list with zero violations.
+# # #     failed_video_ids: set = set()
+
+# # #     # ── Fix 5: memory/resource snapshot — journey start ──────────────────────
+# # #     _log_resource_snapshot("JOURNEY START", job_id=job_id,
+# # #                             violations=len(shared_vstore._violations))
+
+# # #     # ── Run the AI pipeline over each video ──────────────────────────────────
+# # #     for idx, vj in enumerate(ordered):
+# # #         tmp_path    = tmp_paths[vj.video_id]
+# # #         db_filename = os.path.basename(vj.s3_key)
+
+# # #         duration, fps, total_frames, size_mb = _video_meta(tmp_path)
+
+# # #         meta_by_id[vj.video_id] = {
+# # #             "duration_seconds":   duration,
+# # #             "duration_formatted": _fmt_duration(duration),
+# # #             "fps":                fps,
+# # #             "size_mb":            size_mb,
+# # #             "total_frames":       total_frames,
+# # #         }
+
+# # #         print(
+# # #             f"[Analyzer:{job_id}]  [{idx + 1}/{n_videos}]  "
+# # #             f"video_id={vj.video_id}  seq={vj.sequence_no}  "
+# # #             f"file={db_filename}  "
+# # #             f"time_offset={time_offset:.2f}s  frame_offset={frame_offset}"
+# # #         )
+
+# # #         # ── Fix 5: memory/resource snapshot — before this video ──────────────
+# # #         _log_resource_snapshot("VIDEO START", job_id=job_id,
+# # #                                 violations=len(shared_vstore._violations))
+
+# # #         pipeline = GadgetDetectionPipeline(
+# # #             source           = tmp_path,
+# # #             analysis_id      = analysis_id,
+# # #             train_detail_id  = journey_id,
+# # #             save             = False,
+# # #             display          = False,
+# # #             shared_vstore    = shared_vstore,
+# # #             time_offset      = time_offset,
+# # #             frame_offset     = frame_offset,
+# # #             source_filename  = db_filename,
+# # #         )
+
+# # #         # ── FIX — Issue #2: per-video error isolation ─────────────────────────
+# # #         # Wrap pipeline.run() so a failure for one video is logged and skipped,
+# # #         # allowing the remaining videos in the journey to be processed normally.
+# # #         #
+# # #         # We catch BaseException (not just Exception) because
+# # #         # GadgetDetectionPipeline.run() calls sys.exit(1) when it cannot open
+# # #         # a video file — sys.exit raises SystemExit which is a BaseException
+# # #         # subclass and would otherwise escape an "except Exception" guard.
+# # #         #
+# # #         # KeyboardInterrupt is explicitly re-raised so Ctrl-C still works.
+# # #         # SystemExit is also re-raised so a genuine fatal signal propagates to
+# # #         # the consumer's outer handler (nack + DLQ) instead of being swallowed.
+# # #         try:
+# # #             pipeline.run()
+# # #         except KeyboardInterrupt:
+# # #             raise
+# # #         except SystemExit:
+# # #             raise
+# # #         except BaseException as video_exc:
+# # #             print(
+# # #                 f"[Analyzer:{job_id}]  WARNING — video_id={vj.video_id} "
+# # #                 f"seq={vj.sequence_no} FAILED (skipping): {video_exc!r}"
+# # #             )
+# # #             failed_video_ids.add(vj.video_id)
+# # #             # Fall through: advance offsets and continue with the next video.
+
+# # #         # Drop our reference to the finished pipeline so it (and the
+# # #         # ThreadPoolExecutor/MediaPipe resources it owned, which run() has
+# # #         # already explicitly shut down/closed) can be collected promptly
+# # #         # rather than living until the next loop iteration reassigns it.
+# # #         del pipeline
+
+# # #         # Advance offsets for the next video regardless of success/failure.
+# # #         # Using the metadata we already captured keeps offsets consistent for
+# # #         # subsequent videos even when this one's pipeline run was skipped.
+# # #         time_offset  += duration
+# # #         frame_offset += total_frames
+
+# # #         # ── Fix 5: memory/resource snapshot — after this video ───────────────
+# # #         _log_resource_snapshot("VIDEO END", job_id=job_id,
+# # #                                 violations=len(shared_vstore._violations))
+
+# # #         # Report per-video progress (10%–90% band)
+# # #         if progress_cb:
+# # #             pct = 10 + int(((idx + 1) / n_videos) * 80)
+# # #             try:
+# # #                 progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# # #             except Exception as exc:
+# # #                 print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+
+# # #     total_wall_seconds = time.time() - wall_start
+
+# # #     # ── Dedup + merge ─────────────────────────────────────────────────────────
+# # #     shared_vstore._deduplicate_by_frame()
+# # #     shared_vstore._merge_by_time_window()
+
+# # #     # ── Extract frames + upload to S3 ───────────────────────────────────────
+# # #     #
+# # #     # BUG FIX — Wrong frames in violation evidence
+# # #     # ─────────────────────────────────────────────
+# # #     # The old code called:
+# # #     #   for vj in ordered:
+# # #     #       shared_vstore.extract_violation_frames(tmp_path)
+# # #     #
+# # #     # extract_violation_frames() iterates ALL violations in the shared store
+# # #     # and seeks to v.frame_index (a GLOBAL frame number across all videos).
+# # #     # When called with video_2's path, it seeks to e.g. frame 4500 in video_2
+# # #     # — but frame 4500 is from video_1 (frame_index was global, not local).
+# # #     # Result: every violation gets a frame from the WRONG video.
+# # #     #
+# # #     # Fix: build a per-filename path map, then for each violation use its
+# # #     # source_filename to open the correct video and seek using local_time_str
+# # #     # (seconds within that specific video file) — which is correct regardless
+# # #     # of how many videos precede it in the journey.
+
+# # #     # Map db_filename → local tmp path
+# # #     path_by_filename: Dict[str, str] = {
+# # #         os.path.basename(vj.s3_key): tmp_paths[vj.video_id]
+# # #         for vj in ordered
+# # #     }
+
+# # #     for v in shared_vstore._violations:
+# # #         # ── Case 1: annotated frame already in memory — upload directly ──────
+# # #         if v.annotated_frame is not None:
+# # #             filename = _frame_filename(v)
+# # #             try:
+# # #                 s3_key            = upload_frame(v.annotated_frame, journey_id,
+# # #                                                  filename, folder_name=folder_name)
+# # #                 v.frame_path      = s3_key
+# # #                 v.annotated_frame = None
+# # #             except Exception as exc:
+# # #                 print(f"[Analyzer:{job_id}]  In-memory frame upload failed ({filename}): {exc}")
+# # #             continue
+
+# # #         # ── Case 2: no frame yet — extract from the correct source video ─────
+# # #         if v.frame_path:
+# # #             # Already extracted to disk by a previous extract_violation_frames()
+# # #             # call (e.g. standalone mode). Upload it.
+# # #             local_path = _local_frame_path(shared_vstore, v.frame_path)
+# # #             if os.path.isfile(local_path):
+# # #                 try:
+# # #                     s3_key       = upload_frame_from_path(local_path, journey_id,
+# # #                                                           folder_name=folder_name)
+# # #                     v.frame_path = s3_key
+# # #                 except Exception as exc:
+# # #                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
+# # #             else:
+# # #                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+# # #             continue
+
+# # #         # ── Case 3: no frame at all — seek into the correct source video ─────
+# # #         src_file = getattr(v, "source_filename", "")
+# # #         tmp_path = path_by_filename.get(src_file, "")
+# # #         if not tmp_path or not os.path.isfile(tmp_path):
+# # #             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
+# # #                   f"(source_filename={src_file!r}) — skipping frame extraction")
+# # #             continue
+
+# # #         # Use local_time_str (seconds within this video) to seek correctly.
+# # #         # v.local_time_str is set by record_violation(local_video_time=...) and
+# # #         # stored as an "H:MM:SS" string. Convert back to seconds for cv2 seek.
+# # #         local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # #         cap = cv2.VideoCapture(tmp_path)
+# # #         frame_img = None
+# # #         if cap.isOpened():
+# # #             cap.set(cv2.CAP_PROP_POS_MSEC, local_secs * 1000.0)
+# # #             ret, frame_img = cap.read()
+# # #             if not ret:
+# # #                 # Fallback: try seeking by fraction of duration
+# # #                 fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# # #                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# # #                 local_frame = int(local_secs * fps)
+# # #                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(local_frame, max(0, total - 1)))
+# # #                 ret, frame_img = cap.read()
+# # #         cap.release()
+
+# # #         if frame_img is None:
+# # #             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
+# # #                   f"@ local_time={local_secs:.2f}s — skipping")
+# # #             continue
+
+# # #         filename = _frame_filename(v)
+# # #         try:
+# # #             s3_key       = upload_frame(frame_img, journey_id,
+# # #                                         filename, folder_name=folder_name)
+# # #             v.frame_path = s3_key
+# # #         except Exception as exc:
+# # #             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
+
+# # #     # ── Build VideoResult / ViolationResult objects ───────────────────────────
+# # #     violations_by_filename: Dict[str, list] = {}
+# # #     for v in shared_vstore._violations:
+# # #         violations_by_filename.setdefault(v.source_filename, []).append(v)
+
+# # #     video_results: List[VideoResult] = []
+
+# # #     for vj in ordered:
+# # #         meta        = meta_by_id[vj.video_id]
+# # #         db_filename = os.path.basename(vj.s3_key)
+# # #         raw_viols   = violations_by_filename.get(db_filename, [])
+
+# # #         violation_results = []
+# # #         for v in raw_viols:
+# # #             # timestamp_seconds: float seconds from journey start (global)
+# # #             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+
+# # #             # original_video_timestamp: float seconds within the source video (local)
+# # #             local_ts = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# # #             violation_results.append(
+# # #                 ViolationResult(
+# # #                     violation_type           = _event_type_to_violation_type(v.type),
+# # #                     severity                 = _severity_for_risk(v.risk_score),
+# # #                     confidence               = round(v.confidence * 100, 2),
+# # #                     risk_score               = float(v.risk_score),
+# # #                     timestamp_seconds        = _fmt_duration(journey_ts),
+# # #                     original_video_timestamp = _fmt_duration(local_ts),
+# # #                     frame_paths              = [v.frame_path] if v.frame_path else [],
+# # #                 )
+# # #             )
+
+# # #         video_results.append(
+# # #             VideoResult(
+# # #                 video_id           = vj.video_id,
+# # #                 video_name         = db_filename,
+# # #                 sequence_no        = vj.sequence_no,
+# # #                 duration_seconds   = meta["duration_seconds"],
+# # #                 duration_formatted = meta["duration_formatted"],
+# # #                 fps                = meta["fps"],
+# # #                 size_mb            = meta["size_mb"],
+# # #                 original_s3_key    = vj.s3_key,
+# # #                 violations         = violation_results,
+# # #             )
+# # #         )
+
+# # #     if failed_video_ids:
+# # #         print(
+# # #             f"[Analyzer:{job_id}]  Journey analysis complete with "
+# # #             f"{len(failed_video_ids)} skipped video(s): {sorted(failed_video_ids)}"
+# # #         )
+
+# # #     # ── Fix 6: explicit garbage collection at end of journey ─────────────────
+# # #     # By this point every violation's annotated_frame has already been
+# # #     # uploaded and cleared (set to None) above, and every per-video pipeline
+# # #     # (executor + MediaPipe graphs) has already been explicitly shut down /
+# # #     # closed inside GadgetDetectionPipeline.run(). gc.collect() here is a
+# # #     # belt-and-suspenders step to promptly reclaim any reference cycles
+# # #     # (e.g. exception tracebacks) before the next journey starts.
+# # #     n_violations_final = len(shared_vstore._violations)
+# # #     _log_resource_snapshot("JOURNEY END (pre-GC)", job_id=job_id,
+# # #                             violations=n_violations_final)
+# # #     gc.collect()
+# # #     _log_resource_snapshot("JOURNEY END (post-GC)", job_id=job_id,
+# # #                             violations=n_violations_final)
+
+# # #     return video_results, total_wall_seconds
+
+
+# # # # ── Private helpers ───────────────────────────────────────────────────────────
+
+# # # def _frame_filename(v) -> str:
+# # #     """Derive a JPEG filename from a _Violation object (matches _save_frame logic)."""
+# # #     distraction   = "_".join(sorted(v.events))
+# # #     filename_time = v.time_str.replace(":", "-")
+# # #     return f"{distraction}_{filename_time}.jpg"
+
+
+# # from __future__ import annotations
+
+# # import gc
+# # import logging
+# # import os
+# # import threading
+# # import time
+# # from typing import Dict, List, Tuple
+
+# # import cv2
+
+# # try:
+# #     import psutil
+# #     _PSUTIL_AVAILABLE = True
+# # except ImportError:
+# #     psutil = None
+# #     _PSUTIL_AVAILABLE = False
+
+# # from models import VideoJob, VideoResult, ViolationResult
+# # from s3_service import upload_frame, upload_frame_from_path
+
+# # # Import the existing pipeline and store — unchanged
+# # from main import GadgetDetectionPipeline
+# # from utils.violation_store import ViolationStore
+
+# # log = logging.getLogger("analyzer")
+
+# # # OUTPUTS_ROOT mirrors the constant inside violation_store.py
+# # OUTPUTS_ROOT = "outputs"
+
+
+# # # ── Memory / resource diagnostics (Fix 5) ──────────────────────────────────────
+
+# # _PROCESS = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+
+
+# # def _rss_gb() -> float:
+# #     """Current process resident set size, in GB. Returns -1.0 if psutil is unavailable."""
+# #     if _PROCESS is None:
+# #         return -1.0
+# #     try:
+# #         return _PROCESS.memory_info().rss / (1024 ** 3)
+# #     except Exception:
+# #         return -1.0
+
+
+# # def _log_resource_snapshot(label: str, job_id: str = "", violations: int = -1) -> None:
+# #     """
+# #     Emit a single-line resource snapshot. `label` is one of:
+# #     'VIDEO START', 'VIDEO END', 'JOURNEY START', 'JOURNEY END'.
+# #     """
+# #     rss        = _rss_gb()
+# #     thread_cnt = threading.active_count()
+# #     rss_str    = f"{rss:.3f}GB" if rss >= 0 else "n/a (psutil unavailable)"
+# #     viol_str   = f"  VIOLATIONS={violations}" if violations >= 0 else ""
+# #     print(
+# #         f"[MEMORY {label}]  job={job_id}  RSS={rss_str}  THREADS={thread_cnt}{viol_str}"
+# #     )
+
+
+# # # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# # def _video_meta(path: str) -> Tuple[float, float, int, float]:
+# #     """Returns (duration_seconds, fps, total_frames, size_mb)."""
+# #     cap = cv2.VideoCapture(path)
+# #     if not cap.isOpened():
+# #         return 0.0, 25.0, 0, 0.0
+# #     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# #     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# #     cap.release()
+# #     duration = total / fps if fps > 0 and total > 0 else 0.0
+# #     size_mb  = round(os.path.getsize(path) / 1_000_000, 2) if os.path.isfile(path) else 0.0
+# #     return duration, fps, total, size_mb
+
+
+# # def _fmt_duration(seconds: float) -> str:
+# #     """Converts float seconds to 'H:MM:SS' string."""
+# #     t  = int(seconds)
+# #     hh = t // 3600
+# #     mm = (t % 3600) // 60
+# #     ss = t % 60
+# #     return f"{hh}:{mm:02d}:{ss:02d}"
+
+
+# # def _event_type_to_violation_type(event_type: str) -> str:
+# #     """
+# #     Map internal event_type strings → CVVRS API ViolationType enum values.
+
+# #     CVVRS types: PHONE_USAGE | DROWSY | DISTRACTION | EATING |
+# #                  EYES_CLOSED | POSTURE_ALERT | HAND_TO_EAR | SEAT_ABSENCE
+# #     """
+# #     return {
+# #         "phone_use":       "PHONE_USAGE",
+# #         "seat_absence":    "SEAT_ABSENCE",
+# #         "drowsy":          "DROWSY",
+# #         "sleeping":        "DROWSY",
+# #         "sleeping_absent": "DROWSY",
+# #         "distraction":     "DISTRACTION",
+# #         "eating":          "EATING",
+# #         "eyes_closed":     "EYES_CLOSED",
+# #         "posture_alert":   "POSTURE_ALERT",
+# #         "hand_to_ear":     "HAND_TO_EAR",
+# #     }.get(event_type.lower(), event_type.upper())
+
+
+# # def _severity_for_risk(risk_score: float) -> str:
+# #     """
+# #     Map risk score → severity string.
+
+# #     Tiers (aligned with CVVRS severity reference):
+# #         >= 95  → CRITICAL
+# #         >= 80  → HIGH
+# #         >= 50  → MEDIUM
+# #         <  50  → LOW
+# #     """
+# #     if risk_score >= 95:
+# #         return "CRITICAL"
+# #     if risk_score >= 80:
+# #         return "HIGH"
+# #     if risk_score >= 50:
+# #         return "MEDIUM"
+# #     return "LOW"
+
+
+# # def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
+# #     """
+# #     Convert the relative frame path stored by ViolationStore._save_frame()
+# #     back to an absolute local disk path.
+
+# #     _save_frame() returns:  "<analysis_id>/frames/<filename>"
+# #     The actual disk path is: "outputs/<analysis_id>/frames/<filename>"
+# #     """
+# #     filename = os.path.basename(relative_path)
+# #     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+# # def _hms_to_seconds(hms: str) -> float:
+# #     """
+# #     Convert "H:MM:SS" or "HH:MM:SS" to float seconds.
+# #     Returns 0.0 on any parse error.
+# #     """
+# #     try:
+# #         parts = hms.strip().split(":")
+# #         if len(parts) == 3:
+# #             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+# #         if len(parts) == 2:
+# #             return int(parts[0]) * 60 + float(parts[1])
+# #         return float(parts[0])
+# #     except Exception:
+# #         return 0.0
+
+
+# # # ── Main entry point ──────────────────────────────────────────────────────────
+
+# # def analyze_journey(
+# #     job_id:        str,
+# #     journey_id:    int,
+# #     folder_name:   str,                  # e.g. "journeys/1/2026-06-10/JRN-..."
+# #     video_jobs:    List[VideoJob],
+# #     tmp_paths:     Dict[int, str],       # video_id → local tmp file path
+# #     progress_cb    = None,               # optional callable(pct, msg, current_video)
+# #     video_done_cb  = None,               # optional callable(video_id, ok, error, error_type, stack_trace, reason)
+# # ) -> Tuple[List[VideoResult], float]:
+# #     """
+# #     Run the full detection pipeline over all videos in a journey.
+
+# #     Parameters
+# #     ──────────
+# #     job_id        : RabbitMQ job ID (used for logging only).
+# #     journey_id    : Journey ID.
+# #     folder_name   : Journey folder prefix used for S3 frame key construction,
+# #                     e.g. "journeys/1/2026-06-10/JRN-20260610-1-ABC123".
+# #     video_jobs    : List of VideoJob objects (will be sorted by sequence_no).
+# #     tmp_paths     : Mapping of video_id → absolute local temp file path.
+# #     progress_cb   : Optional callable(pct, msg, current_video_idx) for updates.
+# #     video_done_cb : Optional callable(video_id, ok, error, error_type,
+# #                     stack_trace, reason) fired immediately after each video
+# #                     finishes (success or failure). Used by journey_runner.py
+# #                     to push per-video progress events to the parent process via
+# #                     a multiprocessing.Queue so the parent knows which videos
+# #                     completed before a native crash kills the child.
+
+# #     Returns
+# #     ───────
+# #     (video_results, total_wall_clock_seconds)
+# #     """
+# #     # Sort by sequence_no — critical for correct time/frame offset continuity
+# #     ordered  = sorted(video_jobs, key=lambda v: v.sequence_no)
+# #     n_videos = len(ordered)
+
+# #     # One shared ViolationStore for the whole journey.
+# #     analysis_id   = f"journey_{journey_id}"
+# #     shared_vstore = ViolationStore(
+# #         analysis_id     = analysis_id,
+# #         train_detail_id = journey_id,
+# #     )
+
+# #     time_offset  = 0.0
+# #     frame_offset = 0
+# #     wall_start   = time.time()
+
+# #     # Per-video metadata cache (keyed by video_id)
+# #     meta_by_id: Dict[int, dict] = {}
+
+# #     # Track which videos were skipped due to a per-video error so we can
+# #     # still include them in the VideoResult list with zero violations.
+# #     failed_video_ids: set = set()
+
+# #     # ── Fix 5: memory/resource snapshot — journey start ──────────────────────
+# #     _log_resource_snapshot("JOURNEY START", job_id=job_id,
+# #                             violations=len(shared_vstore._violations))
+
+# #     # ── Run the AI pipeline over each video ──────────────────────────────────
+# #     for idx, vj in enumerate(ordered):
+# #         tmp_path    = tmp_paths[vj.video_id]
+# #         db_filename = os.path.basename(vj.s3_key)
+
+# #         duration, fps, total_frames, size_mb = _video_meta(tmp_path)
+
+# #         meta_by_id[vj.video_id] = {
+# #             "duration_seconds":   duration,
+# #             "duration_formatted": _fmt_duration(duration),
+# #             "fps":                fps,
+# #             "size_mb":            size_mb,
+# #             "total_frames":       total_frames,
+# #         }
+
+# #         print(
+# #             f"[Analyzer:{job_id}]  [{idx + 1}/{n_videos}]  "
+# #             f"video_id={vj.video_id}  seq={vj.sequence_no}  "
+# #             f"file={db_filename}  "
+# #             f"time_offset={time_offset:.2f}s  frame_offset={frame_offset}"
+# #         )
+
+# #         # ── Fix 5: memory/resource snapshot — before this video ──────────────
+# #         _log_resource_snapshot("VIDEO START", job_id=job_id,
+# #                                 violations=len(shared_vstore._violations))
+
+# #         pipeline = GadgetDetectionPipeline(
+# #             source           = tmp_path,
+# #             analysis_id      = analysis_id,
+# #             train_detail_id  = journey_id,
+# #             save             = False,
+# #             display          = False,
+# #             shared_vstore    = shared_vstore,
+# #             time_offset      = time_offset,
+# #             frame_offset     = frame_offset,
+# #             source_filename  = db_filename,
+# #         )
+
+# #         # ── FIX — Issue #2: per-video error isolation ─────────────────────────
+# #         # Wrap pipeline.run() so a failure for one video is logged and skipped,
+# #         # allowing the remaining videos in the journey to be processed normally.
+# #         #
+# #         # We catch BaseException (not just Exception) because
+# #         # GadgetDetectionPipeline.run() calls sys.exit(1) when it cannot open
+# #         # a video file — sys.exit raises SystemExit which is a BaseException
+# #         # subclass and would otherwise escape an "except Exception" guard.
+# #         #
+# #         # KeyboardInterrupt is explicitly re-raised so Ctrl-C still works.
+# #         # SystemExit is also re-raised so a genuine fatal signal propagates to
+# #         # the consumer's outer handler (nack + DLQ) instead of being swallowed.
+# #         #
+# #         # video_done_cb is called after every video — success or failure —
+# #         # so that journey_runner.py's parent process learns which videos
+# #         # completed before a native crash kills the child. It is best-effort:
+# #         # a failure inside the callback is swallowed so it never disrupts the
+# #         # remaining video loop.
+# #         _video_exc_for_cb: BaseException | None = None
+# #         try:
+# #             pipeline.run()
+# #         except KeyboardInterrupt:
+# #             raise
+# #         except SystemExit:
+# #             raise
+# #         except BaseException as video_exc:
+# #             _video_exc_for_cb = video_exc
+# #             print(
+# #                 f"[Analyzer:{job_id}]  WARNING — video_id={vj.video_id} "
+# #                 f"seq={vj.sequence_no} FAILED (skipping): {video_exc!r}"
+# #             )
+# #             failed_video_ids.add(vj.video_id)
+# #             # Fall through: advance offsets and continue with the next video.
+
+# #         # Fire video_done_cb (best-effort) so the parent process can track
+# #         # per-video completion before a native crash terminates the child.
+# #         if video_done_cb is not None:
+# #             try:
+# #                 if _video_exc_for_cb is None:
+# #                     video_done_cb(
+# #                         vj.video_id,
+# #                         True,   # ok
+# #                         None,   # error
+# #                         None,   # error_type
+# #                         None,   # stack_trace
+# #                         None,   # reason
+# #                     )
+# #                 else:
+# #                     import traceback as _tb
+# #                     video_done_cb(
+# #                         vj.video_id,
+# #                         False,                          # ok
+# #                         str(_video_exc_for_cb),         # error
+# #                         "PROCESSING_ERROR",             # error_type
+# #                         _tb.format_exc(),               # stack_trace
+# #                         None,                           # reason
+# #                     )
+# #             except Exception:
+# #                 pass  # never let a callback error kill the analysis loop
+
+# #         # Drop our reference to the finished pipeline so it (and the
+# #         # ThreadPoolExecutor/MediaPipe resources it owned, which run() has
+# #         # already explicitly shut down/closed) can be collected promptly
+# #         # rather than living until the next loop iteration reassigns it.
+# #         del pipeline
+
+# #         # Advance offsets for the next video regardless of success/failure.
+# #         # Using the metadata we already captured keeps offsets consistent for
+# #         # subsequent videos even when this one's pipeline run was skipped.
+# #         time_offset  += duration
+# #         frame_offset += total_frames
+
+# #         # ── Fix 5: memory/resource snapshot — after this video ───────────────
+# #         _log_resource_snapshot("VIDEO END", job_id=job_id,
+# #                                 violations=len(shared_vstore._violations))
+
+# #         # Report per-video progress (10%–90% band)
+# #         if progress_cb:
+# #             pct = 10 + int(((idx + 1) / n_videos) * 80)
+# #             try:
+# #                 progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+# #             except Exception as exc:
+# #                 print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+
+# #     total_wall_seconds = time.time() - wall_start
+
+# #     # ── Dedup + merge ─────────────────────────────────────────────────────────
+# #     shared_vstore._deduplicate_by_frame()
+# #     shared_vstore._merge_by_time_window()
+
+# #     # ── Extract frames + upload to S3 ───────────────────────────────────────
+# #     #
+# #     # BUG FIX — Wrong frames in violation evidence
+# #     # ─────────────────────────────────────────────
+# #     # The old code called:
+# #     #   for vj in ordered:
+# #     #       shared_vstore.extract_violation_frames(tmp_path)
+# #     #
+# #     # extract_violation_frames() iterates ALL violations in the shared store
+# #     # and seeks to v.frame_index (a GLOBAL frame number across all videos).
+# #     # When called with video_2's path, it seeks to e.g. frame 4500 in video_2
+# #     # — but frame 4500 is from video_1 (frame_index was global, not local).
+# #     # Result: every violation gets a frame from the WRONG video.
+# #     #
+# #     # Fix: build a per-filename path map, then for each violation use its
+# #     # source_filename to open the correct video and seek using local_time_str
+# #     # (seconds within that specific video file) — which is correct regardless
+# #     # of how many videos precede it in the journey.
+
+# #     # Map db_filename → local tmp path
+# #     path_by_filename: Dict[str, str] = {
+# #         os.path.basename(vj.s3_key): tmp_paths[vj.video_id]
+# #         for vj in ordered
+# #     }
+
+# #     for v in shared_vstore._violations:
+# #         # ── Case 1: annotated frame already in memory — upload directly ──────
+# #         if v.annotated_frame is not None:
+# #             filename = _frame_filename(v)
+# #             try:
+# #                 s3_key            = upload_frame(v.annotated_frame, journey_id,
+# #                                                  filename, folder_name=folder_name)
+# #                 v.frame_path      = s3_key
+# #                 v.annotated_frame = None
+# #             except Exception as exc:
+# #                 print(f"[Analyzer:{job_id}]  In-memory frame upload failed ({filename}): {exc}")
+# #             continue
+
+# #         # ── Case 2: no frame yet — extract from the correct source video ─────
+# #         if v.frame_path:
+# #             # Already extracted to disk by a previous extract_violation_frames()
+# #             # call (e.g. standalone mode). Upload it.
+# #             local_path = _local_frame_path(shared_vstore, v.frame_path)
+# #             if os.path.isfile(local_path):
+# #                 try:
+# #                     s3_key       = upload_frame_from_path(local_path, journey_id,
+# #                                                           folder_name=folder_name)
+# #                     v.frame_path = s3_key
+# #                 except Exception as exc:
+# #                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
+# #             else:
+# #                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+# #             continue
+
+# #         # ── Case 3: no frame at all — seek into the correct source video ─────
+# #         src_file = getattr(v, "source_filename", "")
+# #         tmp_path = path_by_filename.get(src_file, "")
+# #         if not tmp_path or not os.path.isfile(tmp_path):
+# #             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
+# #                   f"(source_filename={src_file!r}) — skipping frame extraction")
+# #             continue
+
+# #         # Use local_time_str (seconds within this video) to seek correctly.
+# #         # v.local_time_str is set by record_violation(local_video_time=...) and
+# #         # stored as an "H:MM:SS" string. Convert back to seconds for cv2 seek.
+# #         local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# #         cap = cv2.VideoCapture(tmp_path)
+# #         frame_img = None
+# #         if cap.isOpened():
+# #             cap.set(cv2.CAP_PROP_POS_MSEC, local_secs * 1000.0)
+# #             ret, frame_img = cap.read()
+# #             if not ret:
+# #                 # Fallback: try seeking by fraction of duration
+# #                 fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+# #                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+# #                 local_frame = int(local_secs * fps)
+# #                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(local_frame, max(0, total - 1)))
+# #                 ret, frame_img = cap.read()
+# #         cap.release()
+
+# #         if frame_img is None:
+# #             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
+# #                   f"@ local_time={local_secs:.2f}s — skipping")
+# #             continue
+
+# #         filename = _frame_filename(v)
+# #         try:
+# #             s3_key       = upload_frame(frame_img, journey_id,
+# #                                         filename, folder_name=folder_name)
+# #             v.frame_path = s3_key
+# #         except Exception as exc:
+# #             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
+
+# #     # ── Build VideoResult / ViolationResult objects ───────────────────────────
+# #     violations_by_filename: Dict[str, list] = {}
+# #     for v in shared_vstore._violations:
+# #         violations_by_filename.setdefault(v.source_filename, []).append(v)
+
+# #     video_results: List[VideoResult] = []
+
+# #     for vj in ordered:
+# #         meta        = meta_by_id[vj.video_id]
+# #         db_filename = os.path.basename(vj.s3_key)
+# #         raw_viols   = violations_by_filename.get(db_filename, [])
+
+# #         violation_results = []
+# #         for v in raw_viols:
+# #             # timestamp_seconds: float seconds from journey start (global)
+# #             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+
+# #             # original_video_timestamp: float seconds within the source video (local)
+# #             local_ts = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+# #             violation_results.append(
+# #                 ViolationResult(
+# #                     violation_type           = _event_type_to_violation_type(v.type),
+# #                     severity                 = _severity_for_risk(v.risk_score),
+# #                     confidence               = round(v.confidence * 100, 2),
+# #                     risk_score               = float(v.risk_score),
+# #                     timestamp_seconds        = _fmt_duration(journey_ts),
+# #                     original_video_timestamp = _fmt_duration(local_ts),
+# #                     frame_paths              = [v.frame_path] if v.frame_path else [],
+# #                 )
+# #             )
+
+# #         video_results.append(
+# #             VideoResult(
+# #                 video_id           = vj.video_id,
+# #                 video_name         = db_filename,
+# #                 sequence_no        = vj.sequence_no,
+# #                 duration_seconds   = meta["duration_seconds"],
+# #                 duration_formatted = meta["duration_formatted"],
+# #                 fps                = meta["fps"],
+# #                 size_mb            = meta["size_mb"],
+# #                 original_s3_key    = vj.s3_key,
+# #                 violations         = violation_results,
+# #             )
+# #         )
+
+# #     if failed_video_ids:
+# #         print(
+# #             f"[Analyzer:{job_id}]  Journey analysis complete with "
+# #             f"{len(failed_video_ids)} skipped video(s): {sorted(failed_video_ids)}"
+# #         )
+
+# #     # ── Fix 6: explicit garbage collection at end of journey ─────────────────
+# #     # By this point every violation's annotated_frame has already been
+# #     # uploaded and cleared (set to None) above, and every per-video pipeline
+# #     # (executor + MediaPipe graphs) has already been explicitly shut down /
+# #     # closed inside GadgetDetectionPipeline.run(). gc.collect() here is a
+# #     # belt-and-suspenders step to promptly reclaim any reference cycles
+# #     # (e.g. exception tracebacks) before the next journey starts.
+# #     n_violations_final = len(shared_vstore._violations)
+# #     _log_resource_snapshot("JOURNEY END (pre-GC)", job_id=job_id,
+# #                             violations=n_violations_final)
+# #     gc.collect()
+# #     _log_resource_snapshot("JOURNEY END (post-GC)", job_id=job_id,
+# #                             violations=n_violations_final)
+
+# #     return video_results, total_wall_seconds
+
+
+# # # ── Private helpers ───────────────────────────────────────────────────────────
+
+# # def _frame_filename(v) -> str:
+# #     """Derive a JPEG filename from a _Violation object (matches _save_frame logic)."""
+# #     distraction   = "_".join(sorted(v.events))
+# #     filename_time = v.time_str.replace(":", "-")
+# #     return f"{distraction}_{filename_time}.jpg"
+
+
+# from __future__ import annotations
+
+# import gc
+# import logging
+# import os
+# import threading
+# import time
+# from typing import Dict, List, Tuple
+
+# import cv2
+
+# try:
+#     import psutil
+#     _PSUTIL_AVAILABLE = True
+# except ImportError:
+#     psutil = None
+#     _PSUTIL_AVAILABLE = False
+
+# from models import VideoJob, VideoResult, ViolationResult
+# from s3_service import upload_frame, upload_frame_from_path
+
+# # Import the existing pipeline and store — unchanged
+# from main import GadgetDetectionPipeline
+# from utils.violation_store import ViolationStore
+
+# log = logging.getLogger("analyzer")
+
+# # OUTPUTS_ROOT mirrors the constant inside violation_store.py
+# OUTPUTS_ROOT = "outputs"
+
+
+# # ── Memory / resource diagnostics (Fix 5) ──────────────────────────────────────
+
+# _PROCESS = psutil.Process(os.getpid()) if _PSUTIL_AVAILABLE else None
+
+
+# def _rss_gb() -> float:
+#     """Current process resident set size, in GB. Returns -1.0 if psutil is unavailable."""
+#     if _PROCESS is None:
+#         return -1.0
+#     try:
+#         return _PROCESS.memory_info().rss / (1024 ** 3)
+#     except Exception:
+#         return -1.0
+
+
+# def _log_resource_snapshot(label: str, job_id: str = "", violations: int = -1) -> None:
+#     """
+#     Emit a single-line resource snapshot. `label` is one of:
+#     'VIDEO START', 'VIDEO END', 'JOURNEY START', 'JOURNEY END'.
+
+#     Also reports GPU memory state (via resource_manager, imported lazily
+#     so analyzer.py has no hard dependency on it being importable) — this
+#     gives Phase 9 leak-detection visibility into CUDA usage alongside the
+#     existing RSS/thread numbers, without changing what this function
+#     already logs for RSS/threads.
+#     """
+#     rss        = _rss_gb()
+#     thread_cnt = threading.active_count()
+#     rss_str    = f"{rss:.3f}GB" if rss >= 0 else "n/a (psutil unavailable)"
+#     viol_str   = f"  VIOLATIONS={violations}" if violations >= 0 else ""
+
+#     gpu_str = ""
+#     try:
+#         from resource_manager import get_gpu_memory_info
+#         gpu_info = get_gpu_memory_info()
+#         if gpu_info.available:
+#             gpu_str = (
+#                 f"  GPU_reserved={gpu_info.reserved_gb:.3f}GB"
+#                 f"/{gpu_info.total_gb:.3f}GB ({gpu_info.used_fraction*100:.1f}%)"
+#             )
+#     except Exception:
+#         pass
+
+#     print(
+#         f"[MEMORY {label}]  job={job_id}  RSS={rss_str}  THREADS={thread_cnt}"
+#         f"{viol_str}{gpu_str}"
+#     )
+
+
+# # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# def _video_meta(path: str) -> Tuple[float, float, int, float]:
+#     """Returns (duration_seconds, fps, total_frames, size_mb)."""
+#     cap = cv2.VideoCapture(path)
+#     if not cap.isOpened():
+#         return 0.0, 25.0, 0, 0.0
+#     fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+#     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+#     cap.release()
+#     duration = total / fps if fps > 0 and total > 0 else 0.0
+#     size_mb  = round(os.path.getsize(path) / 1_000_000, 2) if os.path.isfile(path) else 0.0
+#     return duration, fps, total, size_mb
+
+
+# def _fmt_duration(seconds: float) -> str:
+#     """Converts float seconds to 'H:MM:SS' string."""
+#     t  = int(seconds)
+#     hh = t // 3600
+#     mm = (t % 3600) // 60
+#     ss = t % 60
+#     return f"{hh}:{mm:02d}:{ss:02d}"
+
+
+# def _event_type_to_violation_type(event_type: str) -> str:
+#     """
+#     Map internal event_type strings → CVVRS API ViolationType enum values.
+
+#     CVVRS types: PHONE_USAGE | DROWSY | DISTRACTION | EATING |
+#                  EYES_CLOSED | POSTURE_ALERT | HAND_TO_EAR | SEAT_ABSENCE
+#     """
+#     return {
+#         "phone_use":       "PHONE_USAGE",
+#         "seat_absence":    "SEAT_ABSENCE",
+#         "drowsy":          "DROWSY",
+#         "sleeping":        "DROWSY",
+#         "sleeping_absent": "DROWSY",
+#         "distraction":     "DISTRACTION",
+#         "eating":          "EATING",
+#         "eyes_closed":     "EYES_CLOSED",
+#         "posture_alert":   "POSTURE_ALERT",
+#         "hand_to_ear":     "HAND_TO_EAR",
+#     }.get(event_type.lower(), event_type.upper())
+
+
+# def _severity_for_risk(risk_score: float) -> str:
+#     """
+#     Map risk score → severity string.
+
+#     Tiers (aligned with CVVRS severity reference):
+#         >= 95  → CRITICAL
+#         >= 80  → HIGH
+#         >= 50  → MEDIUM
+#         <  50  → LOW
+#     """
+#     if risk_score >= 95:
+#         return "CRITICAL"
+#     if risk_score >= 80:
+#         return "HIGH"
+#     if risk_score >= 50:
+#         return "MEDIUM"
+#     return "LOW"
+
+
+# def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
+#     """
+#     Convert the relative frame path stored by ViolationStore._save_frame()
+#     back to an absolute local disk path.
+
+#     _save_frame() returns:  "<analysis_id>/frames/<filename>"
+#     The actual disk path is: "outputs/<analysis_id>/frames/<filename>"
+#     """
+#     filename = os.path.basename(relative_path)
+#     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+# def _hms_to_seconds(hms: str) -> float:
+#     """
+#     Convert "H:MM:SS" or "HH:MM:SS" to float seconds.
+#     Returns 0.0 on any parse error.
+#     """
+#     try:
+#         parts = hms.strip().split(":")
+#         if len(parts) == 3:
+#             return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+#         if len(parts) == 2:
+#             return int(parts[0]) * 60 + float(parts[1])
+#         return float(parts[0])
+#     except Exception:
+#         return 0.0
+
+
+# # ── Main entry point ──────────────────────────────────────────────────────────
+
+# def _build_partial_video_result(job_id: str, vj, db_filename: str, meta: dict,
+#                                   shared_vstore) -> dict | None:
+#     """
+#     Best-effort VideoResult snapshot for ONE video, built immediately after
+#     that video's pipeline.run() succeeds.
+
+#     This exists purely so a crash-recovery completion payload (see
+#     consumer.py's interruption handling — journey interrupted after at
+#     least one video already succeeded) can carry the real violation data
+#     for videos that finished before the interruption, instead of losing
+#     them and reporting them as failed too.
+
+#     NOTE: this snapshot is captured BEFORE the journey-wide dedup/merge
+#     step and BEFORE frame extraction/upload (both only run once, after
+#     every video in the journey has been attempted — see below), so
+#     framePaths will be empty here and violations are not yet deduplicated
+#     against other videos in the journey. A normal, uninterrupted journey
+#     completion never uses this snapshot — it always uses the fully
+#     deduped + frame-uploaded build at the end of this function, unchanged.
+#     This is only ever consumed as a fallback for the interrupted case.
+#     """
+#     try:
+#         raw_viols = [v for v in shared_vstore._violations
+#                      if getattr(v, "source_filename", None) == db_filename]
+#         violations = []
+#         for v in raw_viols:
+#             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+#             local_ts   = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+#             violations.append({
+#                 "violationType":          _event_type_to_violation_type(v.type),
+#                 "severity":               _severity_for_risk(v.risk_score),
+#                 "confidence":             round(v.confidence * 100, 2),
+#                 "riskScore":              float(v.risk_score),
+#                 "timestamp":              journey_ts,
+#                 "originalVideoTimestamp": local_ts,
+#                 "framePaths":             [],
+#             })
+#         return {
+#             "videoId":           vj.video_id,
+#             "videoName":         db_filename,
+#             "sequenceNo":        vj.sequence_no,
+#             "durationSeconds":   meta["duration_seconds"],
+#             "durationFormatted": meta["duration_formatted"],
+#             "fps":               meta["fps"],
+#             "sizeMb":            meta["size_mb"],
+#             "originalS3Key":     vj.s3_key,
+#             "violations":        violations,
+#         }
+#     except Exception as exc:
+#         print(f"[Analyzer:{job_id}]  _build_partial_video_result failed "
+#               f"(non-fatal, crash-recovery snapshot only): {exc}")
+#         return None
+
+
+# def analyze_journey(
+#     job_id:        str,
+#     journey_id:    int,
+#     folder_name:   str,                  # e.g. "journeys/1/2026-06-10/JRN-..."
+#     video_jobs:    List[VideoJob],
+#     tmp_paths:     Dict[int, str],       # video_id → local tmp file path
+#     progress_cb    = None,               # optional callable(pct, msg, current_video)
+#     video_done_cb  = None,               # optional callable(video_id, ok, error, error_type, stack_trace, reason, video_result)
+# ) -> Tuple[List[VideoResult], float, Dict[int, str]]:
+#     """
+#     Run the full detection pipeline over all videos in a journey.
+
+#     Parameters
+#     ──────────
+#     job_id        : RabbitMQ job ID (used for logging only).
+#     journey_id    : Journey ID.
+#     folder_name   : Journey folder prefix used for S3 frame key construction,
+#                     e.g. "journeys/1/2026-06-10/JRN-20260610-1-ABC123".
+#     video_jobs    : List of VideoJob objects (will be sorted by sequence_no).
+#     tmp_paths     : Mapping of video_id → absolute local temp file path.
+#     progress_cb   : Optional callable(pct, msg, current_video_idx) for updates.
+#     video_done_cb : Optional callable(video_id, ok, error, error_type,
+#                     stack_trace, reason) fired immediately after each video
+#                     finishes (success or failure). Used by journey_runner.py
+#                     to push per-video progress events to the parent process via
+#                     a multiprocessing.Queue so the parent knows which videos
+#                     completed before a native crash kills the child.
+
+#     Returns
+#     ───────
+#     (video_results, total_wall_clock_seconds)
+#     """
+#     # Sort by sequence_no — critical for correct time/frame offset continuity
+#     ordered  = sorted(video_jobs, key=lambda v: v.sequence_no)
+#     n_videos = len(ordered)
+
+#     # One shared ViolationStore for the whole journey.
+#     analysis_id   = f"journey_{journey_id}"
+#     shared_vstore = ViolationStore(
+#         analysis_id     = analysis_id,
+#         train_detail_id = journey_id,
+#     )
+
+#     time_offset  = 0.0
+#     frame_offset = 0
+#     wall_start   = time.time()
+
+#     # Per-video metadata cache (keyed by video_id)
+#     meta_by_id: Dict[int, dict] = {}
+
+#     # Track which videos were skipped due to a per-video error so we can
+#     # still include them in the VideoResult list with zero violations.
+#     failed_video_ids: set = set()
+
+#     # ── Fix 5: memory/resource snapshot — journey start ──────────────────────
+#     _log_resource_snapshot("JOURNEY START", job_id=job_id,
+#                             violations=len(shared_vstore._violations))
+
+#     # ── Run the AI pipeline over each video ──────────────────────────────────
+#     for idx, vj in enumerate(ordered):
+#         tmp_path    = tmp_paths[vj.video_id]
+#         db_filename = os.path.basename(vj.s3_key)
+
+#         duration, fps, total_frames, size_mb = _video_meta(tmp_path)
+
+#         meta_by_id[vj.video_id] = {
+#             "duration_seconds":   duration,
+#             "duration_formatted": _fmt_duration(duration),
+#             "fps":                fps,
+#             "size_mb":            size_mb,
+#             "total_frames":       total_frames,
+#         }
+
+#         print(
+#             f"[Analyzer:{job_id}]  [{idx + 1}/{n_videos}]  "
+#             f"video_id={vj.video_id}  seq={vj.sequence_no}  "
+#             f"file={db_filename}  "
+#             f"time_offset={time_offset:.2f}s  frame_offset={frame_offset}"
+#         )
+
+#         # ── Fix 5: memory/resource snapshot — before this video ──────────────
+#         _log_resource_snapshot("VIDEO START", job_id=job_id,
+#                                 violations=len(shared_vstore._violations))
+
+#         # ── Per-video processing time + RAM consumed tracking ────────────────
+#         _video_proc_start   = time.time()
+#         _video_rss_start_gb = _rss_gb()
+
+#         # ── Resource lifecycle (Phase 3): GPU threshold safety check ─────────
+#         # If CUDA memory usage is already at/above the configured threshold
+#         # before this video even starts, attempting inference is very likely
+#         # to OOM anyway. Skip this video safely (mark it failed with a clear
+#         # reason) rather than letting a near-certain CUDA crash take down the
+#         # whole journey/process. is_gpu_over_threshold() is a no-op (returns
+#         # False) when CUDA isn't available, so this never affects CPU-only
+#         # environments.
+#         try:
+#             from resource_manager import is_gpu_over_threshold, gpu_cleanup, CUDA_ABORT_THRESHOLD
+#             if is_gpu_over_threshold():
+#                 print(
+#                     f"[Analyzer:{job_id}]  GPU memory usage at/above "
+#                     f"{CUDA_ABORT_THRESHOLD*100:.0f}% threshold — attempting "
+#                     f"cleanup before video_id={vj.video_id}..."
+#                 )
+#                 gpu_cleanup()
+#                 if is_gpu_over_threshold():
+#                     print(
+#                         f"[Analyzer:{job_id}]  GPU still over threshold after "
+#                         f"cleanup — skipping video_id={vj.video_id} "
+#                         f"seq={vj.sequence_no} to avoid a near-certain CUDA OOM."
+#                     )
+#                     failed_video_ids.add(vj.video_id)
+#                     if video_done_cb is not None:
+#                         try:
+#                             video_done_cb(
+#                                 vj.video_id, False,
+#                                 "Not Processed - Worker Resource Exhaustion",
+#                                 "NOT_PROCESSED", None,
+#                                 "Not Processed - Worker Resource Exhaustion",
+#                             )
+#                         except Exception:
+#                             pass
+#                     time_offset  += duration
+#                     frame_offset += total_frames
+#                     if progress_cb:
+#                         pct = 10 + int(((idx + 1) / n_videos) * 80)
+#                         try:
+#                             progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+#                         except Exception as exc:
+#                             print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+#                     continue
+#         except ImportError:
+#             pass  # resource_manager unavailable — proceed without the check
+
+#         pipeline = GadgetDetectionPipeline(
+#             source           = tmp_path,
+#             analysis_id      = analysis_id,
+#             train_detail_id  = journey_id,
+#             save             = False,
+#             display          = False,
+#             shared_vstore    = shared_vstore,
+#             time_offset      = time_offset,
+#             frame_offset     = frame_offset,
+#             source_filename  = db_filename,
+#         )
+
+#         # ── Per-video error isolation (Scenario 1 & 2) ───────────────────────
+#         #
+#         # Two distinct failure classes require different treatment:
+#         #
+#         # SCENARIO 2 — Video-specific failures (corrupted file, bad codec,
+#         # FFmpeg error, decode error, etc.):
+#         #   • Mark only this video as FAILED.
+#         #   • Fire video_done_cb with ok=False and error_type=PROCESSING_ERROR
+#         #     (or a more specific classifier via classify_video_error).
+#         #   • Continue processing the next video in the loop.
+#         #
+#         # SCENARIO 1 — Worker/memory-level failures (CUDA OOM, OpenCV
+#         # OutOfMemoryError, MemoryError, std::bad_alloc, "Failed to allocate",
+#         # etc.) that Python CAN still raise as exceptions (as opposed to the
+#         # native crash that kills the process outright — that is handled by
+#         # the subprocess isolation in journey_runner.py/consumer.py):
+#         #   • Mark this video as FAILED with error_type=RESOURCE_EXHAUSTION.
+#         #   • Mark EVERY REMAINING video (not yet processed) as NOT_PROCESSED
+#         #     via video_done_cb with reason="Not Processed - Worker Resource
+#         #     Exhaustion", so the parent immediately calls the Failure API for
+#         #     each one — preserving all work done before this point.
+#         #   • Break out of the loop — do NOT attempt any more videos.
+#         #   • Preserved: all VideoResult / violation data for videos 1..idx-1.
+#         #
+#         # We catch BaseException (not just Exception) because pipeline.run()
+#         # calls sys.exit(1) on unreadable files — SystemExit is a BaseException.
+#         # KeyboardInterrupt and SystemExit are re-raised so they propagate
+#         # to the consumer's outer handler (nack + DLQ) instead of being
+#         # treated as per-video errors.
+#         #
+#         # video_done_cb is fired after every video (success OR failure) so the
+#         # parent subprocess monitor always knows which videos finished before a
+#         # native crash kills the child process. It is best-effort: errors inside
+#         # the callback are swallowed so they never disrupt the processing loop.
+#         import traceback as _tb
+#         try:
+#             from callback_client import is_resource_exhaustion_error, classify_video_error
+#             _have_classifier = True
+#         except ImportError:
+#             _have_classifier = False
+
+#         _worker_oom    = False   # True when this video hit a resource-exhaustion error
+#         _video_exc_for_cb: BaseException | None = None
+#         try:
+#             pipeline.run()
+#         except KeyboardInterrupt:
+#             raise
+#         except SystemExit:
+#             raise
+#         except BaseException as video_exc:
+#             _video_exc_for_cb = video_exc
+#             # Classify: is this a worker-level memory failure (Scenario 1) or
+#             # an ordinary video-specific failure (Scenario 2)?
+#             if _have_classifier and is_resource_exhaustion_error(video_exc):
+#                 _worker_oom = True
+#                 error_type_for_cb = "RESOURCE_EXHAUSTION"
+#             elif _have_classifier:
+#                 error_type_for_cb = classify_video_error(video_exc)
+#             else:
+#                 # Fallback classification without callback_client available
+#                 _worker_oom = isinstance(video_exc, MemoryError) or any(
+#                     sig in f"{type(video_exc).__name__}: {video_exc}".lower()
+#                     for sig in ("outofmemoryerror", "out of memory",
+#                                 "failed to allocate", "bad_alloc",
+#                                 "cannot allocate memory", "resource exhaust")
+#                 )
+#                 error_type_for_cb = "RESOURCE_EXHAUSTION" if _worker_oom else "PROCESSING_ERROR"
+
+#             print(
+#                 f"[Analyzer:{job_id}]  {'WORKER OOM' if _worker_oom else 'WARNING'} "
+#                 f"— video_id={vj.video_id} seq={vj.sequence_no} "
+#                 f"{'RESOURCE EXHAUSTION' if _worker_oom else 'FAILED (skipping)'}: "
+#                 f"{video_exc!r}"
+#             )
+#             failed_video_ids.add(vj.video_id)
+
+#         # ── Fire video_done_cb for the video that just finished ───────────────
+#         # Called regardless of success or failure so the parent process always
+#         # has an up-to-date picture of which videos completed before any crash.
+#         if video_done_cb is not None:
+#             try:
+#                 if _video_exc_for_cb is None:
+#                     # Success — also hand back a best-effort result snapshot
+#                     # (see _build_partial_video_result) so the parent can
+#                     # preserve this video's real data if the journey gets
+#                     # interrupted later (crash, OOM, etc.) before the normal
+#                     # end-of-journey build/dedup step runs.
+#                     _partial_result = _build_partial_video_result(
+#                         job_id, vj, db_filename, meta_by_id[vj.video_id],
+#                         shared_vstore,
+#                     )
+#                     video_done_cb(
+#                         vj.video_id,
+#                         True,   # ok
+#                         None,   # error
+#                         None,   # error_type
+#                         None,   # stack_trace
+#                         None,   # reason
+#                         video_result=_partial_result,
+#                     )
+#                 else:
+#                     # Per-video failure OR resource-exhaustion failure
+#                     video_done_cb(
+#                         vj.video_id,
+#                         False,                            # ok
+#                         str(_video_exc_for_cb),           # error
+#                         error_type_for_cb,                # error_type
+#                         _tb.format_exc(),                 # stack_trace
+#                         "Not Processed - Worker Resource Exhaustion"
+#                             if _worker_oom else None,     # reason
+#                     )
+#             except Exception:
+#                 pass  # never let a callback error kill the analysis loop
+
+#         # ── Scenario 1: worker OOM — stop the loop, report remaining as NOT_PROCESSED
+#         if _worker_oom:
+#             # Advance offsets for this video so accounting is consistent before we stop.
+#             time_offset  += duration
+#             frame_offset += total_frames
+#             del pipeline
+
+#             # Report every video that comes AFTER this one as NOT_PROCESSED.
+#             # "After" = sequence_no > current vj's position in the ordered list.
+#             # We iterate from the NEXT video to the end of ordered.
+#             remaining_reason = "Not Processed - Worker Resource Exhaustion"
+#             for remaining_vj in ordered[idx + 1:]:
+#                 remaining_vid = remaining_vj.video_id
+#                 failed_video_ids.add(remaining_vid)
+#                 print(
+#                     f"[Analyzer:{job_id}]  Marking video_id={remaining_vid} "
+#                     f"seq={remaining_vj.sequence_no} as NOT_PROCESSED due to "
+#                     "worker resource exhaustion on a prior video."
+#                 )
+#                 if video_done_cb is not None:
+#                     try:
+#                         video_done_cb(
+#                             remaining_vid,
+#                             False,                    # ok
+#                             "Processing stopped due to worker memory failure",
+#                             "NOT_PROCESSED",          # error_type
+#                             None,                     # stack_trace
+#                             remaining_reason,         # reason
+#                         )
+#                     except Exception:
+#                         pass
+
+#             # Stop processing further videos in this journey.
+#             _log_resource_snapshot("VIDEO END (OOM-STOP)", job_id=job_id,
+#                                     violations=len(shared_vstore._violations))
+
+#             # ── Per-video processing time + RAM consumed summary (OOM path) ──
+#             _video_proc_elapsed  = time.time() - _video_proc_start
+#             _video_rss_end_gb    = _rss_gb()
+#             _video_rss_delta_gb  = (
+#                 _video_rss_end_gb - _video_rss_start_gb
+#                 if (_video_rss_end_gb >= 0 and _video_rss_start_gb >= 0) else -1.0
+#             )
+#             _rss_end_str   = f"{_video_rss_end_gb:.3f}GB" if _video_rss_end_gb >= 0 else "n/a"
+#             _rss_delta_str = f"{_video_rss_delta_gb:+.3f}GB" if _video_rss_delta_gb != -1.0 else "n/a"
+#             print(
+#                 f"[Analyzer:{job_id}]  video_id={vj.video_id}  seq={vj.sequence_no}  "
+#                 f"PROCESSING_TIME={_video_proc_elapsed:.2f}s  "
+#                 f"RAM_USED={_rss_end_str}  RAM_CONSUMED(delta)={_rss_delta_str}  (OOM-STOP)"
+#             )
+#             # Break out of the for-loop so we move straight to dedup/upload/build.
+#             break
+
+#         # Drop our reference to the finished pipeline so it (and the
+#         # ThreadPoolExecutor/MediaPipe resources it owned, which run() has
+#         # already explicitly shut down/closed) can be collected promptly
+#         # rather than living until the next loop iteration reassigns it.
+#         del pipeline
+
+#         # Advance offsets for the next video regardless of success/failure.
+#         # Using the metadata we already captured keeps offsets consistent for
+#         # subsequent videos even when this one's pipeline run was skipped.
+#         time_offset  += duration
+#         frame_offset += total_frames
+
+#         # ── Fix 5: memory/resource snapshot — after this video ───────────────
+#         _log_resource_snapshot("VIDEO END", job_id=job_id,
+#                                 violations=len(shared_vstore._violations))
+
+#         # ── Per-video processing time + RAM consumed summary ─────────────────
+#         _video_proc_elapsed  = time.time() - _video_proc_start
+#         _video_rss_end_gb    = _rss_gb()
+#         _video_rss_delta_gb  = (
+#             _video_rss_end_gb - _video_rss_start_gb
+#             if (_video_rss_end_gb >= 0 and _video_rss_start_gb >= 0) else -1.0
+#         )
+#         _rss_end_str   = f"{_video_rss_end_gb:.3f}GB" if _video_rss_end_gb >= 0 else "n/a"
+#         _rss_delta_str = f"{_video_rss_delta_gb:+.3f}GB" if _video_rss_delta_gb != -1.0 else "n/a"
+#         print(
+#             f"[Analyzer:{job_id}]  video_id={vj.video_id}  seq={vj.sequence_no}  "
+#             f"PROCESSING_TIME={_video_proc_elapsed:.2f}s  "
+#             f"RAM_USED={_rss_end_str}  RAM_CONSUMED(delta)={_rss_delta_str}"
+#         )
+
+#         # Report per-video progress (10%–90% band)
+#         if progress_cb:
+#             pct = 10 + int(((idx + 1) / n_videos) * 80)
+#             try:
+#                 progress_cb(pct, f"Analyzed video {idx + 1} of {n_videos}", idx + 1)
+#             except Exception as exc:
+#                 print(f"[Analyzer:{job_id}]  progress_cb error (non-fatal): {exc}")
+
+#     total_wall_seconds = time.time() - wall_start
+
+#     # ── Dedup + merge ─────────────────────────────────────────────────────────
+#     shared_vstore._deduplicate_by_frame()
+#     shared_vstore._merge_by_time_window()
+
+#     # ── Extract frames + upload to S3 ───────────────────────────────────────
+#     #
+#     # BUG FIX — Wrong frames in violation evidence
+#     # ─────────────────────────────────────────────
+#     # The old code called:
+#     #   for vj in ordered:
+#     #       shared_vstore.extract_violation_frames(tmp_path)
+#     #
+#     # extract_violation_frames() iterates ALL violations in the shared store
+#     # and seeks to v.frame_index (a GLOBAL frame number across all videos).
+#     # When called with video_2's path, it seeks to e.g. frame 4500 in video_2
+#     # — but frame 4500 is from video_1 (frame_index was global, not local).
+#     # Result: every violation gets a frame from the WRONG video.
+#     #
+#     # Fix: build a per-filename path map, then for each violation use its
+#     # source_filename to open the correct video and seek using local_time_str
+#     # (seconds within that specific video file) — which is correct regardless
+#     # of how many videos precede it in the journey.
+
+#     # Map db_filename → local tmp path
+#     path_by_filename: Dict[str, str] = {
+#         os.path.basename(vj.s3_key): tmp_paths[vj.video_id]
+#         for vj in ordered
+#     }
+
+#     for v in shared_vstore._violations:
+#         # ── Case 1: annotated frame already in memory — upload directly ──────
+#         if v.annotated_frame is not None:
+#             filename = _frame_filename(v)
+#             try:
+#                 s3_key            = upload_frame(v.annotated_frame, journey_id,
+#                                                  filename, folder_name=folder_name)
+#                 v.frame_path      = s3_key
+#                 v.annotated_frame = None
+#             except Exception as exc:
+#                 print(f"[Analyzer:{job_id}]  In-memory frame upload failed ({filename}): {exc}")
+#             continue
+
+#         # ── Case 2: no frame yet — extract from the correct source video ─────
+#         if v.frame_path:
+#             # Already extracted to disk by a previous extract_violation_frames()
+#             # call (e.g. standalone mode). Upload it.
+#             local_path = _local_frame_path(shared_vstore, v.frame_path)
+#             if os.path.isfile(local_path):
+#                 try:
+#                     s3_key       = upload_frame_from_path(local_path, journey_id,
+#                                                           folder_name=folder_name)
+#                     v.frame_path = s3_key
+#                 except Exception as exc:
+#                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
+#             else:
+#                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+#             continue
+
+#         # ── Case 3: no frame at all — seek into the correct source video ─────
+#         src_file = getattr(v, "source_filename", "")
+#         tmp_path = path_by_filename.get(src_file, "")
+#         if not tmp_path or not os.path.isfile(tmp_path):
+#             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
+#                   f"(source_filename={src_file!r}) — skipping frame extraction")
+#             continue
+
+#         # Use local_time_str (seconds within this video) to seek correctly.
+#         # v.local_time_str is set by record_violation(local_video_time=...) and
+#         # stored as an "H:MM:SS" string. Convert back to seconds for cv2 seek.
+#         local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+#         cap = cv2.VideoCapture(tmp_path)
+#         frame_img = None
+#         if cap.isOpened():
+#             cap.set(cv2.CAP_PROP_POS_MSEC, local_secs * 1000.0)
+#             ret, frame_img = cap.read()
+#             if not ret:
+#                 # Fallback: try seeking by fraction of duration
+#                 fps   = cap.get(cv2.CAP_PROP_FPS) or 25.0
+#                 total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+#                 local_frame = int(local_secs * fps)
+#                 cap.set(cv2.CAP_PROP_POS_FRAMES, min(local_frame, max(0, total - 1)))
+#                 ret, frame_img = cap.read()
+#         cap.release()
+
+#         if frame_img is None:
+#             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
+#                   f"@ local_time={local_secs:.2f}s — skipping")
+#             continue
+
+#         filename = _frame_filename(v)
+#         try:
+#             s3_key       = upload_frame(frame_img, journey_id,
+#                                         filename, folder_name=folder_name)
+#             v.frame_path = s3_key
+#         except Exception as exc:
+#             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
+
+#     # ── Build VideoResult / ViolationResult objects ───────────────────────────
+#     violations_by_filename: Dict[str, list] = {}
+#     for v in shared_vstore._violations:
+#         violations_by_filename.setdefault(v.source_filename, []).append(v)
+
+#     video_results: List[VideoResult] = []
+
+#     for vj in ordered:
+#         meta        = meta_by_id[vj.video_id]
+#         db_filename = os.path.basename(vj.s3_key)
+#         raw_viols   = violations_by_filename.get(db_filename, [])
+
+#         violation_results = []
+#         for v in raw_viols:
+#             # timestamp_seconds: float seconds from journey start (global)
+#             journey_ts = float(v.timestamp) if hasattr(v, "timestamp") else 0.0
+
+#             # original_video_timestamp: float seconds within the source video (local)
+#             local_ts = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+#             violation_results.append(
+#                 ViolationResult(
+#                     violation_type           = _event_type_to_violation_type(v.type),
+#                     severity                 = _severity_for_risk(v.risk_score),
+#                     confidence               = round(v.confidence * 100, 2),
+#                     risk_score               = float(v.risk_score),
+#                     timestamp_seconds        = _fmt_duration(journey_ts),
+#                     original_video_timestamp = _fmt_duration(local_ts),
+#                     duration_seconds         = float(getattr(v, "duration", 0.0)),
+#                     trigger_duration_seconds = getattr(v, "true_duration", None),
+#                     frame_paths              = [v.frame_path] if v.frame_path else [],
+
+#                 )
+#             )
+
+#         video_results.append(
+#             VideoResult(
+#                 video_id           = vj.video_id,
+#                 video_name         = db_filename,
+#                 sequence_no        = vj.sequence_no,
+#                 duration_seconds   = meta["duration_seconds"],
+#                 duration_formatted = meta["duration_formatted"],
+#                 fps                = meta["fps"],
+#                 size_mb            = meta["size_mb"],
+#                 original_s3_key    = vj.s3_key,
+#                 violations         = violation_results,
+#             )
+#         )
+
+#     if failed_video_ids:
+#         print(
+#             f"[Analyzer:{job_id}]  Journey analysis complete with "
+#             f"{len(failed_video_ids)} skipped video(s): {sorted(failed_video_ids)}"
+#         )
+
+#     # Build the failed_videos dict (video_id → error message) that
+#     # journey_runner.py and consumer.py both expect as the third return value.
+#     #
+#     # failed_video_ids is the union of:
+#     #   • Per-video failures (Scenario 2): exceptions isolated to one video;
+#     #     the specific exception was already printed above at skip time.
+#     #   • NOT_PROCESSED videos (Scenario 1): videos AFTER a worker-level OOM
+#     #     that were never reached; their video_done_cb already fired with
+#     #     error_type="NOT_PROCESSED" so the Failure API was called immediately.
+#     #     We still record them here so the caller has a complete picture.
+#     #
+#     # Use a specific message for NOT_PROCESSED videos (no meta_by_id entry
+#     # means the video loop never reached _video_meta for them — they are
+#     # definitely post-OOM unstarted videos, not per-video failures).
+#     failed_videos: Dict[int, str] = {}
+#     for vid in failed_video_ids:
+#         if vid not in meta_by_id:
+#             # Never reached — stopped by worker memory failure on a prior video.
+#             failed_videos[vid] = "Processing stopped due to worker memory failure"
+#         else:
+#             # Per-video failure (Scenario 2) or OOM video itself (Scenario 1).
+#             failed_videos[vid] = "Video processing failed — see worker log for details"
+
+#     # ── Fix 6: explicit garbage collection at end of journey ─────────────────
+#     # By this point every violation's annotated_frame has already been
+#     # uploaded and cleared (set to None) above, and every per-video pipeline
+#     # (executor + MediaPipe graphs) has already been explicitly shut down /
+#     # closed inside GadgetDetectionPipeline.run(). gc.collect() here is a
+#     # belt-and-suspenders step to promptly reclaim any reference cycles
+#     # (e.g. exception tracebacks) before the next journey starts.
+#     n_violations_final = len(shared_vstore._violations)
+#     _log_resource_snapshot("JOURNEY END (pre-GC)", job_id=job_id,
+#                             violations=n_violations_final)
+#     gc.collect()
+#     _log_resource_snapshot("JOURNEY END (post-GC)", job_id=job_id,
+#                             violations=n_violations_final)
+
+#     return video_results, total_wall_seconds, failed_videos
+
+
+# # ── Private helpers ───────────────────────────────────────────────────────────
+
+# def _frame_filename(v) -> str:
+#     """
+#     Derive a JPEG filename from a _Violation object (matches _save_frame logic).
+
+#     FIX — Wrong/stale frame evidence (filename collision):
+#     Includes v.frame_index (already unique per violation — it's part of
+#     record_violation()'s dedup key) so two different violations that
+#     happen to share the same event type and the same whole-second global
+#     timestamp can never produce the same filename/S3 key and silently
+#     overwrite each other's evidence image.
+#     """
+#     distraction   = "_".join(sorted(v.events))
+#     filename_time = v.time_str.replace(":", "-")
+#     return f"{distraction}_{filename_time}_{v.frame_index}.jpg"
+
+
+
 # # # # from __future__ import annotations
 
 # # # # import gc
@@ -6506,7 +13100,15 @@ def analyze_journey(
                     risk_score               = float(v.risk_score),
                     timestamp_seconds        = _fmt_duration(journey_ts),
                     original_video_timestamp = _fmt_duration(local_ts),
+                    duration_seconds         = float(getattr(v, "duration", 0.0)),
+                    trigger_duration_seconds = (
+                        getattr(v, "true_duration", None) * 2
+                        if getattr(v, "true_duration", None) is not None
+                        and _event_type_to_violation_type(v.type) == "SEAT_ABSENCE"
+                        else getattr(v, "true_duration", None)
+                    ),
                     frame_paths              = [v.frame_path] if v.frame_path else [],
+
                 )
             )
 
