@@ -2765,8 +2765,6 @@ class VideoResult:
 
             "durationFormatted": self.duration_formatted,
 
-            "fps":               round(self.fps, 3),
-
             "sizeMb":            round(self.size_mb, 2),
 
             "originalS3Key":     self.original_s3_key,
