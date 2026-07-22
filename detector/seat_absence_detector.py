@@ -835,28 +835,32 @@ class _AbsenceTimer:
 
 class SeatAbsenceDetector:
     """
-    Tracks each pilot using their bounding box.
-    Each pilot has a fixed yellow seat zone (their natural half of frame).
+    Tracks CABIN occupancy, not per-pilot seat-zone occupancy.
 
-    DISTRACTION RULE:
-    ─────────────────
-    Pilot 2 (upper zone person) → alert if their box centre
-    drops BELOW split_y into the loco pilot zone.
+    CHANGED BEHAVIOUR (per requirement):
+    ─────────────────────────────────────
+    Seat absence must fire ONLY when NEITHER pilot is detected anywhere
+    in frame. If at least one pilot is detected — even if they've moved
+    into the other pilot's zone (e.g. swapped seats) — this is NOT an
+    absence event for anyone.
 
-    Pilot 1 (lower zone person) → alert if their box centre
-    is no longer in the lower zone (consistent with Pilot 2 logic).
+    Previously this class checked each pilot_id against a fixed half-frame
+    zone, so a pilot who physically moved to the other seat (still
+    detected, just relabelled/relocated) was flagged "away from seat"
+    even though a person was clearly still present in the cabin. That
+    per-zone check has been removed from the absence decision. The zones
+    are still computed/returned purely for the seat-zone overlay drawing
+    in main.py — they no longer drive the absent/not-absent decision.
 
-    FIXES APPLIED:
-    ──────────────
-    FIX (Bug #3 — seat check): Pilot 1 check now uses bbox CENTRE y
-    instead of y2. The old y2 check meant a pilot who stood up but
-    whose feet/legs were still partially in frame (bbox bottom still
-    touching the lower zone) was incorrectly marked "in seat".
+    A single shared ("cabin") timer replaces the old per-pilot timers:
+    it starts only when BOTH pilot_id 1 and pilot_id 2 have no bbox at
+    all, and resets the moment either one is detected again.
 
-    FIX (Bug #4 — miss threshold): Replaced frame-count-based grace
-    period (15 frames, effectively ~7.2s) with a video-time-based
-    grace period (ABSENCE_GRACE_SECONDS = 0.5s) so behaviour is
-    correct regardless of frame-skip settings.
+    FIXES APPLIED (retained from before):
+    ──────────────────────────────────────
+    FIX (Bug #4 — miss threshold): video-time-based grace period
+    (ABSENCE_GRACE_SECONDS = 0.5s) instead of a frame-count threshold,
+    so behaviour is correct regardless of frame-skip settings.
 
     FIX (Video time): All timers use video_time instead of
     time.monotonic() so a 43-min video processed faster than real
@@ -864,10 +868,9 @@ class SeatAbsenceDetector:
     """
 
     def __init__(self) -> None:
-        self._timers: Dict[int, _AbsenceTimer] = {
-            1: _AbsenceTimer(1),
-            2: _AbsenceTimer(2),
-        }
+        # Single shared timer for whole-cabin absence (pilot_id=0 is a
+        # placeholder id, not tied to either real pilot).
+        self._cabin_timer = _AbsenceTimer(0)
 
     # ──────────────────────────────────────────────────────────────
     # RESOURCE CLEANUP
@@ -885,8 +888,7 @@ class SeatAbsenceDetector:
         multiple times.
         """
         # Reset timer state so no references to old video-time values linger.
-        for timer in self._timers.values():
-            timer.reset()
+        self._cabin_timer.reset()
 
     # ──────────────────────────────────────────────────────────────
     # PUBLIC — call once per detector frame
@@ -909,7 +911,8 @@ class SeatAbsenceDetector:
         for pid, bbox in pilot_boxes:
             bbox_by_pid[pid] = bbox
 
-        # Fixed yellow seat zones — upper half for P2, lower half for P1
+        # Fixed yellow seat zones — kept only for the overlay drawing in
+        # main.py (draw_seat_zone). No longer used to decide absence.
         seat_zones: Dict[int, Tuple[int, int, int, int]] = {
             2: (0, 0,        frame_width, split_y),
             1: (0, split_y,  frame_width, frame_height),
@@ -919,104 +922,57 @@ class SeatAbsenceDetector:
         log_events:      List[Tuple[int, str]]             = []
         # NEW — additive: (pilot_id, start_vtime, end_vtime, true_duration)
         # for every absence episode that gets confirmed (logged) and then
-        # actually ends (pilot returns to seat) within this video. Does
-        # not change any existing return value or behaviour above.
+        # actually ends (someone is detected again) within this video.
         completed_events: List[Tuple[int, float, float, float]] = []
 
-        for pid in [1, 2]:
-            timer     = self._timers[pid]
-            seat_zone = seat_zones[pid]
-            bbox      = bbox_by_pid.get(pid)
+        timer = self._cabin_timer
 
-            in_seat = self._pilot_in_seat(bbox, pid, split_y)
+        # CHANGED: absence is decided at the CABIN level, not per pilot_id.
+        # "Someone present" = at least one of pilot 1 / pilot 2 has a bbox,
+        # regardless of which zone that bbox falls in.
+        cabin_occupied = bbox_by_pid[1] is not None or bbox_by_pid[2] is not None
 
-            if in_seat:
-                # NEW — only treat this as a genuine return once the pilot
-                # has been continuously in-seat for RETURN_GRACE_SECONDS.
-                # A single flickery in_seat frame no longer instantly
-                # truncates true_duration — it just doesn't reset anything
-                # until confirmed by note_in_seat().
-                returned = timer.note_in_seat(video_time)
-                if returned:
-                    closed = timer.close_if_confirmed(video_time)
-                    if closed is not None:
-                        start_v, end_v, true_dur = closed
-                        completed_events.append((pid, start_v, end_v, true_dur))
-                    results.append(AbsenceResult(
-                        pilot_id      = pid,
-                        absent        = False,
-                        timer_value   = 0.0,
-                        calibrated    = True,
-                        seat_zone     = seat_zone,
-                        tracking_bbox = bbox,
-                    ))
-                else:
-                    # Still inside the return-debounce window: keep
-                    # reporting the ongoing absence unchanged rather than
-                    # prematurely clearing it.
-                    elapsed = timer.elapsed(video_time)
-                    absent  = timer.start_vtime is not None and elapsed >= ABSENCE_ALLOWED_DURATION
-                    results.append(AbsenceResult(
-                        pilot_id      = pid,
-                        absent        = absent,
-                        timer_value   = elapsed,
-                        calibrated    = True,
-                        seat_zone     = seat_zone,
-                        tracking_bbox = bbox,
-                    ))
+        if cabin_occupied:
+            # NEW — only treat this as a genuine return once someone has
+            # been continuously detected for RETURN_GRACE_SECONDS. A single
+            # flickery detected frame no longer instantly truncates
+            # true_duration — it just doesn't reset anything until
+            # confirmed by note_in_seat().
+            returned = timer.note_in_seat(video_time)
+            if returned:
+                closed = timer.close_if_confirmed(video_time)
+                if closed is not None:
+                    start_v, end_v, true_dur = closed
+                    completed_events.append((0, start_v, end_v, true_dur))
+                absent  = False
+                elapsed = 0.0
             else:
-                timer.note_absent()
-                timer.activate(video_time)
+                # Still inside the return-debounce window: keep reporting
+                # the ongoing absence unchanged rather than prematurely
+                # clearing it.
                 elapsed = timer.elapsed(video_time)
-                absent  = elapsed >= ABSENCE_ALLOWED_DURATION
+                absent  = timer.start_vtime is not None and elapsed >= ABSENCE_ALLOWED_DURATION
+        else:
+            timer.note_absent()
+            timer.activate(video_time)
+            elapsed = timer.elapsed(video_time)
+            absent  = elapsed >= ABSENCE_ALLOWED_DURATION
 
-                if absent and timer.should_log(video_time):
-                    log_events.append((pid, "Pilot Away From Seat"))
-                    timer.mark_logged(video_time)
+            if absent and timer.should_log(video_time):
+                log_events.append((0, "Both Pilots Away From Seat"))
+                timer.mark_logged(video_time)
 
-                results.append(AbsenceResult(
-                    pilot_id      = pid,
-                    absent        = absent,
-                    timer_value   = elapsed,
-                    calibrated    = True,
-                    seat_zone     = seat_zone,
-                    tracking_bbox = bbox,
-                ))
+        # Report the same cabin-level absent/timer_value for both pilot
+        # slots so existing per-pilot consumers (drawing, droop-combo
+        # logic in main.py) keep working unchanged.
+        for pid in [1, 2]:
+            results.append(AbsenceResult(
+                pilot_id      = pid,
+                absent        = absent,
+                timer_value   = elapsed,
+                calibrated    = True,
+                seat_zone     = seat_zones[pid],
+                tracking_bbox = bbox_by_pid.get(pid),
+            ))
 
         return results, log_events, completed_events
-
-    # ──────────────────────────────────────────────────────────────
-    # SEAT CHECK
-    # ──────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _pilot_in_seat(
-        bbox:    Optional[Tuple[int, int, int, int]],
-        pid:     int,
-        split_y: int,
-    ) -> bool:
-        """
-        Pilot 2 (upper zone):
-            IN SEAT  → box centre is ABOVE split_y
-            ABSENT   → box centre is BELOW split_y OR no detection
-
-        Pilot 1 (lower zone):
-            IN SEAT  → box CENTRE is in the lower zone (>= split_y)
-            ABSENT   → box centre is above split_y OR no detection
-
-        FIX (Bug #3): Previously Pilot 1 used `y2 >= split_y` which
-        allowed a standing pilot whose feet were still visible to be
-        counted as seated. Now uses the bbox centre, consistent with
-        the Pilot 2 logic.
-        """
-        if bbox is None:
-            return False
-
-        x1, y1, x2, y2 = bbox
-        cy = (y1 + y2) / 2  # use centre for both pilots — consistent & robust
-
-        if pid == 2:
-            return cy < split_y
-        else:
-            # FIX: was `y2 >= split_y`; now uses centre
-            return cy >= split_y

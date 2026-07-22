@@ -3599,12 +3599,45 @@ class GadgetDetector:
         for pid, pbox in pilot_boxes:
             bbox_by_pid[pid] = pbox
 
-        # ── Update bbox cache (survives YOLO skip frames) ─────────────────────
+        # ── Update bbox cache (survives YOLO skip frames — TIME-GATED) ────────
+        # FIX (seat-absence blocked forever): this cache previously had no
+        # expiry at all. Once a pilot was seen ONCE, self._last_known_bbox[pid]
+        # was reused for every subsequent frame for the rest of the video,
+        # so bbox_by_pid[pid] was never None again — even after the pilot
+        # had genuinely left for minutes. main.py builds
+        # self._absence_pilot_boxes straight from this detector's results,
+        # so SeatAbsenceDetector always saw the cabin as "occupied" and
+        # never fired, no matter how long both seats were actually empty.
+        # It also made the _PERSON_MISS_TOLERANCE_S check inside
+        # _validate_and_assign_gadgets unreachable dead code, since
+        # bbox_by_pid[pid] was already filled in by the time that method
+        # ran.
+        #
+        # Fix: only reuse the cached bbox while we're within
+        # _PERSON_MISS_TOLERANCE_S of the pilot's last LIVE sighting
+        # (timer.last_person_seen_vtime, updated ONLY on live detections
+        # below — never on a cache-filled frame, so re-using the cache
+        # can't keep resetting its own clock). Once that tolerance is
+        # exceeded, the cache is dropped and bbox_by_pid[pid] stays None,
+        # correctly propagating "no person" downstream.
         for pid in [1, 2]:
+            timer = self.timers[pid]
             if bbox_by_pid[pid] is not None:
                 self._last_known_bbox[pid] = bbox_by_pid[pid]
-            elif self._last_known_bbox[pid] is not None:
-                bbox_by_pid[pid] = self._last_known_bbox[pid]
+                timer.last_person_seen_vtime = video_time
+            else:
+                last_seen = timer.last_person_seen_vtime
+                within_tolerance = (
+                    self._last_known_bbox[pid] is not None
+                    and last_seen is not None
+                    and (video_time - last_seen) <= self._PERSON_MISS_TOLERANCE_S
+                )
+                if within_tolerance:
+                    bbox_by_pid[pid] = self._last_known_bbox[pid]
+                else:
+                    # Tolerance expired (or pilot never seen this session) —
+                    # pilot is genuinely gone; stop resurrecting the cache.
+                    self._last_known_bbox[pid] = None
 
         # ── Assign validated gadget hits to pilots ────────────────────────────
         gadgets_by_pilot = self._validate_and_assign_gadgets(
@@ -3631,8 +3664,10 @@ class GadgetDetector:
             matched = gadgets_by_pilot.get(pid, [])
             timer   = self.timers[pid]
 
-            if pbox is not None:
-                timer.last_person_seen_vtime = video_time
+            # NOTE: timer.last_person_seen_vtime is now set exclusively in
+            # the bbox-cache block above, and only on a LIVE detection —
+            # not here — so a cache-filled pbox can't keep re-stamping its
+            # own expiry clock (see FIX comment above).
 
             if matched:
                 self._phone_frame_counter[pid] += 1
