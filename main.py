@@ -410,7 +410,6 @@ class GadgetDetectionPipeline:
         pose_landmarks_by_pilot = self._get_pose_landmarks(frame) if run_gadget else None
 
         future_gadget  = self.executor.submit(self.detector.process, frame, round(global_time, 3), pose_landmarks_by_pilot) if run_gadget  else None
-        future_absence = self.executor.submit(self.absence_detector.process, self._absence_pilot_boxes, global_time, frame.shape[1], frame.shape[0]) if run_absence else None
         future_droop   = self.executor.submit(self.droop_detector.process, frame, global_time, prev_frame_detection) if run_droop else None
 
         results,         log_events,         gadget_completed  = [], [], []
@@ -421,14 +420,6 @@ class GadgetDetectionPipeline:
             if future_gadget  is not None: results,         log_events,         gadget_completed  = future_gadget.result()
         except Exception as exc:
             self.logger.error(f"Gadget error frame {global_frame}: {exc}", exc_info=True)
-        try:
-            if future_absence is not None: absence_results, absence_log_events, absence_completed = future_absence.result()
-        except Exception as exc:
-            self.logger.error(f"Absence error frame {global_frame}: {exc}", exc_info=True)
-        try:
-            if future_droop   is not None: droop_results,   droop_log_events,   droop_completed   = future_droop.result()
-        except Exception as exc:
-            self.logger.error(f"Droop error frame {global_frame}: {exc}", exc_info=True)
 
         if run_gadget:
             new_boxes = [(r.pilot_id, r.bbox) for r in results]
@@ -441,6 +432,39 @@ class GadgetDetectionPipeline:
                 self._yolo_empty_run_count += 1
                 if self._yolo_empty_run_count >= 3:
                     self._absence_pilot_boxes = []
+
+        # FIX (false seat-absence at video start): absence used to be
+        # submitted to the executor ALONGSIDE future_gadget, using
+        # self._absence_pilot_boxes from BEFORE this frame's gadget result
+        # was folded back in — i.e. always one detector-cycle stale. That's
+        # normally a harmless ~1.2s lag, but self._absence_pilot_boxes
+        # starts as [] in __init__ and a fresh pipeline/detector set is
+        # created per video, so on the first tick (or two) of EVERY video
+        # the absence detector saw an "empty cabin" even when both pilots
+        # were sitting right there on THAT SAME frame — just because the
+        # real detection hadn't been written back yet. With
+        # ABSENCE_GRACE_SECONDS + ABSENCE_ALLOWED_DURATION that startup lag
+        # was enough to build a false multi-second "absence" before real
+        # detections caught up and cleared it.
+        #
+        # Fix: run absence AFTER self._absence_pilot_boxes has been updated
+        # from THIS frame's gadget result, so it always sees current data.
+        # SeatAbsenceDetector.process() is a lightweight pure-Python state
+        # machine (no model inference), so calling it synchronously here
+        # instead of via the executor costs negligible time.
+        if run_absence:
+            try:
+                absence_results, absence_log_events, absence_completed = self.absence_detector.process(
+                    self._absence_pilot_boxes, global_time, frame.shape[1], frame.shape[0]
+                )
+            except Exception as exc:
+                self.logger.error(f"Absence error frame {global_frame}: {exc}", exc_info=True)
+
+        try:
+            if future_droop   is not None: droop_results,   droop_log_events,   droop_completed   = future_droop.result()
+        except Exception as exc:
+            self.logger.error(f"Droop error frame {global_frame}: {exc}", exc_info=True)
+
 
         # ── Draw (only when DRAW=True) ────────────────────────────────────────
         if DRAW:

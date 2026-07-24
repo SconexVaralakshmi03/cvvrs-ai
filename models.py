@@ -211,8 +211,8 @@
 # # #     RabbitMQ message consumed from the 'analysis.jobs' queue.
 
 # # #     Queue    : analysis.jobs
-# # #     Exchange : analysis.exchange
-# # #     Routing  : analysis.job.created
+# # #     Exchange : dev.analysis.exchange
+# # #     Routing  : dev.analysis.jobs.created
 
 # # #     Example JSON
 # # #     ────────────
@@ -428,9 +428,9 @@
  
 # #     Queue    : analysis.jobs
 
-# #     Exchange : analysis.exchange
+# #     Exchange : dev.analysis.exchange
 
-# #     Routing  : analysis.job.created
+# #     Routing  : dev.analysis.jobs.created
  
 # #     Example JSON
 
@@ -908,8 +908,8 @@
 # #     RabbitMQ message consumed from the 'analysis.jobs' queue.
 
 # #     Queue    : analysis.jobs
-# #     Exchange : analysis.exchange
-# #     Routing  : analysis.job.created
+# #     Exchange : dev.analysis.exchange
+# #     Routing  : dev.analysis.jobs.created
 
 # #     Example JSON
 # #     ────────────
@@ -1136,9 +1136,9 @@
  
 #     Queue    : analysis.jobs
 
-#     Exchange : analysis.exchange
+#     Exchange : dev.analysis.exchange
 
-#     Routing  : analysis.job.created
+#     Routing  : dev.analysis.jobs.created
  
 #     Example JSON
 
@@ -1615,8 +1615,8 @@
 # #     RabbitMQ message consumed from the 'analysis.jobs' queue.
 
 # #     Queue    : analysis.jobs
-# #     Exchange : analysis.exchange
-# #     Routing  : analysis.job.created
+# #     Exchange : dev.analysis.exchange
+# #     Routing  : dev.analysis.jobs.created
 
 # #     Example JSON
 # #     ────────────
@@ -1832,9 +1832,9 @@
  
 #     Queue    : analysis.jobs
 
-#     Exchange : analysis.exchange
+#     Exchange : dev.analysis.exchange
 
-#     Routing  : analysis.job.created
+#     Routing  : dev.analysis.jobs.created
  
 #     Example JSON
 
@@ -2312,8 +2312,8 @@
 #     RabbitMQ message consumed from the 'analysis.jobs' queue.
 
 #     Queue    : analysis.jobs
-#     Exchange : analysis.exchange
-#     Routing  : analysis.job.created
+#     Exchange : dev.analysis.exchange
+#     Routing  : dev.analysis.jobs.created
 
 #     Example JSON
 #     ────────────
@@ -2542,7 +2542,7 @@ class AnalysisJobMessage:
 
     Exchange : analysis.exchange
 
-    Routing  : analysis.job.created
+    Routing  : analysis.jobs.created
  
     Example JSON
 

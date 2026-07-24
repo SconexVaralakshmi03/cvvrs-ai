@@ -367,7 +367,7 @@ log = logging.getLogger("worker_pool")
 # Number of persistent GPU worker processes. Configurable — this is the
 # "GPU_WORKERS = 2" knob from the requirements. Each one keeps its own
 # YOLO/TensorRT/CUDA context loaded for as long as the service runs.
-GPU_WORKERS = int(os.environ.get("GPU_WORKERS", "4"))
+GPU_WORKERS = int(os.environ.get("GPU_WORKERS", "2"))
 
 # How long to wait for a worker to exit cleanly after a shutdown/replace
 # signal before forcing it.

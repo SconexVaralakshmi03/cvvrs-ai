@@ -13079,6 +13079,7 @@ def analyze_journey(
 
     video_results: List[VideoResult] = []
 
+
     for vj in ordered:
         meta        = meta_by_id[vj.video_id]
         db_filename = os.path.basename(vj.s3_key)

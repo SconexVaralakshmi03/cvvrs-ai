@@ -82,7 +82,7 @@
 publish_test_job.py
 ────────────────────
 Simulates Spring Boot publishing a message to the 'analysis.jobs' queue
-via the 'analysis.exchange' exchange (routing key: analysis.job.created).
+via the 'dev.analysis.exchange' exchange (routing key: dev.analysis.jobs.created).
 
 Usage
 ─────
@@ -126,8 +126,8 @@ load_dotenv(_ENV_PATH)
 
 RABBITMQ_URL  = os.environ.get("RABBITMQ_URL",       "amqp://guest:guest@localhost:5672/")
 QUEUE_NAME    = os.environ.get("ANALYSIS_QUEUE",    "analysis.jobs")
-EXCHANGE_NAME = os.environ.get("ANALYSIS_EXCHANGE", "analysis.exchange")
-ROUTING_KEY   = os.environ.get("ANALYSIS_ROUTING",  "analysis.job.created")
+EXCHANGE_NAME = os.environ.get("ANALYSIS_EXCHANGE", "dev.analysis.exchange")
+ROUTING_KEY   = os.environ.get("ANALYSIS_ROUTING",  "dev.analysis.jobs.created")
 
 # ── Edit this to match your test scenario ────────────────────────────────────
 JOB_MESSAGE = {
