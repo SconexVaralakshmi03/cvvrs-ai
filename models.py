@@ -2669,7 +2669,14 @@ class ViolationResult:
     trigger_duration_seconds:   Optional[float] = None
 
     frame_paths:                List[str] = field(default_factory=list)
- 
+
+    # NEW — additive: who was performing the violation, as determined by
+    # the LLM verification step (analyzer.py + llm_verifier.py). One of
+    # "Loco Pilot" | "Assistant Loco Pilot" | "Unknown". Every violation
+    # reaching this point has already been verified by the LLM (rejected
+    # candidates never make it this far), so this is always populated.
+    role:                        str = "Unknown"
+
     def to_dict(self) -> dict:
 
         return {
@@ -2694,7 +2701,8 @@ class ViolationResult:
             ),
 
             "framePaths":             self.frame_paths,
-          
+
+            "role":                   self.role,
 
         }
  

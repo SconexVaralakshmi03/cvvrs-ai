@@ -15437,6 +15437,14 @@ class _Violation:
     true_start_timestamp: Optional[float] = None
     true_end_timestamp:   Optional[float] = None
     true_duration:        Optional[float] = None
+    # NEW — additive: filled in by the LLM verification step in analyzer.py
+    # (llm_verifier.verify_frame()) after dedup/merge. "Loco Pilot" |
+    # "Assistant Loco Pilot" | "Unknown". Stays "Unknown" until then.
+    role:                  str            = "Unknown"
+    # NEW — additive: set to True by analyzer.py when the LLM verification
+    # step rejects this candidate. Violations flagged this way are filtered
+    # out before frame upload / result building — never reaches S3 or DB.
+    llm_rejected:          bool           = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -15749,6 +15757,8 @@ class ViolationStore:
             true_start_timestamp  = base.true_start_timestamp,
             true_end_timestamp    = base.true_end_timestamp,
             true_duration         = base.true_duration,
+            role                  = base.role,
+            llm_rejected          = base.llm_rejected,
         )
         print(f"[MERGE] frame_index={base.frame_index} true_durations "
               f"before={before_durations} -> after={merged.true_duration}")

@@ -374,3 +374,28 @@ HAND_RAISE_RAW_MISS_TOLERANCE       = 1
 # constant (rather than importing main.py's literal) so this detector stays
 # fully self-contained.
 HAND_RAISE_ZONE_SPLIT_RATIO         = 0.57
+
+# ── LLM verification gate (NEW — additive) ────────────────────────────────────
+# Every candidate violation (Mobile Phone, Drowsiness, Hand Raising,
+# Seat Absence) produced by the detectors above is re-checked by the
+# Qwen2.5-VL verification model (prompt.py / llm_verifier.py) inside
+# analyzer.py, BEFORE its frame is uploaded to S3 or the violation is
+# included in the completion payload sent to the Java backend. See
+# llm_verifier.py for the full flow.
+
+# Master switch. False = skip the LLM entirely and keep the old
+# detector-only behaviour (every candidate is treated as verified).
+LLM_VERIFICATION_ENABLED    = True
+
+# If the LLM can't be reached / times out / returns unparseable JSON after
+# retries: False (default) = fail CLOSED — reject the candidate, matching
+# the "when in doubt, reject" philosophy of prompt.py. True = fail OPEN —
+# keep the candidate unverified rather than silently drop real violations
+# during an LLM outage.
+LLM_VERIFICATION_FAIL_OPEN  = False
+
+OLLAMA_MODEL                 = "qwen2.5vl:7b"
+OLLAMA_HOST                  = None   # None = ollama client default (http://localhost:11434)
+OLLAMA_TIMEOUT_SECONDS        = 120
+OLLAMA_MAX_RETRIES            = 2
+OLLAMA_TEMPERATURE            = 0.1
