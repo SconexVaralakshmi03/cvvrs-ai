@@ -34,7 +34,7 @@
 # # # # @dataclass
 # # # # class AnalysisJobMessage:
 # # # #     """
-# # # #     RabbitMQ message consumed from the 'dev.analysis.jobs' queue.
+# # # #     RabbitMQ message consumed from the 'dev.dev.analysis.jobs' queue.
 
 # # # #     Example JSON
 # # # #     ────────────
@@ -208,11 +208,11 @@
 # # # @dataclass
 # # # class AnalysisJobMessage:
 # # #     """
-# # #     RabbitMQ message consumed from the 'dev.analysis.jobs' queue.
+# # #     RabbitMQ message consumed from the 'dev.dev.analysis.jobs' queue.
 
-# # #     Queue    : dev.analysis.jobs
+# # #     Queue    : dev.dev.analysis.jobs
 # # #     Exchange : dev.dev.analysis.exchange
-# # #     Routing  : dev.dev.analysis.jobs.created
+# # #     Routing  : dev.dev.dev.analysis.jobs.created
 
 # # #     Example JSON
 # # #     ────────────
@@ -424,13 +424,13 @@
 
 # #     """
 
-# #     RabbitMQ message consumed from the 'dev.analysis.jobs' queue.
+# #     RabbitMQ message consumed from the 'dev.dev.analysis.jobs' queue.
  
-# #     Queue    : dev.analysis.jobs
+# #     Queue    : dev.dev.analysis.jobs
 
 # #     Exchange : dev.dev.analysis.exchange
 
-# #     Routing  : dev.dev.analysis.jobs.created
+# #     Routing  : dev.dev.dev.analysis.jobs.created
  
 # #     Example JSON
 
@@ -731,7 +731,7 @@
 # # # @dataclass
 # # # class AnalysisJobMessage:
 # # #     """
-# # #     RabbitMQ message consumed from the 'dev.analysis.jobs' queue.
+# # #     RabbitMQ message consumed from the 'dev.dev.analysis.jobs' queue.
 
 # # #     Example JSON
 # # #     ────────────
@@ -905,11 +905,11 @@
 # # @dataclass
 # # class AnalysisJobMessage:
 # #     """
-# #     RabbitMQ message consumed from the 'dev.analysis.jobs' queue.
+# #     RabbitMQ message consumed from the 'dev.dev.analysis.jobs' queue.
 
-# #     Queue    : dev.analysis.jobs
+# #     Queue    : dev.dev.analysis.jobs
 # #     Exchange : dev.dev.analysis.exchange
-# #     Routing  : dev.dev.analysis.jobs.created
+# #     Routing  : dev.dev.dev.analysis.jobs.created
 
 # #     Example JSON
 # #     ────────────
@@ -1132,13 +1132,13 @@
 
 #     """
 
-#     RabbitMQ message consumed from the 'dev.analysis.jobs' queue.
+#     RabbitMQ message consumed from the 'dev.dev.analysis.jobs' queue.
  
-#     Queue    : dev.analysis.jobs
+#     Queue    : dev.dev.analysis.jobs
 
 #     Exchange : dev.dev.analysis.exchange
 
-#     Routing  : dev.dev.analysis.jobs.created
+#     Routing  : dev.dev.dev.analysis.jobs.created
  
 #     Example JSON
 
@@ -1438,7 +1438,7 @@
 # # # @dataclass
 # # # class AnalysisJobMessage:
 # # #     """
-# # #     RabbitMQ message consumed from the 'dev.analysis.jobs' queue.
+# # #     RabbitMQ message consumed from the 'dev.dev.analysis.jobs' queue.
 
 # # #     Example JSON
 # # #     ────────────
@@ -1612,11 +1612,11 @@
 # # @dataclass
 # # class AnalysisJobMessage:
 # #     """
-# #     RabbitMQ message consumed from the 'dev.analysis.jobs' queue.
+# #     RabbitMQ message consumed from the 'dev.dev.analysis.jobs' queue.
 
-# #     Queue    : dev.analysis.jobs
+# #     Queue    : dev.dev.analysis.jobs
 # #     Exchange : dev.dev.analysis.exchange
-# #     Routing  : dev.dev.analysis.jobs.created
+# #     Routing  : dev.dev.dev.analysis.jobs.created
 
 # #     Example JSON
 # #     ────────────
@@ -1828,13 +1828,13 @@
 
 #     """
 
-#     RabbitMQ message consumed from the 'dev.analysis.jobs' queue.
+#     RabbitMQ message consumed from the 'dev.dev.analysis.jobs' queue.
  
-#     Queue    : dev.analysis.jobs
+#     Queue    : dev.dev.analysis.jobs
 
 #     Exchange : dev.dev.analysis.exchange
 
-#     Routing  : dev.dev.analysis.jobs.created
+#     Routing  : dev.dev.dev.analysis.jobs.created
  
 #     Example JSON
 
@@ -2135,7 +2135,7 @@
 # # @dataclass
 # # class AnalysisJobMessage:
 # #     """
-# #     RabbitMQ message consumed from the 'dev.analysis.jobs' queue.
+# #     RabbitMQ message consumed from the 'dev.dev.analysis.jobs' queue.
 
 # #     Example JSON
 # #     ────────────
@@ -2309,11 +2309,11 @@
 # @dataclass
 # class AnalysisJobMessage:
 #     """
-#     RabbitMQ message consumed from the 'dev.analysis.jobs' queue.
+#     RabbitMQ message consumed from the 'dev.dev.analysis.jobs' queue.
 
-#     Queue    : dev.analysis.jobs
+#     Queue    : dev.dev.analysis.jobs
 #     Exchange : dev.dev.analysis.exchange
-#     Routing  : dev.dev.analysis.jobs.created
+#     Routing  : dev.dev.dev.analysis.jobs.created
 
 #     Example JSON
 #     ────────────
@@ -2536,13 +2536,13 @@ class AnalysisJobMessage:
 
     """
 
-    RabbitMQ message consumed from the 'analysis.jobs' queue.
+    RabbitMQ message consumed from the 'dev.analysis.jobs' queue.
  
-    Queue    : analysis.jobs
+    Queue    : dev.analysis.jobs
 
     Exchange : dev.analysis.exchange
 
-    Routing  : analysis.jobs.created
+    Routing  : dev.analysis.jobs.created
  
     Example JSON
 
