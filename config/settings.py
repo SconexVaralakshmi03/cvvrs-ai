@@ -242,3 +242,135 @@ HEAD_BACK_SCORE_THRESHOLD  = 0.50
 TORSO_RECLINE_MIN          = -10.0
 TORSO_HUNCH_MAX            = 10.0
 DROWSY_SCORE_THRESHOLD     = 0.5
+
+# ── Hand-raise / signaling gesture (NEW — additive, does not touch any ────────
+#    existing detector's constants above) ──────────────────────────────────
+# Detects the railway "call out and point / hand-raise acknowledgement"
+# gesture — either a straight OVERHEAD salute or an extended forward/
+# outward POINT towards the window/signal/gauge. Runs off the SAME
+# per-pilot MediaPipe landmarks the gadget detector already computes each
+# cycle (main.py's _get_pose_landmarks) — no extra pose inference.
+
+# Minimum MediaPipe landmark visibility to trust a shoulder/elbow/wrist
+# point at all.
+HAND_RAISE_VIS_THRESHOLD            = 0.5
+
+# Wrist must be at least this many pixels ABOVE the shoulder (smaller y)
+# to count as "raised" rather than a small hand fidget near the panel.
+# FIX (real-footage false positives on 001_handgestures.mp4): 20px is a
+# flat pixel count with no relation to frame resolution or how far the
+# pilot is from the camera. On this footage (1904x1004) it's a trivial
+# ~1% of frame height — almost ANY upward hand motion clears it, so this
+# gate was doing effectively nothing and all the real filtering rested on
+# the ratio/angle branches below, which turned out not to be tight enough
+# either (6 of 6 "hand raise" hits on a 4-min routine-panel-operation
+# clip, only 1 genuine). Now combined with HAND_RAISE_MARGIN_FRACTION so
+# the gate scales with the person's actual size in frame.
+HAND_RAISE_MARGIN_PX                = 20
+
+# NEW — companion proportional floor for the rule above: wrist must ALSO
+# clear this fraction of the person's own torso height above the
+# shoulder, not just a flat pixel count. The effective margin used is
+# max(HAND_RAISE_MARGIN_PX, HAND_RAISE_MARGIN_FRACTION * torso_h) — see
+# _classify_side(). 5% of torso height is small enough to still pass a
+# genuine raise/point gesture comfortably, but on a high-resolution/
+# close-up frame it's meaningfully larger than 20px, closing the gap a
+# routine reach toward the panel was sneaking through.
+HAND_RAISE_MARGIN_FRACTION          = 0.05
+
+# Elbow angle (shoulder-elbow-wrist), degrees. A locked-out overhead
+# salute sits ~150-180°; resting/bent arms sit ~105-135°.
+HAND_RAISE_ELBOW_STRAIGHT_MIN_DEG   = 150.0
+
+# "Point towards the window/signal" gesture support: elbow noticeably
+# bent (~120-130°) but the wrist still reaches far from the shoulder
+# relative to the person's own torso height. dist(shoulder, wrist) /
+# torso_height must reach this ratio.
+#
+# FIX (real-footage false positives): 0.55 was measured against only the
+# two reference frames and turned out to also be satisfied by ordinary
+# reaches to operate this cab's panel/gauges — they sit at a similar
+# shoulder-to-head reach height, so a routine switch press was scoring
+# as high as ~0.55-0.65. Raised to 0.72: the two validated true-positive
+# reference frames measured 0.74-0.88, comfortably clear of this floor,
+# while most panel-operation reaches (shorter, closer to the body) fall
+# below it.
+#
+# FIX #2 (001_handgestures.mp4 — 6 confirmed hits in a 4-min clip of
+# routine panel operation, only 1 genuine): 0.72 left only a 0.02 margin
+# below the documented true-positive floor (0.74), so reaches that
+# nearly-but-not-quite matched a real gesture still got through. Raised
+# to match the true-positive floor exactly — still passes both reference
+# frames (0.74, 0.88) at the boundary and above, while closing that gap.
+HAND_RAISE_EXTENSION_RATIO_MIN      = 0.74
+
+# NEW — companion floor for the extension-ratio rule above: the elbow
+# must ALSO be at least moderately opened out (not a tight, tucked bend)
+# for the "POINT" branch to fire. Reference frames measured 122-129°,
+# well clear of this floor; this mainly guards against a landmark
+# artifact inflating the ratio on a genuinely tucked-in arm.
+#
+# FIX #2 (001_handgestures.mp4): 100° was loose enough that a pilot
+# leaning IN toward the console with a moderately tucked elbow (typical
+# of pressing a sequence of panel switches) could still pass. Raised to
+# 115° — still well clear of the 122-129° reference range for a genuine
+# point/signal gesture, but above the tucked-elbow posture of routine
+# panel operation.
+HAND_RAISE_EXTENDED_MIN_ANGLE_DEG   = 115.0
+
+# Fallback: wrist at/above head (nose) height by this fraction of torso
+# height, even when the elbow bend is in between the two rules above.
+HAND_RAISE_WRIST_ABOVE_NOSE_FRACTION = 0.02
+
+# FIX (real-footage false positives, confirmed on TWO independent videos):
+# this branch (cond_overhead in detector/hand_raise_detector.py::
+# _classify_side) previously had NO elbow-angle requirement at all — a
+# wrist within ~2% of torso height of nose level was enough to mark the
+# arm "raised" regardless of elbow bend. That posture also covers holding
+# a phone to the ear, and — as seen on 001_handgestures.mp4 — leaning
+# forward with a sharply tucked elbow to operate upper-console switches,
+# where the wrist crosses above nose height purely from the reach/lean,
+# not a gesture. Tightening HAND_RAISE_EXTENSION_RATIO_MIN /
+# HAND_RAISE_EXTENDED_MIN_ANGLE_DEG alone did not fix this because those
+# only gate the POINT branch — this OVERHEAD fallback branch was
+# untouched and kept firing independently. Requiring the elbow to also be
+# at least moderately open here closes that gap while a genuine overhead
+# raise (elbow well past 150deg, or comfortably open even mid-raise)
+# clears this floor easily.
+HAND_RAISE_OVERHEAD_MIN_ANGLE_DEG   = 120.0
+
+# How many consecutive detector CYCLES (not raw frames — this detector
+# runs on the same cadence as the gadget detector, GADGET_EVERY) a side
+# must be "raised" before it's confirmed. Kills single-cycle jitter.
+# Raised from 2 -> 3: an extra cycle of persistence further separates a
+# quick, incidental panel touch from a held, deliberate signaling gesture.
+HAND_RAISE_CONFIRM_FRAMES           = 3
+
+# Minimum true (onset-to-now) duration, in video seconds, before a
+# gesture is logged — now that the onset-tracking bug is fixed (see
+# detector/hand_raise_detector.py, raw_start), this is a genuine
+# elapsed-time gate rather than firing instantly at 0.0. 0.5s filters out
+# single-frame flicker while still catching brief-but-real gestures.
+HAND_RAISE_ALLOWED_DURATION         = 0.5
+
+# How many consecutive missed detector cycles (no pose landmarks AT ALL
+# for this pilot) before an in-progress gesture episode is considered
+# ended outright.
+HAND_RAISE_MISS_TOLERANCE           = 1
+
+# NEW — hysteresis for the RAW (pre-confirmation) geometric raise signal.
+# Allows this many consecutive cycles where NEITHER side geometrically
+# qualifies before the episode is considered truly over. Without this, a
+# single dropped cycle mid-gesture (pose jitter, or the hand briefly
+# dipping between two motions of one continuous reach) split what was
+# really one gesture into two separate logged episodes, each with a
+# misleadingly tiny reported duration.
+HAND_RAISE_RAW_MISS_TOLERANCE       = 1
+
+# NEW — zone split ratio for HandRaisePoseEngine (detector/hand_raise_detector.py).
+# Matches the 0.57 top/bottom split main.py's _get_pose_landmarks() already
+# uses for the gadget detector, so hand-raise pilot ids (2=top, 1=bottom)
+# line up with the rest of the pipeline's pilot numbering. Kept as its own
+# constant (rather than importing main.py's literal) so this detector stays
+# fully self-contained.
+HAND_RAISE_ZONE_SPLIT_RATIO         = 0.57
