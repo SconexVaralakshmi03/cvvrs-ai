@@ -8,7 +8,7 @@
 
 # # # # # # Processing flow
 # # # # # # ───────────────
-# # # # # #  1. Consume message from 'dev.dev.analysis.jobs'.
+# # # # # #  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 # # # # # #  2. Idempotency check — if job already completed, ACK and skip.
 # # # # # #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 # # # # # #  4. Download all videos from S3.
@@ -125,9 +125,9 @@
 # # # # # # load_dotenv(_ENV_PATH)
 
 # # # # # # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# # # # # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# # # # # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# # # # # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# # # # # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# # # # # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# # # # # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # # # # # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
 # # # # # # RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
 
@@ -989,7 +989,7 @@
 
 # # # # # Processing flow
 # # # # # ───────────────
-# # # # #  1. Consume message from 'dev.dev.analysis.jobs'.
+# # # # #  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 # # # # #  2. Idempotency check — if job already completed, ACK and skip.
 # # # # #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 # # # # #  4. Download all videos from S3.
@@ -1129,9 +1129,9 @@
 # # # # # load_dotenv(_ENV_PATH)
 
 # # # # # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# # # # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# # # # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# # # # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# # # # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# # # # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# # # # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # # # # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
 # # # # # RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
 
@@ -2289,7 +2289,7 @@
 
 # # # # Processing flow
 # # # # ───────────────
-# # # #  1. Consume message from 'dev.dev.analysis.jobs'.
+# # # #  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 # # # #  2. Idempotency check — if job already completed, ACK and skip.
 # # # #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 # # # #  4. Download all videos from S3.
@@ -2429,9 +2429,9 @@
 # # # # load_dotenv(_ENV_PATH)
 
 # # # # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# # # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# # # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# # # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# # # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# # # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# # # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # # # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
 # # # # RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
 
@@ -3628,7 +3628,7 @@
 
 # # # # # Processing flow
 # # # # # ───────────────
-# # # # #  1. Consume message from 'dev.dev.analysis.jobs'.
+# # # # #  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 # # # # #  2. Idempotency check — if job already completed, ACK and skip.
 # # # # #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 # # # # #  4. Download all videos from S3.
@@ -3745,9 +3745,9 @@
 # # # # # load_dotenv(_ENV_PATH)
 
 # # # # # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# # # # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# # # # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# # # # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# # # # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# # # # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# # # # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # # # # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
 # # # # # RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
 
@@ -4609,7 +4609,7 @@
 
 # # # # Processing flow
 # # # # ───────────────
-# # # #  1. Consume message from 'dev.dev.analysis.jobs'.
+# # # #  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 # # # #  2. Idempotency check — if job already completed, ACK and skip.
 # # # #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 # # # #  4. Download all videos from S3.
@@ -4749,9 +4749,9 @@
 # # # # load_dotenv(_ENV_PATH)
 
 # # # # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# # # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# # # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# # # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# # # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# # # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# # # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # # # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
 # # # # RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
 
@@ -5909,7 +5909,7 @@
 
 # # # Processing flow
 # # # ───────────────
-# # #  1. Consume message from 'dev.dev.analysis.jobs'.
+# # #  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 # # #  2. Idempotency check — if job already completed, ACK and skip.
 # # #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 # # #  4. Download all videos from S3.
@@ -6051,9 +6051,9 @@
 # # # load_dotenv(_ENV_PATH)
 
 # # # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # # # Defaults to GPU_WORKERS: with N persistent GPU workers we want the broker
 # # # # to have up to N unacked messages in flight so all N workers can be busy
 # # # # at once (see worker_pool.py). Override explicitly via RABBITMQ_PREFETCH
@@ -7318,7 +7318,7 @@
 
 # # # # Processing flow
 # # # # ───────────────
-# # # #  1. Consume message from 'dev.dev.analysis.jobs'.
+# # # #  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 # # # #  2. Idempotency check — if job already completed, ACK and skip.
 # # # #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 # # # #  4. Download all videos from S3.
@@ -7435,9 +7435,9 @@
 # # # # load_dotenv(_ENV_PATH)
 
 # # # # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# # # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# # # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# # # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# # # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# # # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# # # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # # # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
 # # # # RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
 
@@ -8299,7 +8299,7 @@
 
 # # # Processing flow
 # # # ───────────────
-# # #  1. Consume message from 'dev.dev.analysis.jobs'.
+# # #  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 # # #  2. Idempotency check — if job already completed, ACK and skip.
 # # #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 # # #  4. Download all videos from S3.
@@ -8439,9 +8439,9 @@
 # # # load_dotenv(_ENV_PATH)
 
 # # # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
 # # # RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
 
@@ -9599,7 +9599,7 @@
 
 # # Processing flow
 # # ───────────────
-# #  1. Consume message from 'dev.dev.analysis.jobs'.
+# #  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 # #  2. Idempotency check — if job already completed, ACK and skip.
 # #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 # #  4. Download all videos from S3.
@@ -9741,9 +9741,9 @@
 # # load_dotenv(_ENV_PATH)
 
 # # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # # Defaults to GPU_WORKERS: with N persistent GPU workers we want the broker
 # # # to have up to N unacked messages in flight so all N workers can be busy
 # # # at once (see worker_pool.py). Override explicitly via RABBITMQ_PREFETCH
@@ -11033,7 +11033,7 @@
 
 # # # Processing flow
 # # # ───────────────
-# # #  1. Consume message from 'dev.dev.analysis.jobs'.
+# # #  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 # # #  2. Idempotency check — if job already completed, ACK and skip.
 # # #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 # # #  4. Download all videos from S3.
@@ -11150,9 +11150,9 @@
 # # # load_dotenv(_ENV_PATH)
 
 # # # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# # # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# # # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# # # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
 # # # RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
 
@@ -12014,7 +12014,7 @@
 
 # # Processing flow
 # # ───────────────
-# #  1. Consume message from 'dev.dev.analysis.jobs'.
+# #  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 # #  2. Idempotency check — if job already completed, ACK and skip.
 # #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 # #  4. Download all videos from S3.
@@ -12154,9 +12154,9 @@
 # # load_dotenv(_ENV_PATH)
 
 # # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
 # # RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
 
@@ -13314,7 +13314,7 @@
 
 # Processing flow
 # ───────────────
-#  1. Consume message from 'dev.dev.analysis.jobs'.
+#  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 #  2. Idempotency check — if job already completed, ACK and skip.
 #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 #  4. Download all videos from S3.
@@ -13456,9 +13456,9 @@
 # load_dotenv(_ENV_PATH)
 
 # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # Defaults to GPU_WORKERS: with N persistent GPU workers we want the broker
 # # to have up to N unacked messages in flight so all N workers can be busy
 # # at once (see worker_pool.py). Override explicitly via RABBITMQ_PREFETCH
@@ -14801,7 +14801,7 @@
 
 # # Processing flow
 # # ───────────────
-# #  1. Consume message from 'dev.dev.analysis.jobs'.
+# #  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 # #  2. Idempotency check — if job already completed, ACK and skip.
 # #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 # #  4. Download all videos from S3.
@@ -14918,9 +14918,9 @@
 # # load_dotenv(_ENV_PATH)
 
 # # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# # QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# # EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# # ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
 # # RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
 
@@ -15782,7 +15782,7 @@
 
 # Processing flow
 # ───────────────
-#  1. Consume message from 'dev.dev.analysis.jobs'.
+#  1. Consume message from 'dev.dev.dev.analysis.jobs'.
 #  2. Idempotency check — if job already completed, ACK and skip.
 #  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
 #  4. Download all videos from S3.
@@ -15922,9 +15922,9 @@
 # load_dotenv(_ENV_PATH)
 
 # RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-# QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.analysis.jobs")
-# EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-# ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.analysis.jobs.created")
+# QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.dev.dev.analysis.jobs")
+# EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.dev.analysis.exchange")
+# ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.dev.dev.analysis.jobs.created")
 # PREFETCH_COUNT     = int(os.environ.get("RABBITMQ_PREFETCH",      "1"))
 # RECONNECT_DELAY    = int(os.environ.get("RECONNECT_DELAY_SECONDS", "5"))
 
@@ -17082,7 +17082,7 @@ RabbitMQ consumer for the Journey-based analysis workflow.
 
 Processing flow
 ───────────────
- 1. Consume message from 'dev.dev.analysis.jobs'.
+ 1. Consume message from 'dev.dev.dev.analysis.jobs'.
  2. Idempotency check — if job already completed, ACK and skip.
  3. [KEEPALIVE ON] Start keepalive thread — covers download + analysis.
  4. Download all videos from S3.
@@ -17224,9 +17224,9 @@ _ENV_PATH = os.path.join(
 load_dotenv(_ENV_PATH)
 
 RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "analysis.jobs")
-EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "analysis.exchange")
-ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "analysis.jobs.created")
+QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.analysis.jobs")
+EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
+ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.analysis.jobs.created")
 # Defaults to GPU_WORKERS: with N persistent GPU workers we want the broker
 # to have up to N unacked messages in flight so all N workers can be busy
 # at once (see worker_pool.py). Override explicitly via RABBITMQ_PREFETCH
