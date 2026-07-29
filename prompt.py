@@ -75,7 +75,7 @@ image. Do not trust the upstream detector — it produces false positives.
 Independently verify the violation from the visual evidence alone.
   - If the violation is NOT genuinely happening, immediately stop and
     return:
-        {{"status": false, "role": null}}
+        {"status": false, "role": null}
   - Do NOT attempt to identify who is involved if the violation is not
     verified. Identity is only ever assessed in Step 2, and Step 2 never
     runs unless Step 1 returned true.
@@ -132,10 +132,10 @@ _JSON_SCHEMA = """
 Respond with EXACTLY this JSON schema and nothing else — no other keys,
 no markdown fences, no commentary:
 
-{{
+{
   "status": <true or false>,
   "role": "<LP | ALP | BOTH | AMBIGUOUS | null>"
-}}
+}
 
 Rules recap:
 - status = false  →  role MUST be null.
@@ -150,24 +150,31 @@ Worked examples (follow this exact reasoning pattern):
 
 Example 1 — Detector says Phone Usage. Image clearly shows the LP holding
 a phone to his ear.
-  → {{"status": true, "role": "LP"}}
+  → {"status": true, "role": "LP"}
 
 Example 2 — Detector says Phone Usage. Image shows no phone at all.
-  → {{"status": false, "role": null}}
+  → {"status": false, "role": null}
 
 Example 3 — Detector says Hand Raise. The driver is only operating the
 dashboard controls (reaching for a switch, resting a hand on a lever).
 This is normal operation, not a hand raise.
-  → {{"status": false, "role": null}}
+  → {"status": false, "role": null}
 
 Example 4 — Detector says Hand Raise. The ALP clearly raises his hand well
 above shoulder level, distinct from any control-operating posture.
-  → {{"status": true, "role": "ALP"}}
+  → {"status": true, "role": "ALP"}
 
 Example 5 — Detector says Phone Usage. Phone usage is clearly happening,
 but the person using it is heavily occluded and cannot be identified as
 LP or ALP.
-  → {{"status": true, "role": "AMBIGUOUS"}}
+  → {"status": true, "role": "AMBIGUOUS"}
+
+Example 6 — Detector says Hand Raise. The LP extends his arm outward and
+upward toward the windshield/track ahead in a pointing motion (the
+"point and call" signal gesture). His hand is open/pointing, not
+touching any switch or control, even though his arm passes near the
+console on its way outward.
+  → {"status": true, "role": "LP"}
 """.strip()
 
 
@@ -226,36 +233,53 @@ Step 1 — reject (status = false) if ANY of the following apply:
 _HAND_RAISING_CRITERIA = """
 Candidate violation to verify: HAND RAISING ON SIGNAL.
 
-IMPORTANT — this detector is known to produce frequent false positives
-from ordinary locomotive operation. Verify this extremely conservatively.
-A hand raise should be verified ONLY if a person's hand is intentionally
-raised well above its normal operating position, in a deliberate gesture
-clearly directed toward the front windshield (a signal-acknowledgement
-gesture) — not any other kind of arm/hand movement.
+This violation is the standard railway "point and call" safety practice:
+the crew member extends an arm outward/upward, away from the body, and
+points toward a signal or the track ahead to acknowledge it. This is a
+REAL, LEGITIMATE, EXPECTED gesture you must correctly verify when present
+— it is not a false positive.
+
+This detector is ALSO known to produce false positives from ordinary
+locomotive operation (adjusting knobs, resting a hand on a lever, etc).
+The distinguishing factor between a real hand-raise/point-and-call
+gesture and ordinary operation is NOT how close the hand/arm is to the
+console — a signal gesture can visually pass near the console. The real
+distinguishing factor is:
+  - Is the hand/fingers making CONTACT with a specific control, switch,
+    button, or lever? → this is operating equipment, NOT a hand raise.
+  - OR is the arm EXTENDED AWAY from the body / outward / upward, with
+    the hand open or pointing, NOT touching any equipment? → this IS a
+    genuine hand-raise / point-and-call gesture, even if the arm happens
+    to pass near or above the console on its way outward.
 
 Step 1 — verify (status = true) ONLY if ALL of the following are clearly
 true:
-- A hand is clearly raised well above normal operating height.
-- The raised hand clearly belongs to the person being evaluated.
-- The gesture is clearly deliberate and directed toward the front
-  windshield (signal acknowledgement), not an incidental motion.
+- An arm/hand is clearly extended outward and/or upward, away from a
+  resting/operating position.
+- The hand/fingers are NOT making contact with any switch, button,
+  lever, or control at the moment captured.
+- The gesture reads as deliberate — pointing or an open extended hand
+  toward the windshield/track/signal ahead — not a passing, incidental
+  motion mid-way through reaching for something.
 
-Step 1 — reject (status = false) if the image instead shows ANY of the
-following — none of these count as a hand raise, no matter what the
-detector flagged:
-- Operating locomotive controls (throttle, brake, switches, levers).
-- Reaching for or adjusting a switch or piece of equipment.
-- Pointing at the dashboard or a display.
-- Resting a hand on the controls.
-- Natural driving posture with no deliberate raised gesture.
-- A brief, incidental arm movement.
-- Touching the face.
-- Scratching the head.
-- Stretching, adjusting hair, or adjusting a cap.
-- Any other uncertain or ambiguous pose.
+Step 1 — reject (status = false) ONLY if the image instead clearly shows:
+- The hand/fingers physically touching or manipulating a specific
+  switch, button, lever, or dial (this is operating controls, not a
+  signal gesture — regardless of arm angle).
+- A hand resting stationary on the controls with no extension outward.
+- Natural driving posture with no arm extension at all.
+- A brief, clearly incidental motion (adjusting hair, touching the face,
+  scratching the head, adjusting a cap) with the arm staying close to the
+  body, not extended outward toward the windshield.
 
-If there is ANY doubt at all, reject:
-  → {{"status": false, "role": null}}
+If the arm is extended outward/upward AND not touching equipment, verify
+it — do not reject an outward-pointing gesture merely because it passes
+near the console. If you are genuinely unsure whether the hand is
+touching a control or just passing near it, and the arm is clearly
+extended outward in a pointing motion, prefer verifying it (status=true)
+over rejecting — this violation type is intentionally biased toward
+capturing real point-and-call gestures, unlike the other violation types
+above which are biased toward rejection.
 """.strip()
 
 

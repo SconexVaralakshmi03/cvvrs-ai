@@ -13236,6 +13236,14 @@ def send_progress(
 
 
 def send_completed(completion_payload: Dict[str, Any]) -> None:
+    # ── TEMP DEBUG — remove once role/status DB mismatch is confirmed fixed ──
+    for vr in completion_payload.get("videoResults", []):
+        for v in vr.get("violations", []):
+            print(f"[callback_client] OUTGOING violation "
+                  f"type={v.get('violationType')!r} "
+                  f"framePaths={v.get('framePaths')} "
+                  f"status={v.get('status')!r} ({type(v.get('status')).__name__}) "
+                  f"role={v.get('role')!r} ({type(v.get('role')).__name__})")
     _post("/api/internal/analysis/completed", completion_payload)
 
 
