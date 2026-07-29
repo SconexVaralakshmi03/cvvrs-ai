@@ -134,7 +134,9 @@ no markdown fences, no commentary:
 
 {
   "status": <true or false>,
-  "role": "<LP | ALP | BOTH | AMBIGUOUS | null>"
+  "role": "<LP | ALP | BOTH | AMBIGUOUS | null>",
+  "reason": "<one concise sentence citing the specific visual evidence
+             that drove this decision>"
 }
 
 Rules recap:
@@ -142,6 +144,9 @@ Rules recap:
 - status = true   →  role MUST be "LP", "ALP", "BOTH", or "AMBIGUOUS".
 - Never output "Unknown" / "UNKNOWN" in the role field, under any
   circumstances.
+- "reason" is required on every response, whether status is true or
+  false — always state the specific visual evidence (or lack of it)
+  that led to the decision.
 """.strip()
 
 
