@@ -97,6 +97,12 @@ If two or more people are present and you cannot clearly tell which one
 occupies the primary driving seat, OR if you cannot confidently match the
 flagged action to one specific person's seat position, set role to
 "Unknown". Never guess the role.
+
+If BOTH the Loco Pilot and the Assistant Loco Pilot are clearly and
+independently committing the SAME flagged violation at the same time
+(e.g. both are visibly holding/using a phone), set role to "Both".
+Only use "Both" when each person's involvement is independently clear —
+if there is any doubt about either person, set role to "Unknown" instead.
 """.strip()
 
 
@@ -114,7 +120,7 @@ Respond with EXACTLY this JSON schema and nothing else:
 {{
   "verified": <true or false>,
   "candidate_violation": "{violation}",
-  "role": "<Loco Pilot | Assistant Loco Pilot | Unknown>",
+  "role": "<Loco Pilot | Assistant Loco Pilot | Both | Unknown>",
   "confidence": <integer 0-100>,
   "reason": "<one concise sentence citing the specific visual evidence>"
 }}

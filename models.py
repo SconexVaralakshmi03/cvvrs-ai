@@ -2670,12 +2670,20 @@ class ViolationResult:
 
     frame_paths:                List[str] = field(default_factory=list)
 
-    # NEW — additive: who was performing the violation, as determined by
-    # the LLM verification step (analyzer.py + llm_verifier.py). One of
-    # "Loco Pilot" | "Assistant Loco Pilot" | "Unknown". Every violation
-    # reaching this point has already been verified by the LLM (rejected
-    # candidates never make it this far), so this is always populated.
-    role:                        str = "Unknown"
+    # NEW — additive: every candidate violation is verified by the LLM
+    # (analyzer.py + llm_verifier.py) and tagged with:
+    #   status = "TRUE"  → the LLM confirmed the violation actually
+    #            occurred. role is one of "LP" (Loco Pilot),
+    #            "ALP" (Assistant Loco Pilot), "BOTH" (both crew members
+    #            caught committing it), or "AMBIGUOUS" (confirmed, but the
+    #            LLM could not confidently attribute it to one role).
+    #   status = "FALSE" → the LLM rejected the candidate. role is always
+    #            None — no role is ever assigned to a non-violation.
+    # Rejected candidates are no longer dropped from the payload; they are
+    # kept so the backend/UI can distinguish confirmed violations from
+    # LLM-rejected candidates instead of silently losing the latter.
+    status:                      str = "TRUE"
+    role:                        Optional[str] = None
 
     def to_dict(self) -> dict:
 
@@ -2701,6 +2709,8 @@ class ViolationResult:
             ),
 
             "framePaths":             self.frame_paths,
+
+            "status":                 self.status,
 
             "role":                   self.role,
 

@@ -25588,6 +25588,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import os
 import threading
@@ -25808,7 +25809,8 @@ def _build_partial_video_result(job_id: str, vj, db_filename: str, meta: dict,
                 "timestamp":              journey_ts,
                 "originalVideoTimestamp": local_ts,
                 "framePaths":             [],
-                "role":                   getattr(v, "role", "Unknown"),
+                "status":                 getattr(v, "status", "TRUE"),
+                "role":                   getattr(v, "role", None),
             })
         return {
             "videoId":           vj.video_id,
@@ -26210,16 +26212,15 @@ def analyze_journey(
         for vj in ordered
     }
 
-    # NEW — LLM verification gate (Qwen2.5-VL via Ollama, see
+    # LLM verification gate (Qwen2.5-VL via Ollama, see
     # llm_verifier.py / prompt.py). Inserted right before each case's
-    # existing upload_frame()/upload_frame_from_path() call:
-    #   • REJECTED  → the frame is never uploaded to S3, and the violation
-    #                 is flagged (v.llm_rejected = True) so it is filtered
-    #                 out below before ViolationResult objects are built —
-    #                 it never reaches the completion payload / DB.
-    #   • VERIFIED  → v.role is set from the LLM's Loco Pilot / Assistant
-    #                 Loco Pilot / Unknown determination, and the existing
-    #                 upload proceeds exactly as before.
+    # existing upload_frame()/upload_frame_from_path() call. EVERY
+    # candidate violation is verified and kept (none are dropped):
+    #   • REJECTED  → v.status = "FALSE", v.role = None. The violation
+    #                 still flows through into the completion payload,
+    #                 just tagged as not confirmed.
+    #   • VERIFIED  → v.status = "TRUE", v.role is set to one of
+    #                 "LP" / "ALP" / "BOTH" / "AMBIGUOUS".
     # Everything else about Cases 1/2/3 below (how the frame is located)
     # is unchanged.
     n_llm_verified = 0
@@ -26235,16 +26236,14 @@ def analyze_journey(
             verdict = llm_verifier.verify_frame(frame_img, v.type, log_label=filename)
             if verdict["skipped"]:
                 n_llm_skipped += 1
-            elif not verdict["verified"]:
+            elif verdict["status"] == "FALSE":
                 n_llm_rejected += 1
                 print(f"[Analyzer:{job_id}]  LLM REJECTED violation "
                       f"(type={v.type} file={filename}): {verdict['reason']}")
-                v.llm_rejected     = True
-                v.annotated_frame = None
-                continue
             else:
                 n_llm_verified += 1
-            v.role = verdict["role"]
+            v.status = verdict["status"]
+            v.role   = verdict["role"]
 
             try:
                 s3_key            = upload_frame(frame_img, journey_id,
@@ -26265,22 +26264,22 @@ def analyze_journey(
                 if frame_img is None:
                     print(f"[Analyzer:{job_id}]  Could not read saved frame for "
                           f"LLM check: {local_path} — uploading unverified")
-                    verdict = {"verified": True, "role": "Unknown", "skipped": True,
+                    verdict = {"verified": True, "status": "TRUE", "role": "AMBIGUOUS",
+                               "skipped": True,
                                "reason": "Frame unreadable for LLM check."}
                 else:
                     verdict = llm_verifier.verify_frame(frame_img, v.type, log_label=local_path)
 
                 if verdict["skipped"]:
                     n_llm_skipped += 1
-                elif not verdict["verified"]:
+                elif verdict["status"] == "FALSE":
                     n_llm_rejected += 1
                     print(f"[Analyzer:{job_id}]  LLM REJECTED violation "
                           f"(type={v.type} file={local_path}): {verdict['reason']}")
-                    v.llm_rejected = True
-                    continue
                 else:
                     n_llm_verified += 1
-                v.role = verdict["role"]
+                v.status = verdict["status"]
+                v.role   = verdict["role"]
 
                 try:
                     s3_key       = upload_frame_from_path(local_path, journey_id,
@@ -26329,15 +26328,14 @@ def analyze_journey(
         verdict = llm_verifier.verify_frame(frame_img, v.type, log_label=filename)
         if verdict["skipped"]:
             n_llm_skipped += 1
-        elif not verdict["verified"]:
+        elif verdict["status"] == "FALSE":
             n_llm_rejected += 1
             print(f"[Analyzer:{job_id}]  LLM REJECTED violation "
                   f"(type={v.type} file={filename}): {verdict['reason']}")
-            v.llm_rejected = True
-            continue
         else:
             n_llm_verified += 1
-        v.role = verdict["role"]
+        v.status = verdict["status"]
+        v.role   = verdict["role"]
 
         try:
             s3_key       = upload_frame(frame_img, journey_id,
@@ -26346,21 +26344,28 @@ def analyze_journey(
         except Exception as exc:
             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
 
-    # ── Drop every LLM-rejected violation ─────────────────────────────────────
-    # Must happen before ViolationResult objects are built below: a rejected
-    # candidate's frame was never uploaded to S3 above, and it must not appear
-    # in the completion payload sent to the Java backend (i.e. never reaches
-    # the DB either).
-    _n_before_llm_filter = len(shared_vstore._violations)
-    shared_vstore._violations = [
-        v for v in shared_vstore._violations if not getattr(v, "llm_rejected", False)
-    ]
+    # ── LLM verification summary ───────────────────────────────────────────────
+    # NOTE: rejected (status="FALSE") candidates are NO LONGER dropped here.
+    # Every candidate violation — verified or rejected — is kept and flows
+    # through into the completion payload below, tagged with its own
+    # status ("TRUE"/"FALSE") and role ("LP"/"ALP"/"BOTH"/"AMBIGUOUS"/None).
+    # This lets the backend/UI distinguish confirmed violations from
+    # LLM-rejected candidates instead of silently losing the latter.
+    _n_total_violations = len(shared_vstore._violations)
     print(
         f"[Analyzer:{job_id}]  LLM verification summary: "
-        f"verified={n_llm_verified}  rejected={n_llm_rejected}  "
+        f"verified(TRUE)={n_llm_verified}  rejected(FALSE)={n_llm_rejected}  "
         f"skipped(no-criteria/disabled)={n_llm_skipped}  "
-        f"kept={len(shared_vstore._violations)}/{_n_before_llm_filter}"
+        f"total={_n_total_violations}"
     )
+    print("[LLM_VERIFICATION_SUMMARY] " + json.dumps({
+        "job_id":   job_id,
+        "journey_id": journey_id,
+        "verified_true":  n_llm_verified,
+        "rejected_false": n_llm_rejected,
+        "skipped_no_llm": n_llm_skipped,
+        "total_violations": _n_total_violations,
+    }))
 
     # ── Build VideoResult / ViolationResult objects ───────────────────────────
     violations_by_filename: Dict[str, list] = {}
@@ -26399,7 +26404,8 @@ def analyze_journey(
                         else getattr(v, "true_duration", None)
                     ),
                     frame_paths              = [v.frame_path] if v.frame_path else [],
-                    role                     = getattr(v, "role", "Unknown"),
+                    status                   = getattr(v, "status", "TRUE"),
+                    role                     = getattr(v, "role", None),
 
                 )
             )

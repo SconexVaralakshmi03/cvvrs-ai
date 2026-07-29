@@ -15438,12 +15438,17 @@ class _Violation:
     true_end_timestamp:   Optional[float] = None
     true_duration:        Optional[float] = None
     # NEW — additive: filled in by the LLM verification step in analyzer.py
-    # (llm_verifier.verify_frame()) after dedup/merge. "Loco Pilot" |
-    # "Assistant Loco Pilot" | "Unknown". Stays "Unknown" until then.
-    role:                  str            = "Unknown"
-    # NEW — additive: set to True by analyzer.py when the LLM verification
-    # step rejects this candidate. Violations flagged this way are filtered
-    # out before frame upload / result building — never reaches S3 or DB.
+    # (llm_verifier.verify_frame()) after dedup/merge.
+    #   status: "TRUE" (violation confirmed) | "FALSE" (LLM rejected it).
+    #           Defaults to "TRUE" until verification actually runs.
+    #   role:   "LP" | "ALP" | "BOTH" | "AMBIGUOUS" when status == "TRUE",
+    #           always None when status == "FALSE". None until verified.
+    status:                str            = "TRUE"
+    role:                  Optional[str]  = None
+    # Kept for backward compatibility with any external code still reading
+    # this attribute; no longer used to filter violations out of the
+    # completion payload (rejected candidates are now kept, tagged
+    # status="FALSE", instead of being dropped).
     llm_rejected:          bool           = False
 
 

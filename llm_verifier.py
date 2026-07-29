@@ -14,20 +14,24 @@ model BEFORE:
   • it is included in the completion payload sent to the Java/Spring Boot
     backend (i.e. before it ever reaches the DB).
 
-If the LLM rejects a candidate, analyzer.py drops it entirely — no S3
-upload, no DB row. If the LLM verifies it, the returned "role" (Loco
-Pilot / Assistant Loco Pilot / Unknown) is attached to the violation and
-flows through into the "role" field of the outbound ViolationResult
-payload — this is the only change to the existing payload shape.
+Every candidate is kept in the output either way and tagged with a
+"status" field:
+  • status="TRUE"  — the LLM confirmed the violation. "role" is set to
+    one of "LP" (Loco Pilot), "ALP" (Assistant Loco Pilot), "BOTH" (both
+    crew members caught committing the same violation), or "AMBIGUOUS"
+    (violation confirmed but the LLM could not confidently attribute it
+    to one specific role).
+  • status="FALSE" — the LLM rejected the candidate. "role" is always
+    None (no role is ever assigned to a non-violation).
 
 Design notes
 ------------
 * Only violation types with defined criteria in prompt.py (Mobile Phone,
   Drowsiness, Hand Raising, Seat Absence) are sent to the LLM. Any other
-  event_type is passed straight through unverified (verified=True,
-  role="Unknown", skipped=True) — unchanged pipeline behaviour for those
-  types, since prompt.py currently defines no verification criteria for
-  them.
+  event_type is passed straight through unverified (status="TRUE",
+  role="AMBIGUOUS", skipped=True, llm_invoked=False) — unchanged pipeline
+  behaviour for those types, since prompt.py currently defines no
+  verification criteria for them.
 * If Ollama / the model is unavailable, or the LLM call errors out
   repeatedly, verify_frame() fails *open* or *closed* depending on the
   LLM_VERIFICATION_FAIL_OPEN setting (config/settings.py), so a
@@ -86,7 +90,33 @@ EVENT_TYPE_TO_PROMPT_VIOLATION: dict[str, str] = {
     "seat_absence":    Violation.SEAT_ABSENCE,
 }
 
-VALID_ROLES = {"Loco Pilot", "Assistant Loco Pilot", "Unknown"}
+VALID_ROLES = {"Loco Pilot", "Assistant Loco Pilot", "Both", "Unknown"}
+
+# Canonical short role codes used on the outbound payload / DB, per task
+# spec: role is one of "LP" | "ALP" | "BOTH" | "AMBIGUOUS", or None when the
+# violation itself was rejected (status FALSE).
+ROLE_TO_CODE = {
+    "Loco Pilot":           "LP",
+    "Assistant Loco Pilot": "ALP",
+    "Both":                 "BOTH",
+    "Unknown":               "AMBIGUOUS",
+}
+
+
+def _log_verification_json(**fields) -> None:
+    """
+    Emit one structured JSON line to the terminal for EVERY candidate
+    violation that passes through verify_frame(), regardless of outcome.
+
+    This is the audit trail requested for task 2: from the terminal logs
+    alone it must always be possible to tell (a) whether the LLM was
+    actually invoked for a given frame ("llm_invoked"), and (b) what
+    status/role verdict was ultimately assigned to it.
+    """
+    try:
+        print("[LLM_VERIFICATION_LOG] " + json.dumps(fields, default=str))
+    except Exception:
+        log.exception("Failed to emit LLM verification JSON log")
 
 
 class VerificationTimeoutError(RuntimeError):
@@ -216,35 +246,69 @@ def _safe_parse(raw_text: str) -> Optional[dict]:
 
 # ── Public entry point ───────────────────────────────────────────────────
 
+def _status_role(verified: bool, raw_role: str) -> tuple[str, Optional[str]]:
+    """
+    Map an internal (verified: bool, raw_role: str) pair to the outbound
+    task-spec contract:
+        verified True  → status="TRUE",  role="LP"|"ALP"|"BOTH"|"AMBIGUOUS"
+        verified False → status="FALSE", role=None
+    """
+    if not verified:
+        return "FALSE", None
+    return "TRUE", ROLE_TO_CODE.get(raw_role, "AMBIGUOUS")
+
+
 def verify_frame(image_bgr: np.ndarray, event_type: str, log_label: str = "") -> dict:
     """
     Verify one candidate-violation frame with the LLM.
 
     Returns a dict:
         {
-          "verified":   bool,
-          "role":       "Loco Pilot" | "Assistant Loco Pilot" | "Unknown",
-          "confidence": int 0-100,
-          "reason":     str,
-          "skipped":    bool,   # True if this event_type has no defined LLM
+          "verified":    bool,   # kept for internal/backward-compat checks
+          "status":      "TRUE" | "FALSE",
+          "role":        "LP" | "ALP" | "BOTH" | "AMBIGUOUS" | None,
+                         # None whenever status == "FALSE" — no role is
+                         # ever assigned to a rejected candidate.
+          "confidence":  int 0-100,
+          "reason":      str,
+          "skipped":     bool,  # True if this event_type has no defined LLM
                                  # verification criteria, or verification is
-                                 # disabled — verified is always True in that
+                                 # disabled — status is always "TRUE" in that
                                  # case (unverified pass-through, unchanged
-                                 # pipeline behaviour).
+                                 # pipeline behaviour), role "AMBIGUOUS".
+          "llm_invoked": bool,  # True iff an actual model call was made
+                                 # (i.e. this candidate was NOT skipped).
         }
+
+    Every call to this function emits exactly one
+    "[LLM_VERIFICATION_LOG] {...}" JSON line to the terminal — task 2's
+    audit trail — regardless of which branch below is taken.
     """
     if not LLM_VERIFICATION_ENABLED:
+        status, role = "TRUE", "AMBIGUOUS"
+        _log_verification_json(
+            label=log_label, event_type=event_type, candidate_violation=None,
+            llm_invoked=False, status=status, role=role, confidence=0,
+            reason="LLM verification disabled by config.", skipped=True,
+        )
         return {
-            "verified": True, "role": "Unknown", "confidence": 0,
+            "verified": True, "status": status, "role": role, "confidence": 0,
             "reason": "LLM verification disabled by config.", "skipped": True,
+            "llm_invoked": False,
         }
 
     candidate_violation = EVENT_TYPE_TO_PROMPT_VIOLATION.get((event_type or "").lower())
     if candidate_violation is None:
+        status, role = "TRUE", "AMBIGUOUS"
+        reason = f"No LLM verification criteria defined for event_type={event_type!r}."
+        _log_verification_json(
+            label=log_label, event_type=event_type, candidate_violation=None,
+            llm_invoked=False, status=status, role=role, confidence=0,
+            reason=reason, skipped=True,
+        )
         return {
-            "verified": True, "role": "Unknown", "confidence": 0,
-            "reason": f"No LLM verification criteria defined for event_type={event_type!r}.",
-            "skipped": True,
+            "verified": True, "status": status, "role": role, "confidence": 0,
+            "reason": reason, "skipped": True, "llm_invoked": False,
         }
 
     prompt_text = build_verification_prompt(candidate_violation)
@@ -264,36 +328,63 @@ def verify_frame(image_bgr: np.ndarray, event_type: str, log_label: str = "") ->
 
     if raw_text is None:
         fail_open = LLM_VERIFICATION_FAIL_OPEN
+        status, role = _status_role(fail_open, "Unknown")
+        reason = f"LLM verification unavailable: {last_error}"
         log.error(
             "LLM verification unavailable for %s (%s) after retries: %s — %s",
             log_label, candidate_violation, last_error,
             "failing OPEN (kept, unverified)" if fail_open else "failing CLOSED (rejected)",
         )
+        _log_verification_json(
+            label=log_label, event_type=event_type, candidate_violation=candidate_violation,
+            llm_invoked=True, status=status, role=role, confidence=0,
+            reason=reason, skipped=False,
+        )
         return {
-            "verified":   fail_open,
-            "role":       "Unknown",
-            "confidence": 0,
-            "reason":     f"LLM verification unavailable: {last_error}",
-            "skipped":    False,
+            "verified":    fail_open,
+            "status":      status,
+            "role":        role,
+            "confidence":  0,
+            "reason":      reason,
+            "skipped":     False,
+            "llm_invoked": True,
         }
 
     parsed = _safe_parse(raw_text)
     if parsed is None:
         fail_open = LLM_VERIFICATION_FAIL_OPEN
+        status, role = _status_role(fail_open, "Unknown")
+        reason = "Model response could not be parsed as valid JSON."
         log.warning(
             "LLM returned unparseable JSON for %s (%s) — %s",
             log_label, candidate_violation,
             "failing OPEN" if fail_open else "failing CLOSED (rejected)",
         )
+        _log_verification_json(
+            label=log_label, event_type=event_type, candidate_violation=candidate_violation,
+            llm_invoked=True, status=status, role=role, confidence=0,
+            reason=reason, skipped=False, raw_response=raw_text,
+        )
         return {
-            "verified":   fail_open,
-            "role":       "Unknown",
-            "confidence": 0,
-            "reason":     "Model response could not be parsed as valid JSON.",
-            "skipped":    False,
+            "verified":    fail_open,
+            "status":      status,
+            "role":        role,
+            "confidence":  0,
+            "reason":      reason,
+            "skipped":     False,
+            "llm_invoked": True,
         }
 
-    parsed["skipped"] = False
+    status, role = _status_role(parsed["verified"], parsed["role"])
+    parsed["skipped"]     = False
+    parsed["llm_invoked"] = True
+    parsed["status"]      = status
+    parsed["role"]        = role
     print(f"[llm_verifier] PARSED verdict for {log_label!r} "
           f"(candidate={candidate_violation}): {parsed}")
+    _log_verification_json(
+        label=log_label, event_type=event_type, candidate_violation=candidate_violation,
+        llm_invoked=True, status=status, role=role, confidence=parsed["confidence"],
+        reason=parsed["reason"], skipped=False,
+    )
     return parsed
