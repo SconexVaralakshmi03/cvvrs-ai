@@ -2710,7 +2710,13 @@ class ViolationResult:
 
             "framePaths":             self.frame_paths,
 
-            "status":                 self.status,
+            # Sent as a real JSON boolean (true/false), not the string
+            # "TRUE"/"FALSE", to match the backend's `status boolean`
+            # column type. A string here can fail strict Jackson boolean
+            # binding, which (depending on backend config) can silently
+            # default the WHOLE violation object rather than just this
+            # field — which would explain role coming through as null too.
+            "status":                 self.status == "TRUE",
 
             "role":                   self.role,
 

@@ -25809,7 +25809,7 @@ def _build_partial_video_result(job_id: str, vj, db_filename: str, meta: dict,
                 "timestamp":              journey_ts,
                 "originalVideoTimestamp": local_ts,
                 "framePaths":             [],
-                "status":                 getattr(v, "status", "TRUE"),
+                "status":                 getattr(v, "status", "TRUE") == "TRUE",
                 "role":                   getattr(v, "role", None),
             })
         return {
