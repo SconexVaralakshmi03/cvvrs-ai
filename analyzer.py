@@ -25779,39 +25779,19 @@ def _apply_llm_verdict(v, verdict: dict) -> None:
     into the outbound ViolationResult ("status" / "role" in the completion
     payload sent to the Java backend) — see models.py.
 
-    Rules:
-      • skipped (event_type has no LLM criteria defined, or verification
-        is disabled) → status=True, role="Unknown" (unchanged pass-through
-        behaviour — this candidate was never sent to the LLM at all).
-      • rejected     → status=False, role=None.
-      • verified     → status=True.
-            - SEAT_ABSENCE → role="BOTH" (nobody in the driving position,
-              so both LP and ALP are absent — regardless of what the LLM
-              put in its own role field, which prompt.py always forces to
-              "Unknown" for this violation type since role isn't visually
-              determinable when the cabin is empty).
-            - all other types → role = whatever the LLM determined
-              ("Loco Pilot" / "Assistant Loco Pilot" / "Unknown").
-
-    NOTE: the frame is uploaded to S3 (and framePaths populated) in every
-    case — verified AND rejected — so the Java backend gets the evidence
-    image alongside status=False for rejected candidates too.
+    llm_verifier.verify_frame() already enforces the hard schema rules
+    (status=False → role=None; status=True → role is always one of
+    "LP"/"ALP"/"BOTH"/"AMBIGUOUS", never "Unknown"), so this function just
+    copies the verdict through — plus one defensive safety net for
+    SEAT_ABSENCE, in case prompt.py's own role text ever drifts: a
+    verified seat-absence candidate is ALWAYS "BOTH", since there is no
+    identity question when nobody is in the driving position at all.
     """
-    if verdict["skipped"]:
-        v.status = True
-        v.role   = "Unknown"
-        return
+    v.status = bool(verdict["status"])
+    v.role   = verdict["role"]
 
-    if not verdict["verified"]:
-        v.status = False
-        v.role   = None
-        return
-
-    v.status = True
-    if (v.type or "").lower() == "seat_absence":
+    if v.status and (v.type or "").lower() == "seat_absence":
         v.role = "BOTH"
-    else:
-        v.role = verdict["role"]
 
 
 def _build_partial_video_result(job_id: str, vj, db_filename: str, meta: dict,
@@ -25850,8 +25830,8 @@ def _build_partial_video_result(job_id: str, vj, db_filename: str, meta: dict,
                 "timestamp":              journey_ts,
                 "originalVideoTimestamp": local_ts,
                 "framePaths":             [],
-                "status":                 getattr(v, "status", True),
-                "role":                   getattr(v, "role", "Unknown"),
+                "status":                 getattr(v, "status", False),
+                "role":                   getattr(v, "role", None),
             })
         return {
             "videoId":           vj.video_id,
@@ -26280,7 +26260,7 @@ def analyze_journey(
 
             if verdict["skipped"]:
                 n_llm_skipped += 1
-            elif verdict["verified"]:
+            elif verdict["status"]:
                 n_llm_verified += 1
             else:
                 n_llm_rejected += 1
@@ -26315,7 +26295,7 @@ def analyze_journey(
 
                 if verdict["skipped"]:
                     n_llm_skipped += 1
-                elif verdict["verified"]:
+                elif verdict["status"]:
                     n_llm_verified += 1
                 else:
                     n_llm_rejected += 1
@@ -26371,7 +26351,7 @@ def analyze_journey(
 
         if verdict["skipped"]:
             n_llm_skipped += 1
-        elif verdict["verified"]:
+        elif verdict["status"]:
             n_llm_verified += 1
         else:
             n_llm_rejected += 1
@@ -26436,8 +26416,8 @@ def analyze_journey(
                         else getattr(v, "true_duration", None)
                     ),
                     frame_paths              = [v.frame_path] if v.frame_path else [],
-                    status                   = getattr(v, "status", True),
-                    role                     = getattr(v, "role", "Unknown"),
+                    status                   = getattr(v, "status", False),
+                    role                     = getattr(v, "role", None),
 
                 )
             )

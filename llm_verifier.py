@@ -8,32 +8,37 @@ main journey analysis pipeline (analyzer.py).
 This wraps the Qwen2.5-VL (via Ollama) verifier described in prompt.py so
 that every candidate violation frame produced by the YOLO/MediaPipe
 detectors (detector/*.py) is independently re-checked by a vision-language
-model BEFORE:
+model BEFORE it is included in the completion payload sent to the
+Java/Spring Boot backend.
 
-  • its frame image is uploaded to S3, and
-  • it is included in the completion payload sent to the Java/Spring Boot
-    backend (i.e. before it ever reaches the DB).
+REVISION — status/role schema, no more "Unknown"
+--------------------------------------------------
+This version aligns with prompt.py's two-step flow and its strict output
+schema: {"status": bool, "role": "LP" | "ALP" | "BOTH" | "AMBIGUOUS" | null}.
 
-If the LLM rejects a candidate, analyzer.py drops it entirely — no S3
-upload, no DB row. If the LLM verifies it, the returned "role" (Loco
-Pilot / Assistant Loco Pilot / Unknown) is attached to the violation and
-flows through into the "role" field of the outbound ViolationResult
-payload — this is the only change to the existing payload shape.
+  • status = false  →  role is ALWAYS None (enforced here even if the model
+                        slips and includes a role anyway).
+  • status = true   →  role is ALWAYS one of "LP" / "ALP" / "BOTH" /
+                        "AMBIGUOUS" — "Unknown" is never produced anywhere
+                        in this module. Any invalid/missing role on a
+                        verified candidate is normalized to "AMBIGUOUS"
+                        (genuine, labelled uncertainty), never "Unknown".
 
 Design notes
 ------------
 * Only violation types with defined criteria in prompt.py (Mobile Phone,
   Drowsiness, Hand Raising, Seat Absence) are sent to the LLM. Any other
-  event_type is passed straight through unverified (verified=True,
-  role="Unknown", skipped=True) — unchanged pipeline behaviour for those
-  types, since prompt.py currently defines no verification criteria for
-  them.
+  event_type is passed straight through unverified (status=True,
+  role="AMBIGUOUS", skipped=True) — unchanged pipeline behaviour for
+  those types (no LLM criteria exist for them yet), just phrased with the
+  new role vocabulary instead of "Unknown".
 * If Ollama / the model is unavailable, or the LLM call errors out
   repeatedly, verify_frame() fails *open* or *closed* depending on the
-  LLM_VERIFICATION_FAIL_OPEN setting (config/settings.py), so a
-  temporarily-down verifier can never silently take down the whole
-  pipeline in a way ops doesn't control. Default is fail CLOSED (reject)
-  to match the "when in doubt, reject" philosophy of prompt.py.
+  LLM_VERIFICATION_FAIL_OPEN setting (config/settings.py). Default is fail
+  CLOSED (status=False, role=None) to match the "never default to
+  status=true" / "when in doubt, reject" philosophy of prompt.py — this is
+  also the fix for the DB previously showing status=true for nearly every
+  violation: unresolved/failed LLM calls no longer silently pass as true.
 """
 
 from __future__ import annotations
@@ -62,9 +67,10 @@ def _cfg(name: str, default):
 
 
 LLM_VERIFICATION_ENABLED   = bool(_cfg("LLM_VERIFICATION_ENABLED", True))
-# Fail-open = keep the candidate (verified=True) if the LLM can't be
-# reached / doesn't respond after retries. Fail-closed (default) rejects
-# it instead, matching the "when in doubt, reject" design of prompt.py.
+# Fail-open = keep the candidate (status=True, role="AMBIGUOUS") if the LLM
+# can't be reached / doesn't respond after retries. Fail-closed (default,
+# recommended) rejects it instead (status=False, role=None), matching the
+# "never default to status=true" design of prompt.py.
 LLM_VERIFICATION_FAIL_OPEN = bool(_cfg("LLM_VERIFICATION_FAIL_OPEN", False))
 OLLAMA_MODEL                = str(_cfg("OLLAMA_MODEL", "qwen2.5vl:7b"))
 OLLAMA_HOST                 = _cfg("OLLAMA_HOST", None)  # None = client default (localhost:11434)
@@ -86,7 +92,9 @@ EVENT_TYPE_TO_PROMPT_VIOLATION: dict[str, str] = {
     "seat_absence":    Violation.SEAT_ABSENCE,
 }
 
-VALID_ROLES = {"Loco Pilot", "Assistant Loco Pilot", "Unknown"}
+# Valid role values when status=true. "Unknown" is deliberately absent —
+# it must never be produced by this module.
+VALID_ROLES = {"LP", "ALP", "BOTH", "AMBIGUOUS"}
 
 
 class VerificationTimeoutError(RuntimeError):
@@ -99,46 +107,115 @@ class OllamaConnectionError(RuntimeError):
 
 # ── Ollama call ───────────────────────────────────────────────────────────
 
-def _call_ollama(prompt_text: str, image_bgr: np.ndarray) -> str:
-    """Blocking Ollama chat call with a hard timeout. Frame is passed as
-    JPEG-encoded bytes so no temp file needs to be written to disk."""
+def _call_ollama(prompt_text: str, image_bgr: np.ndarray, log_label: str = "") -> str:
+    """Blocking Ollama chat call with a hard timeout.
+
+    Frame is written to a temp JPEG and passed as a file PATH (not raw
+    bytes) — passing bytes directly was found to be handled unreliably by
+    some `ollama` python client versions, degrading what the model
+    actually saw. A file path matches the known-working reference
+    behaviour of the standalone verify.py test tool.
+    """
     import cv2
+    import os
+    import tempfile
     from ollama import Client
 
-    ok, buf = cv2.imencode(".jpg", image_bgr)
-    if not ok:
-        raise ValueError("Failed to JPEG-encode frame for LLM verification")
-    image_bytes = buf.tobytes()
+    fd, tmp_path = tempfile.mkstemp(suffix=".jpg", prefix="llmverify_")
+    os.close(fd)
+    try:
+        ok = cv2.imwrite(tmp_path, image_bgr)
+        if not ok:
+            raise ValueError("Failed to JPEG-encode frame for LLM verification")
 
-    client = Client(host=OLLAMA_HOST) if OLLAMA_HOST else Client()
+        print(f"[llm_verifier] Calling Ollama model={OLLAMA_MODEL!r} "
+              f"host={OLLAMA_HOST or 'default(127.0.0.1:11434)'} "
+              f"label={log_label!r} image={tmp_path} "
+              f"size={os.path.getsize(tmp_path)}B")
 
-    def _do_call() -> str:
-        response = client.chat(
-            model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt_text, "images": [image_bytes]}],
-            options={"temperature": OLLAMA_TEMPERATURE},
-        )
+        client = Client(host=OLLAMA_HOST) if OLLAMA_HOST else Client()
+
+        def _do_call() -> str:
+            response = client.chat(
+                model=OLLAMA_MODEL,
+                messages=[{"role": "user", "content": prompt_text, "images": [tmp_path]}],
+                options={"temperature": OLLAMA_TEMPERATURE},
+            )
+            try:
+                return response["message"]["content"]
+            except (TypeError, KeyError):
+                return response.message.content  # type: ignore[union-attr]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_do_call)
+            try:
+                raw = future.result(timeout=OLLAMA_TIMEOUT_SECONDS)
+                print(f"[llm_verifier] RAW response for {log_label!r}: {raw!r}")
+                return raw
+            except concurrent.futures.TimeoutError as exc:
+                raise VerificationTimeoutError(
+                    f"Model call exceeded {OLLAMA_TIMEOUT_SECONDS}s"
+                ) from exc
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "connect" in msg or "connection" in msg:
+                    raise OllamaConnectionError(str(exc)) from exc
+                raise
+    finally:
         try:
-            return response["message"]["content"]
-        except (TypeError, KeyError):
-            return response.message.content  # type: ignore[union-attr]
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_do_call)
-        try:
-            return future.result(timeout=OLLAMA_TIMEOUT_SECONDS)
-        except concurrent.futures.TimeoutError as exc:
-            raise VerificationTimeoutError(
-                f"Model call exceeded {OLLAMA_TIMEOUT_SECONDS}s"
-            ) from exc
-        except Exception as exc:
-            msg = str(exc).lower()
-            if "connect" in msg or "connection" in msg:
-                raise OllamaConnectionError(str(exc)) from exc
-            raise
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
-# ── Response parsing (mirrors the standalone verify.py safe_parse logic) ────
+# ── Response parsing ─────────────────────────────────────────────────────
+#
+# Expected schema from prompt.py:
+#   {"status": true|false, "role": "LP"|"ALP"|"BOTH"|"AMBIGUOUS"|null}
+#
+# This parser is defensive against older/partial model output (e.g. a
+# stray "verified" key from prompt drift, "Unknown"/legacy role strings)
+# so a mid-rollout model hiccup degrades safely rather than crashing.
+
+_LEGACY_ROLE_MAP = {
+    # Back-compat normalization only — never produced going forward, but
+    # if the model (or a stale cached prompt) ever emits one of these,
+    # map it to the new vocabulary instead of leaking "Unknown"/old labels
+    # into the payload.
+    "loco pilot":           "LP",
+    "assistant loco pilot": "ALP",
+    "unknown":              "AMBIGUOUS",
+    "ambiguous":            "AMBIGUOUS",
+    "both":                 "BOTH",
+    "lp":                   "LP",
+    "alp":                  "ALP",
+}
+
+
+def _normalize_role(raw_role, status: bool) -> Optional[str]:
+    """
+    Enforce the hard schema rules regardless of what the model returned:
+      - status is False  → role is ALWAYS None.
+      - status is True   → role is ALWAYS one of VALID_ROLES; anything
+        else (missing, null, "Unknown", unrecognized string) becomes
+        "AMBIGUOUS" — never "Unknown".
+    """
+    if not status:
+        return None
+
+    if raw_role is None:
+        return "AMBIGUOUS"
+
+    role_str = str(raw_role).strip()
+    if role_str.upper() in VALID_ROLES:
+        return role_str.upper()
+
+    mapped = _LEGACY_ROLE_MAP.get(role_str.strip().lower())
+    if mapped:
+        return mapped
+
+    return "AMBIGUOUS"
+
 
 def _safe_parse(raw_text: str) -> Optional[dict]:
     text = (raw_text or "").strip()
@@ -164,29 +241,21 @@ def _safe_parse(raw_text: str) -> Optional[dict]:
         return None
 
     try:
-        verified = bool(data.get("verified", False))
+        # Accept "status" (current schema) with a fallback to a stray
+        # "verified" key in case of prompt/model drift during rollout.
+        if "status" in data:
+            status = bool(data.get("status", False))
+        else:
+            status = bool(data.get("verified", False))
 
-        role = data.get("role", "Unknown")
-        if role not in VALID_ROLES:
-            role = "Unknown"
-        if not verified:
-            role = "Unknown"
+        role = _normalize_role(data.get("role"), status)
 
-        try:
-            confidence = int(data.get("confidence", 0))
-        except (TypeError, ValueError):
-            confidence = 0
-        confidence = max(0, min(100, confidence))
-        if not verified:
-            confidence = 0
-
-        reason = str(data.get("reason", "")).strip() or "No reason provided."
+        reason = str(data.get("reason", "")).strip()  # debug-only, not sent downstream
 
         return {
-            "verified":   verified,
-            "role":       role,
-            "confidence": confidence,
-            "reason":     reason,
+            "status": status,
+            "role":   role,
+            "reason": reason,
         }
     except Exception:
         return None
@@ -200,27 +269,27 @@ def verify_frame(image_bgr: np.ndarray, event_type: str, log_label: str = "") ->
 
     Returns a dict:
         {
-          "verified":   bool,
-          "role":       "Loco Pilot" | "Assistant Loco Pilot" | "Unknown",
-          "confidence": int 0-100,
-          "reason":     str,
-          "skipped":    bool,   # True if this event_type has no defined LLM
-                                 # verification criteria, or verification is
-                                 # disabled — verified is always True in that
-                                 # case (unverified pass-through, unchanged
-                                 # pipeline behaviour).
+          "status":  bool,             # True = genuine violation, False = rejected
+          "role":    str | None,       # "LP" | "ALP" | "BOTH" | "AMBIGUOUS" when
+                                        # status=True; ALWAYS None when status=False.
+                                        # Never "Unknown".
+          "reason":  str,              # debug-only, not sent to the Java backend
+          "skipped": bool,             # True if this event_type has no defined LLM
+                                        # verification criteria, or verification is
+                                        # disabled — unverified pass-through, unchanged
+                                        # legacy pipeline behaviour for those types.
         }
     """
     if not LLM_VERIFICATION_ENABLED:
         return {
-            "verified": True, "role": "Unknown", "confidence": 0,
+            "status": True, "role": "AMBIGUOUS",
             "reason": "LLM verification disabled by config.", "skipped": True,
         }
 
     candidate_violation = EVENT_TYPE_TO_PROMPT_VIOLATION.get((event_type or "").lower())
     if candidate_violation is None:
         return {
-            "verified": True, "role": "Unknown", "confidence": 0,
+            "status": True, "role": "AMBIGUOUS",
             "reason": f"No LLM verification criteria defined for event_type={event_type!r}.",
             "skipped": True,
         }
@@ -231,7 +300,7 @@ def verify_frame(image_bgr: np.ndarray, event_type: str, log_label: str = "") ->
     last_error: Optional[Exception] = None
     for attempt in range(1, OLLAMA_MAX_RETRIES + 2):
         try:
-            raw_text = _call_ollama(prompt_text, image_bgr)
+            raw_text = _call_ollama(prompt_text, image_bgr, log_label=log_label)
             break
         except Exception as exc:
             last_error = exc
@@ -239,37 +308,48 @@ def verify_frame(image_bgr: np.ndarray, event_type: str, log_label: str = "") ->
                 "LLM verify attempt %d/%d failed for %s (%s): %s",
                 attempt, OLLAMA_MAX_RETRIES + 1, log_label, candidate_violation, exc,
             )
+            print(f"[llm_verifier] attempt {attempt}/{OLLAMA_MAX_RETRIES + 1} "
+                  f"FAILED for {log_label!r} ({candidate_violation}): {exc}")
 
     if raw_text is None:
         fail_open = LLM_VERIFICATION_FAIL_OPEN
+        status = fail_open
+        role = "AMBIGUOUS" if fail_open else None
+        print(f"[llm_verifier] UNAVAILABLE for {log_label!r} ({candidate_violation}) "
+              f"after retries: {last_error} — "
+              f"{'failing OPEN (status=True, role=AMBIGUOUS)' if fail_open else 'failing CLOSED (status=False, role=None)'}")
         log.error(
             "LLM verification unavailable for %s (%s) after retries: %s — %s",
             log_label, candidate_violation, last_error,
-            "failing OPEN (kept, unverified)" if fail_open else "failing CLOSED (rejected)",
+            "failing OPEN" if fail_open else "failing CLOSED",
         )
         return {
-            "verified":   fail_open,
-            "role":       "Unknown",
-            "confidence": 0,
-            "reason":     f"LLM verification unavailable: {last_error}",
-            "skipped":    False,
+            "status":  status,
+            "role":    role,
+            "reason":  f"LLM verification unavailable: {last_error}",
+            "skipped": False,
         }
 
     parsed = _safe_parse(raw_text)
     if parsed is None:
         fail_open = LLM_VERIFICATION_FAIL_OPEN
+        status = fail_open
+        role = "AMBIGUOUS" if fail_open else None
+        print(f"[llm_verifier] UNPARSEABLE JSON for {log_label!r} ({candidate_violation}) — "
+              f"{'failing OPEN' if fail_open else 'failing CLOSED'}. Raw: {raw_text!r}")
         log.warning(
             "LLM returned unparseable JSON for %s (%s) — %s",
             log_label, candidate_violation,
-            "failing OPEN" if fail_open else "failing CLOSED (rejected)",
+            "failing OPEN" if fail_open else "failing CLOSED",
         )
         return {
-            "verified":   fail_open,
-            "role":       "Unknown",
-            "confidence": 0,
-            "reason":     "Model response could not be parsed as valid JSON.",
-            "skipped":    False,
+            "status":  status,
+            "role":    role,
+            "reason":  "Model response could not be parsed as valid JSON.",
+            "skipped": False,
         }
 
     parsed["skipped"] = False
+    print(f"[llm_verifier] PARSED verdict for {log_label!r} "
+          f"(candidate={candidate_violation}): {parsed}")
     return parsed

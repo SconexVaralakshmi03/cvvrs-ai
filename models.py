@@ -2670,22 +2670,28 @@ class ViolationResult:
 
     frame_paths:                List[str] = field(default_factory=list)
 
-    # NEW — additive: LLM verification outcome.
+    # LLM verification outcome (two-step verify-then-identify flow, see
+    # prompt.py / llm_verifier.py):
     #   status = True  → the LLM verified this candidate as a genuine violation.
     #   status = False → the LLM rejected this candidate (false positive).
-    # Rejected violations are still included in the payload (with status
-    # False) so the backend has a full record of every candidate that was
-    # checked — their frame is never uploaded to S3, and role is null.
-    status:                      bool = True
+    # Every violation — verified AND rejected — is included in the
+    # completion payload, and its frame is uploaded to S3 either way, so
+    # the backend has the evidence image alongside the outcome for every
+    # candidate that was checked. Default is fail-CLOSED (False) rather
+    # than an optimistic True — a violation only reads True once a
+    # genuine verified LLM verdict was actually applied.
+    status:                      bool = False
 
-    # NEW — who was performing the violation, as determined by the LLM
+    # Who was performing the violation, as determined by the LLM
     # verification step (analyzer.py + llm_verifier.py):
-    #   "Loco Pilot" | "Assistant Loco Pilot"  → identified crew member (status=True)
-    #   "BOTH"                                  → SEAT_ABSENCE, verified (status=True)
-    #   "Unknown"                               → verified but LLM could not
-    #                                              identify who (status=True)
-    #   None (null)                             → violation rejected (status=False)
-    role:                        Optional[str] = "Unknown"
+    #   "LP"        → identified as the Loco Pilot            (status=True)
+    #   "ALP"       → identified as the Assistant Loco Pilot   (status=True)
+    #   "BOTH"      → SEAT_ABSENCE, verified — nobody in seat  (status=True)
+    #   "AMBIGUOUS" → verified, but identity could not be      (status=True)
+    #                 determined (occlusion / poor visibility / angle)
+    #   None (null) → violation rejected                       (status=False)
+    # "Unknown" is never produced anywhere in this pipeline.
+    role:                        Optional[str] = None
 
     def to_dict(self) -> dict:
 

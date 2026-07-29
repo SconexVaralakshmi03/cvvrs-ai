@@ -15437,18 +15437,19 @@ class _Violation:
     true_start_timestamp: Optional[float] = None
     true_end_timestamp:   Optional[float] = None
     true_duration:        Optional[float] = None
-    # NEW — additive: filled in by the LLM verification step in analyzer.py
-    # (llm_verifier.verify_frame()) after dedup/merge.
-    #   "Loco Pilot" | "Assistant Loco Pilot" → identified crew member
-    #   "BOTH"                                 → SEAT_ABSENCE, verified
-    #   "Unknown"                              → verified, LLM couldn't tell
-    #   None                                    → rejected (status=False)
-    role:                  Optional[str]  = "Unknown"
-    # NEW — additive: LLM verification outcome. True = verified (genuine
-    # violation), False = rejected (false positive). Rejected violations
-    # still flow through to the completion payload (with status=False,
-    # role=None) but their frame is never uploaded to S3.
-    status:                bool           = True
+    # LLM verification outcome — filled in by the LLM verification step in
+    # analyzer.py (llm_verifier.verify_frame() → _apply_llm_verdict())
+    # after dedup/merge:
+    #   status=True,  role="LP" | "ALP" | "BOTH" | "AMBIGUOUS" → verified
+    #   status=False, role=None                                 → rejected
+    # Defaults are fail-CLOSED (status=False, role=None) rather than an
+    # optimistic True/"Unknown" — a violation that for any reason never
+    # actually reaches the LLM (e.g. its source video/frame couldn't be
+    # located at all) must NOT silently read as an unverified "true" in
+    # the completion payload / DB. It only becomes True once a genuine
+    # verified verdict is applied.
+    role:                  Optional[str]  = None
+    status:                bool           = False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
