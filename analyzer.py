@@ -25772,6 +25772,48 @@ def _hms_to_seconds(hms: str) -> float:
 
 # ── Main entry point ──────────────────────────────────────────────────────────
 
+def _apply_llm_verdict(v, verdict: dict) -> None:
+    """
+    Apply an llm_verifier.verify_frame() verdict to a _Violation object,
+    setting v.status and v.role. These two fields flow straight through
+    into the outbound ViolationResult ("status" / "role" in the completion
+    payload sent to the Java backend) — see models.py.
+
+    Rules:
+      • skipped (event_type has no LLM criteria defined, or verification
+        is disabled) → status=True, role="Unknown" (unchanged pass-through
+        behaviour — this candidate was never sent to the LLM at all).
+      • rejected     → status=False, role=None.
+      • verified     → status=True.
+            - SEAT_ABSENCE → role="BOTH" (nobody in the driving position,
+              so both LP and ALP are absent — regardless of what the LLM
+              put in its own role field, which prompt.py always forces to
+              "Unknown" for this violation type since role isn't visually
+              determinable when the cabin is empty).
+            - all other types → role = whatever the LLM determined
+              ("Loco Pilot" / "Assistant Loco Pilot" / "Unknown").
+
+    NOTE: the frame is uploaded to S3 (and framePaths populated) in every
+    case — verified AND rejected — so the Java backend gets the evidence
+    image alongside status=False for rejected candidates too.
+    """
+    if verdict["skipped"]:
+        v.status = True
+        v.role   = "Unknown"
+        return
+
+    if not verdict["verified"]:
+        v.status = False
+        v.role   = None
+        return
+
+    v.status = True
+    if (v.type or "").lower() == "seat_absence":
+        v.role = "BOTH"
+    else:
+        v.role = verdict["role"]
+
+
 def _build_partial_video_result(job_id: str, vj, db_filename: str, meta: dict,
                                   shared_vstore) -> dict | None:
     """
@@ -25808,6 +25850,7 @@ def _build_partial_video_result(job_id: str, vj, db_filename: str, meta: dict,
                 "timestamp":              journey_ts,
                 "originalVideoTimestamp": local_ts,
                 "framePaths":             [],
+                "status":                 getattr(v, "status", True),
                 "role":                   getattr(v, "role", "Unknown"),
             })
         return {
@@ -26211,17 +26254,17 @@ def analyze_journey(
     }
 
     # NEW — LLM verification gate (Qwen2.5-VL via Ollama, see
-    # llm_verifier.py / prompt.py). Inserted right before each case's
-    # existing upload_frame()/upload_frame_from_path() call:
-    #   • REJECTED  → the frame is never uploaded to S3, and the violation
-    #                 is flagged (v.llm_rejected = True) so it is filtered
-    #                 out below before ViolationResult objects are built —
-    #                 it never reaches the completion payload / DB.
-    #   • VERIFIED  → v.role is set from the LLM's Loco Pilot / Assistant
-    #                 Loco Pilot / Unknown determination, and the existing
-    #                 upload proceeds exactly as before.
-    # Everything else about Cases 1/2/3 below (how the frame is located)
-    # is unchanged.
+    # llm_verifier.py / prompt.py). Runs right before each case's existing
+    # upload_frame()/upload_frame_from_path() call to set v.status / v.role
+    # via _apply_llm_verdict():
+    #   • REJECTED  → v.status=False, v.role=None.
+    #   • VERIFIED  → v.status=True, v.role set from the LLM's
+    #                 determination ("BOTH" for SEAT_ABSENCE; otherwise
+    #                 Loco Pilot / Assistant Loco Pilot / Unknown).
+    # The frame is uploaded to S3 in BOTH cases — rejected candidates still
+    # get a framePath so the backend has the evidence image alongside
+    # status=False. Everything else about Cases 1/2/3 below (how the frame
+    # is located) is unchanged.
     n_llm_verified = 0
     n_llm_rejected = 0
     n_llm_skipped  = 0
@@ -26233,18 +26276,16 @@ def analyze_journey(
             frame_img = v.annotated_frame
 
             verdict = llm_verifier.verify_frame(frame_img, v.type, log_label=filename)
+            _apply_llm_verdict(v, verdict)
+
             if verdict["skipped"]:
                 n_llm_skipped += 1
-            elif not verdict["verified"]:
+            elif verdict["verified"]:
+                n_llm_verified += 1
+            else:
                 n_llm_rejected += 1
                 print(f"[Analyzer:{job_id}]  LLM REJECTED violation "
                       f"(type={v.type} file={filename}): {verdict['reason']}")
-                v.llm_rejected     = True
-                v.annotated_frame = None
-                continue
-            else:
-                n_llm_verified += 1
-            v.role = verdict["role"]
 
             try:
                 s3_key            = upload_frame(frame_img, journey_id,
@@ -26270,17 +26311,16 @@ def analyze_journey(
                 else:
                     verdict = llm_verifier.verify_frame(frame_img, v.type, log_label=local_path)
 
+                _apply_llm_verdict(v, verdict)
+
                 if verdict["skipped"]:
                     n_llm_skipped += 1
-                elif not verdict["verified"]:
+                elif verdict["verified"]:
+                    n_llm_verified += 1
+                else:
                     n_llm_rejected += 1
                     print(f"[Analyzer:{job_id}]  LLM REJECTED violation "
                           f"(type={v.type} file={local_path}): {verdict['reason']}")
-                    v.llm_rejected = True
-                    continue
-                else:
-                    n_llm_verified += 1
-                v.role = verdict["role"]
 
                 try:
                     s3_key       = upload_frame_from_path(local_path, journey_id,
@@ -26327,17 +26367,16 @@ def analyze_journey(
         filename = _frame_filename(v)
 
         verdict = llm_verifier.verify_frame(frame_img, v.type, log_label=filename)
+        _apply_llm_verdict(v, verdict)
+
         if verdict["skipped"]:
             n_llm_skipped += 1
-        elif not verdict["verified"]:
+        elif verdict["verified"]:
+            n_llm_verified += 1
+        else:
             n_llm_rejected += 1
             print(f"[Analyzer:{job_id}]  LLM REJECTED violation "
                   f"(type={v.type} file={filename}): {verdict['reason']}")
-            v.llm_rejected = True
-            continue
-        else:
-            n_llm_verified += 1
-        v.role = verdict["role"]
 
         try:
             s3_key       = upload_frame(frame_img, journey_id,
@@ -26346,20 +26385,18 @@ def analyze_journey(
         except Exception as exc:
             print(f"[Analyzer:{job_id}]  Extracted frame upload failed ({filename}): {exc}")
 
-    # ── Drop every LLM-rejected violation ─────────────────────────────────────
-    # Must happen before ViolationResult objects are built below: a rejected
-    # candidate's frame was never uploaded to S3 above, and it must not appear
-    # in the completion payload sent to the Java backend (i.e. never reaches
-    # the DB either).
-    _n_before_llm_filter = len(shared_vstore._violations)
-    shared_vstore._violations = [
-        v for v in shared_vstore._violations if not getattr(v, "llm_rejected", False)
-    ]
+    # ── LLM verification summary ────────────────────────────────────────────
+    # Rejected violations are NOT dropped from shared_vstore._violations —
+    # they flow through into the ViolationResult list below with
+    # status=False / role=None, but (unlike an earlier version of this
+    # gate) their frame IS still uploaded to S3 above, so framePaths is
+    # populated for rejected candidates too, giving the Java backend the
+    # evidence image alongside status=False.
     print(
         f"[Analyzer:{job_id}]  LLM verification summary: "
         f"verified={n_llm_verified}  rejected={n_llm_rejected}  "
         f"skipped(no-criteria/disabled)={n_llm_skipped}  "
-        f"kept={len(shared_vstore._violations)}/{_n_before_llm_filter}"
+        f"total={len(shared_vstore._violations)}"
     )
 
     # ── Build VideoResult / ViolationResult objects ───────────────────────────
@@ -26399,6 +26436,7 @@ def analyze_journey(
                         else getattr(v, "true_duration", None)
                     ),
                     frame_paths              = [v.frame_path] if v.frame_path else [],
+                    status                   = getattr(v, "status", True),
                     role                     = getattr(v, "role", "Unknown"),
 
                 )

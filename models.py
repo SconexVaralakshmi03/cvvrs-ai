@@ -2670,12 +2670,22 @@ class ViolationResult:
 
     frame_paths:                List[str] = field(default_factory=list)
 
-    # NEW — additive: who was performing the violation, as determined by
-    # the LLM verification step (analyzer.py + llm_verifier.py). One of
-    # "Loco Pilot" | "Assistant Loco Pilot" | "Unknown". Every violation
-    # reaching this point has already been verified by the LLM (rejected
-    # candidates never make it this far), so this is always populated.
-    role:                        str = "Unknown"
+    # NEW — additive: LLM verification outcome.
+    #   status = True  → the LLM verified this candidate as a genuine violation.
+    #   status = False → the LLM rejected this candidate (false positive).
+    # Rejected violations are still included in the payload (with status
+    # False) so the backend has a full record of every candidate that was
+    # checked — their frame is never uploaded to S3, and role is null.
+    status:                      bool = True
+
+    # NEW — who was performing the violation, as determined by the LLM
+    # verification step (analyzer.py + llm_verifier.py):
+    #   "Loco Pilot" | "Assistant Loco Pilot"  → identified crew member (status=True)
+    #   "BOTH"                                  → SEAT_ABSENCE, verified (status=True)
+    #   "Unknown"                               → verified but LLM could not
+    #                                              identify who (status=True)
+    #   None (null)                             → violation rejected (status=False)
+    role:                        Optional[str] = "Unknown"
 
     def to_dict(self) -> dict:
 
@@ -2701,6 +2711,8 @@ class ViolationResult:
             ),
 
             "framePaths":             self.frame_paths,
+
+            "status":                 self.status,
 
             "role":                   self.role,
 
