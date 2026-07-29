@@ -99,43 +99,65 @@ class OllamaConnectionError(RuntimeError):
 
 # ── Ollama call ───────────────────────────────────────────────────────────
 
-def _call_ollama(prompt_text: str, image_bgr: np.ndarray) -> str:
-    """Blocking Ollama chat call with a hard timeout. Frame is passed as
-    JPEG-encoded bytes so no temp file needs to be written to disk."""
+def _call_ollama(prompt_text: str, image_bgr: np.ndarray, log_label: str = "") -> str:
+    """Blocking Ollama chat call with a hard timeout.
+
+    Frame is written to a temp JPEG and passed as a file PATH (not raw
+    bytes) — this matches the standalone verify.py tool exactly, which is
+    the known-working reference implementation. Some versions of the
+    `ollama` python client handle raw bytes for `images` less reliably
+    than a path, which can degrade what the model actually sees.
+    """
     import cv2
+    import os
+    import tempfile
     from ollama import Client
 
-    ok, buf = cv2.imencode(".jpg", image_bgr)
-    if not ok:
-        raise ValueError("Failed to JPEG-encode frame for LLM verification")
-    image_bytes = buf.tobytes()
+    fd, tmp_path = tempfile.mkstemp(suffix=".jpg", prefix="llmverify_")
+    os.close(fd)
+    try:
+        ok = cv2.imwrite(tmp_path, image_bgr)
+        if not ok:
+            raise ValueError("Failed to JPEG-encode frame for LLM verification")
 
-    client = Client(host=OLLAMA_HOST) if OLLAMA_HOST else Client()
+        print(f"[llm_verifier] Calling Ollama model={OLLAMA_MODEL!r} "
+              f"host={OLLAMA_HOST or 'default(127.0.0.1:11434)'} "
+              f"label={log_label!r} image={tmp_path} "
+              f"size={os.path.getsize(tmp_path)}B")
 
-    def _do_call() -> str:
-        response = client.chat(
-            model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt_text, "images": [image_bytes]}],
-            options={"temperature": OLLAMA_TEMPERATURE},
-        )
+        client = Client(host=OLLAMA_HOST) if OLLAMA_HOST else Client()
+
+        def _do_call() -> str:
+            response = client.chat(
+                model=OLLAMA_MODEL,
+                messages=[{"role": "user", "content": prompt_text, "images": [tmp_path]}],
+                options={"temperature": OLLAMA_TEMPERATURE},
+            )
+            try:
+                return response["message"]["content"]
+            except (TypeError, KeyError):
+                return response.message.content  # type: ignore[union-attr]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_do_call)
+            try:
+                raw = future.result(timeout=OLLAMA_TIMEOUT_SECONDS)
+                print(f"[llm_verifier] RAW response for {log_label!r}: {raw!r}")
+                return raw
+            except concurrent.futures.TimeoutError as exc:
+                raise VerificationTimeoutError(
+                    f"Model call exceeded {OLLAMA_TIMEOUT_SECONDS}s"
+                ) from exc
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "connect" in msg or "connection" in msg:
+                    raise OllamaConnectionError(str(exc)) from exc
+                raise
+    finally:
         try:
-            return response["message"]["content"]
-        except (TypeError, KeyError):
-            return response.message.content  # type: ignore[union-attr]
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_do_call)
-        try:
-            return future.result(timeout=OLLAMA_TIMEOUT_SECONDS)
-        except concurrent.futures.TimeoutError as exc:
-            raise VerificationTimeoutError(
-                f"Model call exceeded {OLLAMA_TIMEOUT_SECONDS}s"
-            ) from exc
-        except Exception as exc:
-            msg = str(exc).lower()
-            if "connect" in msg or "connection" in msg:
-                raise OllamaConnectionError(str(exc)) from exc
-            raise
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 # ── Response parsing (mirrors the standalone verify.py safe_parse logic) ────
@@ -231,7 +253,7 @@ def verify_frame(image_bgr: np.ndarray, event_type: str, log_label: str = "") ->
     last_error: Optional[Exception] = None
     for attempt in range(1, OLLAMA_MAX_RETRIES + 2):
         try:
-            raw_text = _call_ollama(prompt_text, image_bgr)
+            raw_text = _call_ollama(prompt_text, image_bgr, log_label=log_label)
             break
         except Exception as exc:
             last_error = exc
@@ -272,4 +294,6 @@ def verify_frame(image_bgr: np.ndarray, event_type: str, log_label: str = "") ->
         }
 
     parsed["skipped"] = False
+    print(f"[llm_verifier] PARSED verdict for {log_label!r} "
+          f"(candidate={candidate_violation}): {parsed}")
     return parsed
