@@ -68,41 +68,66 @@ Non-negotiable rules:
 _ROLE_RULES = """
 Role identification (only if verified = true):
 
-The cabin normally has two crew positions: the Loco Pilot (LP), who is
-seated in the primary driving seat with direct hands-on access to the
-throttle/brake handle and the main control console, and the Assistant Loco
-Pilot (ALP), who occupies the secondary seat/position and does not operate
-the controls.
+Before assigning a role, first determine who is operating the locomotive.
+The role must be identified independently from the violation itself.
 
-Being merely near the console, leaning over it, glancing at it, or
-standing beside it is NOT enough to be classified as Loco Pilot. Only the
-person who is:
-  - seated in the primary driving seat, AND
-  - positioned with their hand(s) on or immediately at the throttle/brake
-    handle in a driving posture (not just resting nearby),
-should be classified as "Loco Pilot".
+STEP 1 – Identify the Loco Pilot (LP)
 
-Any other crew member visible in the frame -- including someone standing,
-seated in the secondary seat, walking through the cabin, or interacting
-with anything other than the primary control console -- must be
-classified as "Assistant Loco Pilot".
+The Loco Pilot is the crew member who is clearly and visibly:
 
-Do NOT assume the person doing the flagged action (e.g. using a phone) is
-automatically the Loco Pilot just because they are the most visually
-prominent person in the frame, or because they are close to the panel.
-Judge role independently from seat position and control-handling posture,
-not from who happens to be committing the candidate violation.
+- Seated in the primary driving seat directly in front of the main driving console.
+- Facing the front windshield while operating the locomotive.
+- Actively controlling or immediately positioned to control the locomotive.
+- Having one or both hands on, or immediately adjacent to, the throttle, brake handle, or main driving controls.
+- Occupying the driver's position throughout the visible scene.
 
-If two or more people are present and you cannot clearly tell which one
-occupies the primary driving seat, OR if you cannot confidently match the
-flagged action to one specific person's seat position, set role to
-"Unknown". Never guess the role.
+Only this person should be classified as "Loco Pilot".
 
-If BOTH the Loco Pilot and the Assistant Loco Pilot are clearly and
-independently committing the SAME flagged violation at the same time
-(e.g. both are visibly holding/using a phone), set role to "Both".
-Only use "Both" when each person's involvement is independently clear —
-if there is any doubt about either person, set role to "Unknown" instead.
+STEP 2 – Identify the Assistant Loco Pilot (ALP)
+
+Any other crew member visible in the cabin who is NOT occupying the primary
+driving position must be classified as "Assistant Loco Pilot".
+
+This includes a crew member who is:
+
+- Sitting in the secondary seat.
+- Sitting beside or behind the driver.
+- Standing anywhere inside the cabin.
+- Walking inside the cabin.
+- Looking outside.
+- Holding a phone.
+- Sleeping.
+- Performing any other activity away from the primary driving controls.
+
+The activity being performed DOES NOT determine the role.
+
+STEP 3 – Match the violation
+
+After identifying the LP and ALP, determine which person is committing
+the verified violation.
+
+If the violating person is the identified driver,
+role = "Loco Pilot".
+
+If the violating person is any other crew member,
+role = "Assistant Loco Pilot".
+
+If BOTH the Loco Pilot and Assistant Loco Pilot are clearly and independently
+committing the SAME verified violation simultaneously, set role = "Both".
+
+IMPORTANT RULES
+
+- Never assume the person closest to the camera is the Loco Pilot.
+- Never assume the largest or most prominent person in the image is the Loco Pilot.
+- Never assign the Loco Pilot role solely because a person is holding a phone,
+  appears drowsy, or is raising a hand.
+- Never infer the role based on the candidate violation.
+- Determine the driver's position first, then identify who committed the violation.
+- If the driver's position cannot be identified with high confidence, or if the
+  violating person cannot be confidently matched to either crew member,
+  set role = "Unknown".
+- False role assignments are unacceptable. When in doubt, return "Unknown"
+  instead of guessing.
 """.strip()
 
 
@@ -170,19 +195,41 @@ Reject (verified = false) if ANY of the following apply:
 _HAND_RAISING_CRITERIA = """
 Candidate violation to verify: HAND RAISING ON SIGNAL.
 
-Verify (verified = true) ONLY if ALL of the following are clearly true:
-- A hand is clearly raised.
-- The raised hand clearly belongs to the person being evaluated.
-- The gesture is clearly directed toward the front windshield (i.e. a
-  signal-acknowledgement gesture), not an incidental motion.
+This violation represents the standard railway signal acknowledgement
+gesture performed by a crew member while driving.
 
-Reject (verified = false) if the gesture instead looks like:
-- Stretching.
-- Scratching.
-- Adjusting hair.
-- Adjusting a cap.
-- A resting hand.
-- Any other uncertain or ambiguous pose.
+Verify (verified = true) ONLY if ALL of the following conditions are clearly
+visible in this single image:
+
+- At least ONE hand is clearly raised or intentionally extended toward the
+  front windshield / railway signal.
+- The raised hand clearly belongs to the person being evaluated.
+- The gesture is deliberate and appears to acknowledge an external railway
+  signal rather than interact with the locomotive controls.
+- The raised hand is clearly visible and distinguishable from normal driving
+  movements.
+
+A raised hand does NOT need to be above the person's head. A forward-raised
+or forward-extended arm directed toward the front windshield is sufficient
+provided it is clearly a signal acknowledgement gesture.
+
+Reject (verified = false) if ANY of the following apply:
+
+- The hand is resting on the control console.
+- The hand is holding or operating a lever, switch, throttle, brake, or
+  any locomotive control.
+- The arm movement appears to be part of normal driving operations.
+- The person is reaching for an object inside the cabin.
+- The gesture appears to be stretching, scratching, adjusting clothing,
+  adjusting hair, adjusting a cap, or any other non-signal action.
+- The raised hand is partially hidden, blurred, or not clearly visible.
+- The direction or purpose of the gesture cannot be confidently determined.
+- There is any reasonable ambiguity about whether the gesture is a railway
+  signal acknowledgement.
+
+False positives are unacceptable. If the gesture is not clearly identifiable
+as a railway signal acknowledgement from this single frame, reject the
+candidate (verified = false).
 """.strip()
 
 
