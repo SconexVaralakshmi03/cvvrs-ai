@@ -3105,6 +3105,8 @@ from __future__ import annotations
  
 import io
 
+import json
+
 import logging
 
 import os
@@ -3485,5 +3487,55 @@ def upload_text_log(
         Key         = s3_key,
         Body        = text.encode("utf-8"),
         ContentType = "text/plain; charset=utf-8",
+    )
+    return s3_key
+
+
+def upload_json_result(
+    payload:     dict,
+    folder_name: str,
+    filename:    str,
+) -> str:
+    """
+    Upload a JSON document (e.g. the full completion payload) directly
+    under the journey folder (NOT under /frames), e.g.:
+
+        <folderName>/<filename>
+
+    e.g. "journeys/104/2026-06-19/JRN-20260619-104-011E57/JOB-262B2786AC81_result.json"
+
+    Intended use: persist the exact JSON we are about to POST to the Java
+    backend to S3 first, so there is always an authoritative, immutable
+    record of what was sent — independent of whatever happens on the
+    backend/DB side afterwards (deserialization bugs, backend downtime,
+    retries that end up sending a mutated dict, etc).
+
+    Parameters
+    ──────────
+    payload     : JSON-serializable dict (e.g. completion_dict, the exact
+                  object about to be handed to send_completed()).
+    folder_name : Journey folder prefix, e.g.
+                  "journeys/104/2026-06-19/JRN-20260619-104-011E57".
+    filename    : e.g. "JOB-262B2786AC81_result.json" (will have .json
+                  appended if missing).
+
+    Returns the S3 key. Raises on failure — callers should catch and log,
+    since a failed upload here must never block the actual backend
+    callback from being sent.
+    """
+    if not filename.lower().endswith(".json"):
+        filename = f"{filename}.json"
+
+    s3_key = f"{folder_name.rstrip('/')}/{filename}"
+    bkt    = _bucket()
+
+    body = json.dumps(payload, indent=2, default=str).encode("utf-8")
+
+    print(f"[S3] Uploading JSON result  →  s3://{bkt}/{s3_key}  ({len(body)} bytes)")
+    _s3_client().put_object(
+        Bucket      = bkt,
+        Key         = s3_key,
+        Body        = body,
+        ContentType = "application/json; charset=utf-8",
     )
     return s3_key

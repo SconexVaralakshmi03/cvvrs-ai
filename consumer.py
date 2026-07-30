@@ -17212,7 +17212,7 @@ from callback_client import (
     finish_job,
 )
 from models import AnalysisJobMessage, CompletionPayload, VideoResult, ViolationResult
-from s3_service import download_video, upload_text_log
+from s3_service import download_video, upload_text_log, upload_json_result
 from journey_log import build_journey_log_text
 from resource_manager import resource_manager, memory_monitor
 
@@ -18003,6 +18003,18 @@ def _finalize_partial_journey_on_interruption(
     completion_dict = completion.to_dict()
     completion_dict["journeyStatus"] = journey_status
 
+    try:
+        json_key = upload_json_result(
+            payload     = completion_dict,
+            folder_name = folder_name,
+            filename    = f"{job_id}_result.json",
+        )
+        log.info("[Job %s]  Completion JSON result uploaded to S3 (partial-journey "
+                 "path): %s", job_id, json_key)
+    except Exception as exc:
+        log.warning("[Job %s]  Completion JSON result upload failed (non-fatal, "
+                    "callback will still be sent): %s", job_id, exc)
+
     # Notify the frontend of progress/status before the final callback too,
     # best-effort — mirrors the normal-path "Sending results to backend"
     # progress update so the UI doesn't appear stuck at whatever percentage
@@ -18286,6 +18298,20 @@ def _handle_job(
                 )
                 completion_dict = completion.to_dict()
                 completion_dict["journeyStatus"] = journey_status
+
+                try:
+                    json_key = upload_json_result(
+                        payload     = completion_dict,
+                        folder_name = folder_name,
+                        filename    = f"{job_id}_result.json",
+                    )
+                    log.info("[Job %s]  Completion JSON result uploaded to S3: %s",
+                             job_id, json_key)
+                except Exception as exc:
+                    log.warning("[Job %s]  Completion JSON result upload failed "
+                                "(non-fatal, callback will still be sent): %s",
+                                job_id, exc)
+
                 send_completed(completion_dict)
                 log.info(
                     "[Job %s]  Completion callback sent.  status=%s  failedVideos=%d",
