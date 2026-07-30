@@ -192,44 +192,52 @@ Reject (verified = false) if ANY of the following apply:
 """.strip()
 
 
-_HAND_RAISING_CRITERIA = """
+_HAND_RAISING_CRITERIA = _HAND_RAISING_CRITERIA = """
 Candidate violation to verify: HAND RAISING ON SIGNAL.
 
 This violation represents the standard railway signal acknowledgement
-gesture performed by a crew member while driving.
+performed by railway crew members.
 
-Verify (verified = true) ONLY if ALL of the following conditions are clearly
-visible in this single image:
+Verify (verified = true) if ALL of the following are clearly visible in this
+single image:
 
-- At least ONE hand is clearly raised or intentionally extended toward the
-  front windshield / railway signal.
-- The raised hand clearly belongs to the person being evaluated.
-- The gesture is deliberate and appears to acknowledge an external railway
-  signal rather than interact with the locomotive controls.
-- The raised hand is clearly visible and distinguishable from normal driving
-  movements.
+- At least one arm is raised or intentionally extended toward the front
+  windshield.
+- The raised or extended arm clearly belongs to the evaluated person.
+- The arm direction is consistent with acknowledging an external railway
+  signal.
+- The gesture is visually distinguishable from normal resting posture.
 
-A raised hand does NOT need to be above the person's head. A forward-raised
-or forward-extended arm directed toward the front windshield is sufficient
-provided it is clearly a signal acknowledgement gesture.
+A valid signal acknowledgement DOES NOT require:
 
-Reject (verified = false) if ANY of the following apply:
+- the hand to be above the head,
+- the elbow to be fully extended,
+- the entire hand or fingertips to be visible,
+- both hands to be raised.
 
-- The hand is resting on the control console.
-- The hand is holding or operating a lever, switch, throttle, brake, or
-  any locomotive control.
-- The arm movement appears to be part of normal driving operations.
-- The person is reaching for an object inside the cabin.
-- The gesture appears to be stretching, scratching, adjusting clothing,
-  adjusting hair, adjusting a cap, or any other non-signal action.
-- The raised hand is partially hidden, blurred, or not clearly visible.
-- The direction or purpose of the gesture cannot be confidently determined.
-- There is any reasonable ambiguity about whether the gesture is a railway
-  signal acknowledgement.
+It is acceptable if:
 
-False positives are unacceptable. If the gesture is not clearly identifiable
-as a railway signal acknowledgement from this single frame, reject the
-candidate (verified = false).
+- only one hand is raised,
+- one hand remains on the driving controls,
+- part of the raised hand extends outside the camera frame,
+- the fingertips are cropped but the arm direction is clearly visible.
+
+Reject (verified = false) only if:
+
+- there is no raised or forward-extended arm,
+- the arm is clearly resting,
+- the person is reaching for an object inside the cabin,
+- the movement is clearly unrelated to signal acknowledgement
+  (scratching, adjusting clothing, adjusting hair, stretching, etc.),
+- the arm direction cannot be determined because of severe blur or
+  occlusion,
+- there is insufficient visual evidence to distinguish the gesture.
+
+If the raised arm is clearly directed toward the front windshield,
+prefer verification rather than rejection.
+
+False positives should still be avoided, but do not reject solely because
+part of the hand or forearm lies outside the image boundary.
 """.strip()
 
 
