@@ -26289,6 +26289,16 @@ def analyze_journey(
                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
             else:
                 print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
+                # FIX — previously this branch left v.status / v.role on the
+                # bare _Violation dataclass defaults ("TRUE" / None) because
+                # verify_frame() was never called here, producing status=true
+                # with role=null in the completion payload. Tag it the same
+                # way the other "couldn't verify" branches in llm_verifier.py
+                # do: unverified pass-through, so role is never None while
+                # status is TRUE.
+                n_llm_skipped += 1
+                v.status = "TRUE"
+                v.role   = "AMBIGUOUS"
             continue
 
         # ── Case 3: no frame at all — seek into the correct source video ─────
@@ -26297,6 +26307,12 @@ def analyze_journey(
         if not tmp_path or not os.path.isfile(tmp_path):
             print(f"[Analyzer:{job_id}]  Cannot find source video for violation "
                   f"(source_filename={src_file!r}) — skipping frame extraction")
+            # FIX — see matching comment above: verify_frame() is never
+            # reached on this branch either, so tag status/role explicitly
+            # instead of leaving role=null on the dataclass default.
+            n_llm_skipped += 1
+            v.status = "TRUE"
+            v.role   = "AMBIGUOUS"
             continue
 
         # Use local_time_str (seconds within this video) to seek correctly.
@@ -26321,6 +26337,12 @@ def analyze_journey(
         if frame_img is None:
             print(f"[Analyzer:{job_id}]  Frame seek failed for {src_file} "
                   f"@ local_time={local_secs:.2f}s — skipping")
+            # FIX — see matching comment above: verify_frame() is never
+            # reached on this branch either, so tag status/role explicitly
+            # instead of leaving role=null on the dataclass default.
+            n_llm_skipped += 1
+            v.status = "TRUE"
+            v.role   = "AMBIGUOUS"
             continue
 
         filename = _frame_filename(v)
