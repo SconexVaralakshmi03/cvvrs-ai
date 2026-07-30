@@ -17504,6 +17504,19 @@ def _video_result_from_dict(vr: dict) -> VideoResult:
                 duration_seconds         = v.get("durationSeconds", 0.0),
                 trigger_duration_seconds = v.get("triggerDurationSeconds"),
                 frame_paths              = v.get("framePaths", []),
+                # FIX — status/role were never read here either, so they
+                # always fell back to the dataclass defaults ("TRUE" / None)
+                # on every result that crossed the subprocess boundary, even
+                # when the LLM verification step had already computed the
+                # real verdict (confirmed/rejected + LP/ALP/BOTH/None) in the
+                # child process. This is what was turning a correct
+                # status=FALSE / role=LP in the worker logs into
+                # status=true / role=null in the payload sent to Java.
+                # `status` crosses as a real JSON bool (see
+                # ViolationResult.to_dict()) — convert back to the "TRUE"/
+                # "FALSE" string the dataclass field stores internally.
+                status                    = "TRUE" if v.get("status", True) else "FALSE",
+                role                      = v.get("role"),
             )
             for v in vr.get("violations", [])
         ],
