@@ -15659,6 +15659,18 @@ class ViolationStore:
         self._deduplicate_by_frame()
         self._merge_by_time_window()
 
+        # NEW — additive: RSL Hand Brake post-verification (standalone/CLI
+        # mode counterpart of the same step in analyzer.py::analyze_journey).
+        # See detector/rsl_hand_brake_verifier.py for the full rationale.
+        # Runs only here, after dedup/merge have produced the final
+        # representative frame per confirmed hand_raise episode, and never
+        # per-frame. Non-fatal — a failure here never blocks the existing
+        # finalize() flow below.
+        try:
+            self._generate_rsl_hand_brake_violations()
+        except Exception as exc:
+            print(f"[ViolationStore] RSL Hand Brake verification step failed (non-fatal): {exc}")
+
         # Extract frames from every video in the batch (or the single video)
         for vi in self.video_infos:
             if vi and vi.get("videoPath"):
@@ -15677,6 +15689,110 @@ class ViolationStore:
             print(f"[ViolationStore] S3/DB upload failed (non-fatal): {exc}")
 
         return out_path
+
+    # NEW — additive: RSL Hand Brake post-verification ────────────────────────
+
+    def _generate_rsl_hand_brake_violations(self) -> None:
+        """
+        Standalone/CLI-mode counterpart of the RSL Hand Brake step in
+        analyzer.py::analyze_journey(). Not a standalone detector and never
+        called per-frame -- only from finalize(), after dedup/merge have
+        already produced the final representative frame for every confirmed
+        "hand_raise" violation.
+
+        For each such violation: reads a small +/-2 frame window around the
+        SAME already-selected frame from its source video (never a full
+        re-scan), re-derives pose landmarks for just those frames via the
+        existing HandRaisePoseEngine (imported, not modified), and -- if the
+        opposite hand is consistently on the RSL Hand Brake across that
+        window -- clones the exact same frame/timestamp/metadata into a new
+        "rsl_hand_brake" violation appended to self._violations. The clone
+        then flows through the existing extract_violation_frames() /
+        finalize() S3+DB upload path completely unmodified, exactly like
+        every other violation.
+        """
+        import dataclasses as _dc
+
+        # Match on `events` (not just `type`) — a hand_raise violation can
+        # end up merged with another violation type that happened within
+        # the same MERGE_WINDOW, in which case v.type is whichever event
+        # came first but "hand_raise" is still present in v.events.
+        hand_raise_violations = [v for v in self._violations if "hand_raise" in v.events]
+        if not hand_raise_violations:
+            return
+
+        # Map source_filename -> local video path from the video_infos this
+        # store already knows about (standalone mode: one entry; batch mode
+        # is handled instead by analyzer.py's own copy of this step).
+        path_by_filename: Dict[str, str] = {}
+        for vi in self.video_infos:
+            vp = vi.get("videoPath") if vi else None
+            if vp:
+                path_by_filename[os.path.basename(vp)] = vp
+
+        if not path_by_filename:
+            return
+
+        from detector.hand_raise_detector import HandRaisePoseEngine
+        from detector.rsl_hand_brake_verifier import extract_frame_window, verify_rsl_hand_brake
+
+        engine = HandRaisePoseEngine()
+        new_violations: List[_Violation] = []
+
+        try:
+            for v in hand_raise_violations:
+                src_file   = os.path.basename(getattr(v, "source_filename", "") or "")
+                video_path = path_by_filename.get(src_file)
+                if not video_path or not os.path.isfile(video_path):
+                    continue
+
+                cap = cv2.VideoCapture(video_path)
+                fps = (cap.get(cv2.CAP_PROP_FPS) or 25.0) if cap.isOpened() else 25.0
+                cap.release()
+
+                local_str = getattr(v, "local_time_str", "0:00:00")
+                try:
+                    parts      = local_str.strip().split(":")
+                    local_secs = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+                except Exception:
+                    local_secs = 0.0
+
+                frames       = extract_frame_window(video_path, local_secs, fps)
+                center_frame = frames[len(frames) // 2] if frames else None
+                if center_frame is None:
+                    print(f"[ViolationStore] RSL verify: could not read the "
+                          f"selected hand_raise frame for {src_file} @ {local_secs:.2f}s -- skipping")
+                    continue
+
+                frame_h, frame_w = center_frame.shape[:2]
+                verdict = verify_rsl_hand_brake(frames, engine, frame_w, frame_h)
+                print(f"[ViolationStore] RSL verify for hand_raise "
+                      f"frame_index={v.frame_index} src={src_file}: {verdict}")
+
+                if not verdict["confirmed"]:
+                    continue
+
+                new_violations.append(_dc.replace(
+                    v,
+                    type            = "rsl_hand_brake",
+                    events          = ["rsl_hand_brake"],
+                    confidence      = round(float(verdict["confidence"]), 3),
+                    factors         = list(set(list(v.factors) + ["rsl_hand_brake", "opposite_hand_on_brake"])),
+                    annotated_frame = center_frame.copy(),
+                    frame_path      = None,
+                    status          = "TRUE",
+                    role            = None,
+                ))
+        finally:
+            try:
+                engine.close()
+            except Exception:
+                pass
+
+        if new_violations:
+            self._violations.extend(new_violations)
+            print(f"[ViolationStore] RSL Hand Brake: {len(new_violations)} "
+                  f"additional violation(s) created from confirmed hand_raise frame(s).")
 
     # ── Private — deduplication & merging ────────────────────────────────────
 

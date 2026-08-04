@@ -25587,6 +25587,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import gc
 import json
 import logging
@@ -25721,6 +25722,11 @@ def _event_type_to_violation_type(event_type: str) -> str:
         "posture_alert":   "POSTURE_ALERT",
         "hand_to_ear":     "HAND_TO_EAR",
         "hand_raise":      "Hand Raise on signaling",
+        # NEW — additive: RSL Hand Brake post-verification (see
+        # detector/rsl_hand_brake_verifier.py). Only ever created alongside
+        # an already-confirmed "hand_raise" violation on the exact same
+        # frame, never on its own.
+        "rsl_hand_brake":  "RSL Hand Brake Held",
     }.get(event_type.lower(), event_type.upper())
 
 
@@ -26186,6 +26192,100 @@ def analyze_journey(
     # ── Dedup + merge ─────────────────────────────────────────────────────────
     shared_vstore._deduplicate_by_frame()
     shared_vstore._merge_by_time_window()
+
+    # ── NEW — additive: RSL Hand Brake post-verification ─────────────────────
+    # Runs ONLY here — after hand_rise_detector.py has already run over the
+    # complete video(s), and only after dedup/merge above have produced the
+    # FINAL, single representative frame per confirmed hand-raise episode.
+    # This is not a standalone detector and never runs per-frame.
+    #
+    # For every confirmed "hand_raise" violation, this:
+    #   1. re-reads a small ±2 frame window around the SAME already-selected
+    #      frame from the correct source video (never a full re-scan),
+    #   2. re-derives pose landmarks for just those <=5 frames via the
+    #      existing HandRaisePoseEngine (detector/hand_raise_detector.py,
+    #      imported/reused — not modified),
+    #   3. checks whether the OPPOSITE hand is consistently resting on the
+    #      fixed RSL Hand Brake console lever across that window, and
+    #   4. on success, clones the SAME frame/timestamp/journey/video
+    #      metadata into a new "rsl_hand_brake" violation.
+    #
+    # The clone is appended to shared_vstore._violations BEFORE the existing
+    # LLM-verification / frame-extraction / S3-upload loop below runs, so
+    # that loop — completely unmodified — persists/uploads it exactly the
+    # same way it already does for every other violation. Nothing here
+    # mutates the original hand_raise violation or any existing logic above.
+    try:
+        from detector.hand_raise_detector import HandRaisePoseEngine
+        from detector.rsl_hand_brake_verifier import extract_frame_window, verify_rsl_hand_brake
+
+        _rsl_path_by_filename: Dict[str, str] = {
+            os.path.basename(vj.s3_key): tmp_paths[vj.video_id] for vj in ordered
+        }
+        _rsl_fps_by_filename: Dict[str, float] = {
+            os.path.basename(vj.s3_key): meta_by_id.get(vj.video_id, {}).get("fps", 25.0)
+            for vj in ordered
+        }
+
+        _rsl_engine = HandRaisePoseEngine()
+        _rsl_new_violations = []
+
+        # Match on `events` (not just `type`) — a hand_raise violation can
+        # end up merged with another violation type that happened within
+        # the same MERGE_WINDOW, in which case v.type is whichever event
+        # came first but "hand_raise" is still present in v.events. This
+        # mirrors how close_violation_episode() already matches above.
+        for v in [v for v in shared_vstore._violations if "hand_raise" in v.events]:
+            src_file = getattr(v, "source_filename", "")
+            tmp_path = _rsl_path_by_filename.get(src_file, "")
+            if not tmp_path or not os.path.isfile(tmp_path):
+                continue
+
+            fps        = _rsl_fps_by_filename.get(src_file) or 25.0
+            local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
+
+            frames = extract_frame_window(tmp_path, local_secs, fps)
+            center_frame = frames[len(frames) // 2] if frames else None
+            if center_frame is None:
+                print(f"[Analyzer:{job_id}]  RSL verify: could not read the "
+                      f"selected hand_raise frame for {src_file} @ {local_secs:.2f}s — skipping")
+                continue
+
+            frame_h, frame_w = center_frame.shape[:2]
+            verdict = verify_rsl_hand_brake(frames, _rsl_engine, frame_w, frame_h)
+            print(f"[Analyzer:{job_id}]  RSL verify for hand_raise "
+                  f"frame_index={v.frame_index} src={src_file}: {verdict}")
+
+            if not verdict["confirmed"]:
+                continue
+
+            # Duplicate the exact same selected frame / timestamp / journey /
+            # video / metadata — only the type, events, factors, confidence
+            # and annotated_frame differ.
+            rsl_violation = dataclasses.replace(
+                v,
+                type            = "rsl_hand_brake",
+                events          = ["rsl_hand_brake"],
+                confidence      = round(float(verdict["confidence"]), 3),
+                factors         = list(set(list(v.factors) + ["rsl_hand_brake", "opposite_hand_on_brake"])),
+                annotated_frame = center_frame.copy(),
+                frame_path      = None,
+                status          = "TRUE",
+                role            = None,
+            )
+            _rsl_new_violations.append(rsl_violation)
+
+        if _rsl_new_violations:
+            shared_vstore._violations.extend(_rsl_new_violations)
+            print(f"[Analyzer:{job_id}]  RSL Hand Brake: {len(_rsl_new_violations)} "
+                  f"additional violation(s) created from confirmed hand_raise frame(s).")
+
+        try:
+            _rsl_engine.close()
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"[Analyzer:{job_id}]  RSL Hand Brake verification step failed (non-fatal): {exc}")
 
     # ── Extract frames + upload to S3 ───────────────────────────────────────
     #

@@ -375,6 +375,53 @@ HAND_RAISE_RAW_MISS_TOLERANCE       = 1
 # fully self-contained.
 HAND_RAISE_ZONE_SPLIT_RATIO         = 0.57
 
+# ── RSL Hand Brake post-verification (NEW — additive) ─────────────────────────
+# See detector/rsl_hand_brake_verifier.py. Runs ONLY after hand_raise has
+# already confirmed a violation and the pipeline has selected its final
+# representative frame — never on every frame, never a standalone detector.
+# Tuning is expressed relative to the pilot's own torso height (nose-to-hip
+# distance in the frame) so it scales with camera distance/resolution, the
+# same pattern HAND_RAISE_MARGIN_FRACTION already uses above.
+
+# Minimum landmark visibility (shoulder + wrist) to trust the opposite arm
+# at all in a given verification-window frame.
+RSL_BRAKE_VIS_THRESHOLD                = 0.5
+
+# The RSL Hand Brake console lever sits roughly between shoulder height and
+# a little below hip height. This fraction of torso height is allowed as
+# slack above the shoulder / below the hip when checking the opposite
+# wrist's vertical position.
+RSL_BRAKE_REGION_Y_MARGIN_FRACTION     = 0.20
+
+# Maximum horizontal distance (as a fraction of torso height) the opposite
+# wrist may sit from the body's own hip-center before it's considered too
+# far out to the side to be resting on the console in front of the pilot.
+RSL_BRAKE_REGION_X_FRACTION            = 0.55
+
+# Of the up to 5 frames in the verification window, how many must have
+# usable (non-occluded) landmarks at all before a decision is made.
+RSL_BRAKE_MIN_VALID_FRAMES             = 3
+
+# ...and, of those valid frames, how many must individually pass the
+# region check.
+RSL_BRAKE_MIN_PASS_FRAMES              = 3
+
+# Minimum fraction of valid frames that must pass the region check.
+RSL_BRAKE_MIN_PASS_RATIO               = 0.8
+
+# Temporal-consistency gate: max allowed positional spread (as a fraction
+# of torso height) of the opposite wrist across the PASSING frames. A hand
+# genuinely gripping a fixed lever barely moves frame to frame; a hand
+# merely passing through the region on its way elsewhere does not stay
+# put, and will fail this even if a couple of individual frames pass the
+# region check above.
+RSL_BRAKE_MAX_POSITION_SPREAD_FRACTION = 0.35
+
+# Verification window radius around the already-selected hand-raise frame
+# N: reads/verifies frames [N-radius .. N+radius] only — never a full
+# video re-scan.
+RSL_BRAKE_WINDOW_RADIUS                = 2
+
 # ── LLM verification gate (NEW — additive) ────────────────────────────────────
 # Every candidate violation (Mobile Phone, Drowsiness, Hand Raising,
 # Seat Absence) produced by the detectors above is re-checked by the
