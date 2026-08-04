@@ -148,9 +148,9 @@ _ENV_PATH = os.path.join(
 load_dotenv(_ENV_PATH)
 
 RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.analysis.jobs")
-EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.analysis.jobs.created")
+QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "analysis.jobs")
+EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "analysis.exchange")
+ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "analysis.jobs.created")
 # Defaults to GPU_WORKERS: with N persistent GPU workers we want the broker
 # to have up to N unacked messages in flight so all N workers can be busy
 # at once (see worker_pool.py). Override explicitly via RABBITMQ_PREFETCH
