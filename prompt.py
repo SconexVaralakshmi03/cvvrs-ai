@@ -35,6 +35,7 @@ class Violation:
     DROWSINESS = "Drowsiness"
     HAND_RAISING = "Hand Raising"
     SEAT_ABSENCE = "Seat Absence"  # Loco cabin left unmanned -- now verified.
+    RSL_HAND_BRAKE = "RSL Hand Brake"  # NEW -- opposite-hand brake grip during a hand-raise.
 
 
 # --------------------------------------------------------------------------- #
@@ -269,11 +270,59 @@ the candidate.
 """.strip()
 
 
+_RSL_HAND_BRAKE_CRITERIA = """
+Candidate violation to verify: RSL HAND BRAKE (Deadman's / Vigilance Brake)
+HELD DURING SIGNAL ACKNOWLEDGEMENT.
+
+An upstream pose-geometry check has already flagged this frame as: one
+hand/arm raised or extended for signal acknowledgement, AND the person's
+OTHER (opposite) hand positioned near the driving console in a location
+consistent with the fixed RSL Hand Brake lever. That geometry check is
+approximate -- it cannot see the actual physical lever, only where the
+hand sits relative to the body. Your job is to look at the real console
+in this image and decide whether the opposite hand is genuinely resting
+on / gripping a fixed lever or handle there.
+
+Verify (verified = true) ONLY if ALL of the following are clearly true:
+- One hand/arm is visibly raised or extended for signaling.
+- The OPPOSITE hand is clearly touching a lever, handle, or knob-like
+  fixed control mounted on the console directly in front of the person
+  -- not merely hovering near the console's general area.
+- The hand's grip/contact looks like genuine, settled holding (fingers
+  wrapped around or firmly resting on the control), not a hand caught
+  mid-motion, reaching, pointing, or passing through that space toward
+  something else.
+- The lever/control being touched is plausibly the brake/vigilance
+  control given its position on the console (not clearly some other
+  switch, gauge, or unrelated object).
+
+Reject (verified = false) if ANY of the following apply:
+- The opposite hand is not visible, is out of frame, or is occluded.
+- The opposite hand is resting on the person's own body, clothing, lap,
+  the seat, or any surface that is not a fixed console control.
+- The hand appears to be moving, reaching, adjusting something, or
+  merely passing through the console area rather than settled in a
+  holding grip.
+- The identity of the object under/near the hand is uncertain -- you
+  cannot confidently tell it is a lever/brake handle at all.
+- The raised/signaling arm itself is not clearly visible or convincing
+  in this same image.
+- Image quality, blur, glare, or occlusion make the grip impossible to
+  confirm with confidence.
+- You are not fully certain.
+
+This is a compliance/procedure confirmation, not a hazard alert, but the
+same "when in doubt, reject" rule still applies -- do not verify a brake
+grip unless it is clearly and unambiguously visible in this image.
+""".strip()
+
+
 _CRITERIA_BY_VIOLATION: dict[str, str] = {
     Violation.MOBILE_PHONE: _MOBILE_PHONE_CRITERIA,
     Violation.DROWSINESS: _DROWSINESS_CRITERIA,
     Violation.HAND_RAISING: _HAND_RAISING_CRITERIA,
     Violation.SEAT_ABSENCE: _SEAT_ABSENCE_CRITERIA,
+    Violation.RSL_HAND_BRAKE: _RSL_HAND_BRAKE_CRITERIA,
 }
 
 
