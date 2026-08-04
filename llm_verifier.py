@@ -88,6 +88,14 @@ EVENT_TYPE_TO_PROMPT_VIOLATION: dict[str, str] = {
     "sleeping_absent": Violation.DROWSINESS,
     "hand_raise":      Violation.HAND_RAISING,
     "seat_absence":    Violation.SEAT_ABSENCE,
+    # NEW — additive: RSL Hand Brake post-verification (see
+    # detector/rsl_hand_brake_verifier.py). Previously this event_type had
+    # no entry here, so it silently skipped the LLM gate entirely
+    # (status="TRUE", role="AMBIGUOUS", llm_invoked=False) regardless of
+    # what the pose-geometry heuristic actually saw. Now it goes through
+    # the same Qwen2.5-VL verification every other candidate does, against
+    # the RSL Hand Brake-specific criteria in prompt.py.
+    "rsl_hand_brake":  Violation.RSL_HAND_BRAKE,
 }
 
 VALID_ROLES = {"Loco Pilot", "Assistant Loco Pilot", "Both", "Unknown"}
