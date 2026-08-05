@@ -1,3 +1,4 @@
+
 """
 consumer.py
 ───────────
@@ -80,31 +81,27 @@ For 40 videos × 15 min
 • Connection will stay alive for the entire duration ✅
 
 ═══════════════════════════════════════════════════════════════════
-FATAL-INTERRUPTION HANDLING
+FATAL-INTERRUPTION HANDLING (partial-journey recovery)
 ═══════════════════════════════════════════════════════════════════
-See `_finalize_failed_journey_on_interruption()` and the restructured
-exception handling in `_handle_job()` below, plus `_fail_all_in_flight_jobs()`
-/ `start()` for the top-level KeyboardInterrupt/crash handler, for the
-policy that governs what happens when a fatal interruption (RabbitMQ
-connection loss, Ctrl+C, OpenCV/native crash, OOM, unexpected exception,
-etc.) hits a journey that is already in progress, at ANY stage — before
-the first video, or while processing any video:
+See `_finalize_on_interruption()` and the restructured exception
+handling in `_handle_job()` below for the policy that governs what
+happens when a fatal interruption (RabbitMQ connection loss, Ctrl+C,
+OpenCV/native crash, OOM, unexpected exception, etc.) hits a journey
+that is already in progress:
 
-  • The failed callback is ALWAYS called immediately and the journey is
-    ALWAYS finalized as FAILED — regardless of how many videos had
-    already succeeded. There is no "Completed with Errors" status.
-  • Any video that isn't already accounted for (succeeded or reported
-    failed) is marked NOT_PROCESSED and individually reported via the
-    failed endpoint, same as any other per-video failure.
-  • A real Ctrl+C (SIGINT) only ever raises KeyboardInterrupt on the
-    MAIN thread, never on a journey's own worker thread — so
-    `_fail_all_in_flight_jobs()` in start() is what actually guarantees
-    the failed callback fires for whichever journey(s) are in flight at
-    that moment. The BaseException handlers inside
-    `_run_journey_supervised()`/`_handle_job()` cover interruptions that
-    originate ON the job's own thread (e.g. a propagating exception).
-  • Resource cleanup (_cleanup(tmp_paths), resource_manager.cleanup_after_failure)
-    still runs unconditionally on every path.
+  • Zero videos succeeded so far  → existing FAILED-callback path
+    (send_failed + NACK) is unchanged.
+  • One or more videos already succeeded → we do NOT call the failed
+    callback. Instead we wait up to RECOVERY_WAIT_SECONDS (2 min,
+    used as a bounded retry budget for the completion callback),
+    mark every still-unprocessed video as failed, send the
+    COMPLETED_WITH_ERRORS completion callback (which already carries
+    both the successful VideoResults and the failed/unprocessed
+    video details — this is the same payload shape used by the
+    existing subprocess-crash path), and finalize (ACK) the message
+    so the worker moves on to the next queued journey. Resource
+    cleanup (_cleanup(tmp_paths), resource_manager.cleanup_after_failure)
+    still runs unconditionally on this path.
 """
 
 from __future__ import annotations
@@ -143,76 +140,6 @@ from s3_service import download_video, upload_text_log, upload_json_result
 from journey_log import build_journey_log_text
 from resource_manager import resource_manager, memory_monitor
 
-# ── In-flight job registry (KeyboardInterrupt / crash handling) ─────────────
-#
-# _handle_job() runs each journey on its own daemon thread (see _on_message
-# below). A real Ctrl+C (SIGINT) is only ever delivered by Python as a
-# KeyboardInterrupt on the MAIN thread — never on these per-job worker
-# threads — so the BaseException handlers inside _run_journey_supervised()/
-# _handle_job() do NOT fire for a genuine Ctrl+C. Previously this meant: the
-# main thread caught KeyboardInterrupt inside start()'s reconnect loop and
-# shut the process down WITHOUT ever telling Spring Boot that the in-flight
-# journey(s) had failed — the frontend stayed on "Processing" forever, and
-# on restart the journey was reprocessed from scratch because it was never
-# marked FAILED.
-#
-# This registry tracks every journey currently being processed (job_id ->
-# journey_id) so that, the moment the main thread observes a
-# KeyboardInterrupt OR any unhandled crash, it can immediately call the
-# failed callback for every still-in-flight journey before the process
-# exits — satisfying "at any stage of journey processing (before the first
-# video or while processing any video)".
-_in_flight_jobs: Dict[str, int] = {}
-_in_flight_jobs_lock = threading.Lock()
-
-
-def _register_in_flight(job_id: str, journey_id: int) -> None:
-    with _in_flight_jobs_lock:
-        _in_flight_jobs[job_id] = journey_id
-
-
-def _unregister_in_flight(job_id: str) -> None:
-    with _in_flight_jobs_lock:
-        _in_flight_jobs.pop(job_id, None)
-
-
-def _fail_all_in_flight_jobs(reason: str) -> None:
-    """
-    Best-effort: immediately call the failed callback for every journey
-    that is still being processed when the consumer is interrupted
-    (KeyboardInterrupt) or crashing (unhandled exception), so the
-    frontend never remains stuck on "Processing" and the journey is
-    marked FAILED instead of silently vanishing on restart.
-    """
-    with _in_flight_jobs_lock:
-        snapshot = dict(_in_flight_jobs)
-        _in_flight_jobs.clear()
-
-    if not snapshot:
-        return
-
-    log.error(
-        "[Consumer]  %s — sending FAILED callback for %d in-flight job(s): %s",
-        reason, len(snapshot), list(snapshot.keys()),
-    )
-    for job_id, journey_id in snapshot.items():
-        try:
-            send_failed(job_id, journey_id, f"Worker interrupted: {reason}")
-            log.info(
-                "[Consumer]  FAILED callback sent for in-flight job=%s "
-                "(journey=%d) after interruption.", job_id, journey_id,
-            )
-        except Exception as exc:
-            log.error(
-                "[Consumer]  Could not send FAILED callback for in-flight "
-                "job=%s (journey=%d): %s", job_id, journey_id, exc,
-            )
-        finally:
-            try:
-                finish_job(job_id)
-            except Exception:
-                pass
-
 # ── Config / credentials ──────────────────────────────────────────────────────
 _ENV_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -239,6 +166,14 @@ HEARTBEAT_INTERVAL = int(os.environ.get("RABBITMQ_HEARTBEAT",    "60"))
 # How often the keepalive thread pokes pika during blocking work.
 # Must be < HEARTBEAT_INTERVAL / 2 (i.e. < 30 s).
 KEEPALIVE_INTERVAL = int(os.environ.get("RABBITMQ_KEEPALIVE",    "15"))
+
+# How long (seconds) we are willing to keep retrying the COMPLETED_WITH_ERRORS
+# completion callback after a fatal interruption that struck a journey which
+# already had at least one successfully-processed video. This is a bounded
+# "wait for recovery" window, not a re-run of any video — the videos that
+# already succeeded are never reprocessed.
+RECOVERY_WAIT_SECONDS  = int(os.environ.get("RECOVERY_WAIT_SECONDS",  "120"))
+RECOVERY_RETRY_SECONDS = int(os.environ.get("RECOVERY_RETRY_SECONDS", "5"))
 
 # ── Subprocess isolation config ────────────────────────────────────────────
 # Each journey's analysis runs in its own child process (see journey_runner.py)
@@ -660,12 +595,10 @@ def _run_journey_supervised(
                 # result snapshot (analyzer.py's _build_partial_video_result,
                 # carried on the video_done event) — preserve it as a
                 # genuine success rather than discarding it. NOT added to
-                # failed_videos / not reported to /failed. The journey-level
-                # outcome is still decided by the caller: compute_journey_status()
-                # now resolves to FAILED as soon as ANY video failed (no more
-                # "Completed with Errors" partial-success state) — this
-                # preserved result is only used for diagnostics/the text log
-                # in that case, not to flip the outcome to COMPLETED.
+                # failed_videos / not reported to /failed; the journey-level
+                # outcome is decided by the caller based on succeeded vs.
+                # failed counts and will resolve to COMPLETED_WITH_ERRORS
+                # (never FAILED) as long as at least one video succeeded.
                 try:
                     video_results.append(_video_result_from_dict(partial_results[vj.video_id]))
                     continue
@@ -846,17 +779,61 @@ def _run_journey_supervised(
     )
 
 
-# ── Fatal-interruption finalization ─────────────────────────────────────
+# ── Fatal-interruption finalization (partial-journey recovery) ────────────
 #
 # Called from _handle_job's outer exception handler when a fatal
-# interruption (KeyboardInterrupt, unexpected exception, connection loss,
-# etc.) strikes at ANY point during journey processing — before the first
-# video, or while any video is being processed. There is no "Completed
-# with Errors" status: regardless of how many videos had already
-# succeeded, the journey is always finalized as FAILED and the failed
-# callback is called IMMEDIATELY (no retry/recovery window), so the
-# frontend is told right away instead of being left on "Processing".
-def _finalize_failed_journey_on_interruption(
+# interruption (unexpected exception, KeyboardInterrupt, etc.) strikes
+# AFTER at least one video has already been processed successfully by
+# `_run_journey_supervised`. Per spec we must NOT call the failed
+# callback in this case — instead we mark every still-unprocessed video
+# as failed, wait up to RECOVERY_WAIT_SECONDS while retrying the
+# completion callback, and let the caller ACK the message either way so
+# the worker can move on to the next queued journey.
+def _send_completed_with_recovery(completion_dict: dict, job_id: str) -> bool:
+    """
+    Sends the COMPLETED_WITH_ERRORS completion callback, retrying for up
+    to RECOVERY_WAIT_SECONDS if the first attempt fails (e.g. the same
+    transient condition that interrupted the journey — connection loss,
+    broker hiccup — may still be resolving). Never re-processes any
+    video; only retries delivering the already-final payload.
+
+    Returns True if the callback was eventually delivered, False if the
+    recovery window was exhausted without success (the journey's partial
+    results are still preserved locally via the uploaded text log either
+    way — see build_journey_log_text()/upload_text_log() in _handle_job).
+    """
+    deadline = time.time() + RECOVERY_WAIT_SECONDS
+    attempt  = 0
+    while True:
+        attempt += 1
+        try:
+            send_completed(completion_dict)
+            log.info(
+                "[Job %s]  COMPLETED_WITH_ERRORS callback delivered on "
+                "attempt %d after fatal interruption.", job_id, attempt,
+            )
+            return True
+        except Exception as exc:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                log.error(
+                    "[Job %s]  Could not deliver COMPLETED_WITH_ERRORS "
+                    "callback within the %ds recovery window (%d attempts): "
+                    "%s — giving up; partial results remain preserved in "
+                    "the uploaded text log.", job_id, RECOVERY_WAIT_SECONDS,
+                    attempt, exc,
+                )
+                return False
+            wait_s = min(RECOVERY_RETRY_SECONDS, remaining)
+            log.warning(
+                "[Job %s]  COMPLETED_WITH_ERRORS callback attempt %d "
+                "failed (%s) — retrying in %.0fs (recovery window "
+                "remaining %.0fs).", job_id, attempt, exc, wait_s, remaining,
+            )
+            time.sleep(wait_s)
+
+
+def _finalize_partial_journey_on_interruption(
     *,
     job_id: str,
     journey_id: int,
@@ -871,11 +848,13 @@ def _finalize_failed_journey_on_interruption(
     interruption_reason: str,
 ) -> None:
     """
-    Marks every video that is neither in video_results nor already in
-    failed_videos as NOT_PROCESSED (reason: fatal interruption), uploads
-    a diagnostic text log for the partial results (best-effort — never
-    blocks the failed callback), and immediately calls the FAILED
-    callback for the journey as a whole.
+    Builds and sends the COMPLETED_WITH_ERRORS payload after a fatal
+    interruption that hit a journey with at least one already-succeeded
+    video. Marks every video that is neither in video_results nor already
+    in failed_videos as failed (reason: fatal interruption), uploads the
+    text log (so results are preserved even if the callback ultimately
+    can't be delivered), and attempts the completion callback with a
+    bounded recovery window.
     """
     succeeded_ids = {vr.video_id for vr in video_results}
     accounted_ids = succeeded_ids | set(failed_videos.keys())
@@ -907,15 +886,25 @@ def _finalize_failed_journey_on_interruption(
                       "during interruption finalization: %s",
                       job_id, vj.video_id, exc)
 
+    failed_ids = set(failed_videos.keys())
+    journey_status = compute_journey_status(
+        total_videos        = len(msg_videos),
+        succeeded_video_ids = succeeded_ids,
+        failed_video_ids    = failed_ids,
+    )
+    # By construction at least one video succeeded, so this should always
+    # resolve to COMPLETED_WITH_ERRORS (or COMPLETED, if the interruption
+    # struck after the very last video already succeeded) — never FAILED.
+    if journey_status == "FAILED":
+        journey_status = "COMPLETED_WITH_ERRORS"
+
     log.warning(
-        "[Job %s]  Finalizing journey as FAILED after fatal interruption "
-        "(%s).  succeeded=%d  failed=%d  (Completed-with-errors is no "
-        "longer a valid outcome — any interruption resolves to FAILED.)",
-        job_id, interruption_reason, len(succeeded_ids), len(failed_videos),
+        "[Job %s]  Finalizing partial journey after fatal interruption "
+        "(%s).  succeeded=%d  failed=%d  status=%s",
+        job_id, interruption_reason, len(succeeded_ids), len(failed_ids),
+        journey_status,
     )
 
-    # Best-effort diagnostic artifacts — never block/skip the failed
-    # callback below if these fail.
     try:
         log_text = build_journey_log_text(
             job_id              = job_id,
@@ -925,44 +914,59 @@ def _finalize_failed_journey_on_interruption(
             started_at          = job_started_at,
             failed_videos       = failed_videos,
             video_error_details = video_error_details,
-            journey_status      = "FAILED",
+            journey_status      = journey_status,
         )
         upload_text_log(
             text        = log_text,
             folder_name = folder_name,
             filename    = f"{job_id}.txt",
         )
-        log.info("[Job %s]  Text log uploaded to S3 (interruption path).",
+        log.info("[Job %s]  Text log uploaded to S3 (partial-journey path).",
                  job_id)
     except Exception as log_exc:
         log.warning("[Job %s]  Text log build/upload failed (non-fatal): %s",
                     job_id, log_exc)
     _upload_job_console_log(job_id, folder_name)
 
-    # Notify the frontend before the final callback too, best-effort —
-    # mirrors the normal-path progress update so the UI doesn't appear
-    # stuck at whatever percentage it was at when the interruption hit.
+    processing_time_ms = int(wall_seconds * 1000)
+    completion = CompletionPayload(
+        job_id          = job_id,
+        journey_id      = journey_id,
+        train_detail_id = train_detail_id,
+        folder_name     = folder_name,
+        processing_time = processing_time_ms,
+        video_results   = video_results,
+    )
+    completion_dict = completion.to_dict()
+    completion_dict["journeyStatus"] = journey_status
+
+    try:
+        json_key = upload_json_result(
+            payload     = completion_dict,
+            folder_name = folder_name,
+            filename    = f"{job_id}_result.json",
+        )
+        log.info("[Job %s]  Completion JSON result uploaded to S3 (partial-journey "
+                 "path): %s", job_id, json_key)
+    except Exception as exc:
+        log.warning("[Job %s]  Completion JSON result upload failed (non-fatal, "
+                    "callback will still be sent): %s", job_id, exc)
+
+    # Notify the frontend of progress/status before the final callback too,
+    # best-effort — mirrors the normal-path "Sending results to backend"
+    # progress update so the UI doesn't appear stuck at whatever percentage
+    # it was at when the interruption happened.
     try:
         send_progress(
             job_id, journey_id, 95,
-            f"Journey interrupted ({interruption_reason}) — marking FAILED",
+            f"Recovering from interruption — status {journey_status}",
             current_video=len(msg_videos),
         )
     except Exception as exc:
         log.warning("[Job %s]  progress callback failed (non-fatal): %s",
                     job_id, exc)
 
-    error_message = (
-        f"Journey interrupted ({interruption_reason}) after "
-        f"{len(succeeded_ids)} of {len(msg_videos)} video(s) succeeded."
-    )
-    try:
-        send_failed(job_id, journey_id, error_message)
-        log.info("[Job %s]  FAILED callback sent immediately after fatal "
-                 "interruption.", job_id)
-    except Exception as exc:
-        log.error("[Job %s]  send_failed failed after fatal interruption: %s",
-                  job_id, exc)
+    _send_completed_with_recovery(completion_dict, job_id)
 
 
 # ── Job handler ───────────────────────────────────────────────────────────────
@@ -1036,12 +1040,6 @@ def _handle_job(
                        method.delivery_tag, job_id)
         return
 
-    # Register this journey as in-flight BEFORE any processing begins (i.e.
-    # before the first video is downloaded) so a KeyboardInterrupt/crash at
-    # ANY stage — including before the first video — is covered by
-    # _fail_all_in_flight_jobs() in start().
-    _register_in_flight(job_id, journey_id)
-
     # ── Start keepalive — covers download + analysis + callback ───────────────
     # FIX: keepalive starts HERE, before downloads, because the download phase
     # can take several minutes and will starve pika's heartbeat just as badly
@@ -1051,10 +1049,9 @@ def _handle_job(
         job_failed = False
 
         # Mutable state visible to the outer except block, so a fatal
-        # interruption at ANY point can be finalized with whatever
-        # per-video bookkeeping had already accumulated — the journey
-        # itself is always finalized as FAILED (see
-        # _finalize_failed_journey_on_interruption below).
+        # interruption at ANY point after _run_journey_supervised has
+        # returned at least one successful video can be finalized as
+        # COMPLETED_WITH_ERRORS instead of FAILED.
         video_results:       list            = []
         failed_videos:       Dict[int, str]  = {}
         video_error_details: Dict[int, dict] = {}
@@ -1168,8 +1165,8 @@ def _handle_job(
             )
 
             # ── Step 8b: Build and upload the .txt analysis log ───────────────
-            # Built for EVERY outcome now (COMPLETED and FAILED, including
-            # FAILED-with-partial-results) — not just full success — so
+            # Built for EVERY outcome now (COMPLETED, COMPLETED_WITH_ERRORS,
+            # and FAILED-with-partial-results) — not just full success — so
             # the log always reflects which videos actually failed and why.
             # Written to the same dynamic journey folder used for frames:
             # <folderName>/<jobId>.txt
@@ -1201,14 +1198,17 @@ def _handle_job(
             # Per-video failures were ALREADY reported individually and
             # immediately inside _run_journey_supervised (Phase 1 requirement
             # — no video waits until journey end to be reported). This step
-            # decides the JOURNEY-level outcome. "Completed with Errors" has
-            # been removed — compute_journey_status() now only ever returns:
+            # decides the JOURNEY-level outcome:
             #
-            #   COMPLETED → every video succeeded — send_completed with all
-            #               video_results.
-            #   FAILED    → ANY video failed (or none ran) — send one
-            #               journey-level /failed call summarizing it, no
-            #               /completed call.
+            #   COMPLETED              → send_completed with all video_results.
+            #   COMPLETED_WITH_ERRORS  → still send_completed (the journey DID
+            #                            finish — some videos succeeded and
+            #                            their results are real); per-video
+            #                            failures are already on record via
+            #                            the immediate /failed calls above.
+            #   FAILED                 → every video failed (or none ran) —
+            #                            send one journey-level /failed call
+            #                            summarizing it, no /completed call.
             if journey_status == "FAILED":
                 error_message = "; ".join(
                     f"video_id={vid}: {msg_}" for vid, msg_ in failed_videos.items()
@@ -1276,19 +1276,14 @@ def _handle_job(
                 log.error("[Job %s]  cleanup_after_failure() failed:\n%s",
                           job_id, traceback.format_exc())
 
-            # ── Per spec: ANY fatal interruption (KeyboardInterrupt at any
-            # stage, unexpected exception, connection loss, etc.) always
-            # resolves the journey to FAILED and calls the failed callback
-            # immediately — regardless of how many videos had already
-            # succeeded. "Completed with Errors" is not a valid outcome.
-            job_failed = True
-            if video_results or failed_videos:
-                # At least some per-video bookkeeping exists — go through
-                # the full finalization (marks remaining videos as
-                # NOT_PROCESSED, uploads diagnostic logs, then calls the
-                # failed callback).
+            if video_results:
+                # ── At least one video already succeeded: do NOT call the
+                # failed callback. Preserve the successful results, mark the
+                # rest as failed, and finalize as COMPLETED_WITH_ERRORS
+                # (with a bounded recovery/retry window for the callback).
+                job_failed = False
                 try:
-                    _finalize_failed_journey_on_interruption(
+                    _finalize_partial_journey_on_interruption(
                         job_id               = job_id,
                         journey_id           = journey_id,
                         train_detail_id      = train_detail_id,
@@ -1302,22 +1297,26 @@ def _handle_job(
                         interruption_reason  = f"{type(exc).__name__}: {exc}",
                     )
                 except Exception as finalize_exc:
+                    # Even the recovery path itself failed unexpectedly —
+                    # this is the only case where we still fall back to the
+                    # failed callback, since we genuinely could not finalize
+                    # the partial results any other way.
                     log.error(
-                        "[Job %s]  Interruption finalization itself failed: "
-                        "%s — falling back to a plain failed callback.",
+                        "[Job %s]  Partial-journey finalization itself "
+                        "failed: %s — falling back to failed callback.",
                         job_id, finalize_exc,
                     )
+                    job_failed = True
                     try:
                         send_failed(job_id, journey_id,
                                     f"{exc}\n\n{err_detail}\n\n"
-                                    f"(finalization also failed: {finalize_exc})")
+                                    f"(partial-finalization also failed: {finalize_exc})")
                     except Exception as sf_exc:
                         log.warning("[Job %s]  send_failed itself failed: %s",
                                     job_id, sf_exc)
             else:
-                # ── Interruption struck before any per-video outcome was
-                # even known (e.g. during download, or before the first
-                # video) — call the failed callback directly. ──
+                # ── Zero videos succeeded — existing FAILED-callback path. ──
+                job_failed = True
                 try:
                     send_failed(job_id, journey_id, f"{exc}\n\n{err_detail}")
                 except Exception as sf_exc:
@@ -1325,34 +1324,21 @@ def _handle_job(
                                 job_id, sf_exc)
         finally:
             # Always release temp files / resources, on every path: clean
-            # success, FAILED, or a still-failing finalization attempt.
+            # success, FAILED, COMPLETED_WITH_ERRORS, or a still-failing
+            # finalization attempt.
             _cleanup(tmp_paths)
-            # Frames written locally by ViolationStore._save_frame() are
-            # already durably uploaded to S3 by this point (whether the
-            # journey succeeded, failed partway through, or was
-            # interrupted) — remove the local copy now instead of leaving
-            # it on disk until the next startup's stale-workspace sweep.
-            try:
-                resource_manager.cleanup_journey_workspace(
-                    job_id=job_id, journey_id=journey_id,
-                )
-            except Exception:
-                log.warning(
-                    "[Job %s]  cleanup_journey_workspace() failed "
-                    "(non-fatal):\n%s", job_id, traceback.format_exc(),
-                )
 
     # ── Keepalive stopped here — safe to call pika ────────────────────────────
     # Release the in-progress claim before the terminal ACK/NACK either way,
     # so a later genuine redelivery (e.g. after this worker instance itself
     # dies before reaching this point) is never permanently blocked.
     finish_job(job_id)
-    _unregister_in_flight(job_id)
     if job_failed:
         _nack(channel, pika_lock, method.delivery_tag, job_id)
     else:
         # ── Step 10: ACK ─────────────────────────────────────────────────────
-        # The message is finalized here so the worker moves on to the next
+        # Also reached for the COMPLETED_WITH_ERRORS-after-interruption path:
+        # the message is finalized here so the worker moves on to the next
         # queued journey, exactly as it does after a normal completion.
         _ack_and_flush(channel, connection, pika_lock,
                        method.delivery_tag, job_id)
@@ -1529,24 +1515,9 @@ def start() -> None:
         try:
             _connect_and_consume()
         except KeyboardInterrupt:
-            # A real Ctrl+C only ever raises KeyboardInterrupt on THIS
-            # (main) thread — never on the per-journey worker threads
-            # spawned by _on_message(). Before this fix, any journey still
-            # in flight at this moment was simply abandoned: no failed
-            # callback was ever sent, so the frontend stayed on
-            # "Processing" forever and the journey was reprocessed from
-            # scratch on the next consumer.py restart. Failing every
-            # in-flight job HERE, immediately, closes that gap.
             log.info("[Consumer]  Interrupted by user — shutting down.")
-            _fail_all_in_flight_jobs(
-                "KeyboardInterrupt (Ctrl+C) received by consumer"
-            )
             break
         except Exception as exc:
-            # A dropped/reconnecting RabbitMQ connection does NOT abandon
-            # in-flight jobs — their worker threads keep running
-            # independently and will send their own callback when they
-            # finish, so we do NOT fail them here; we just reconnect.
             log.error(
                 "[Consumer]  Connection lost: %s — reconnecting in %ds...",
                 exc, RECONNECT_DELAY,
@@ -1571,20 +1542,4 @@ def start() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        start()
-    except BaseException as exc:
-        # Catches anything that escapes start() itself (e.g. a bug in
-        # resource_manager.initialize_service()/worker_pool.start(), or any
-        # other unhandled exception/runtime crash outside the normal
-        # per-message try/except) — per spec, the failed callback must
-        # still be called for every in-flight journey before the consumer
-        # actually exits.
-        log.error(
-            "[Consumer]  Unhandled crash — failing in-flight jobs before "
-            "exit:\n%s", traceback.format_exc(),
-        )
-        _fail_all_in_flight_jobs(
-            f"Unhandled consumer crash: {type(exc).__name__}: {exc}"
-        )
-        raise
+    start()

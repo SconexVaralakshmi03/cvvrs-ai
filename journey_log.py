@@ -375,7 +375,8 @@ def build_journey_log_text(
                     back to just the error_message from failed_videos if a
                     video_id has no entry here.
     journey_status : Optional explicit override for Final Status (e.g. when
-                    consumer.py has already computed COMPLETED / FAILED via
+                    consumer.py has already computed COMPLETED /
+                    COMPLETED_WITH_ERRORS / FAILED via
                     callback_client.compute_journey_status). If omitted, it
                     is derived from failed_videos vs. video_results here.
     """
@@ -440,10 +441,12 @@ def build_journey_log_text(
     out.append("")
 
     if journey_status is None:
-        # "Completed with Errors" has been removed — any failed video
-        # resolves the journey to FAILED, regardless of how many others
-        # succeeded.
-        journey_status = "SUCCESS" if n_failed == 0 else "FAILED"
+        if n_failed == 0:
+            journey_status = "SUCCESS"
+        elif n_succeeded == 0:
+            journey_status = "FAILED"
+        else:
+            journey_status = "COMPLETED_WITH_ERRORS"
 
     out.append(f"Final Status        : {journey_status}")
     out.append("")

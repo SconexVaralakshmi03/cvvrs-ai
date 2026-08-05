@@ -45,11 +45,11 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 
-from prompt import Violation, build_verification_prompt
+from prompt import Violation, build_verification_prompt, build_rsl_hand_brake_prompt
 
 log = logging.getLogger("llm_verifier")
 
@@ -190,6 +190,71 @@ def _call_ollama(prompt_text: str, image_bgr: np.ndarray, log_label: str = "") -
             pass
 
 
+def _call_ollama_multi(prompt_text: str, images_bgr: List[np.ndarray], log_label: str = "") -> str:
+    """Blocking Ollama chat call with MULTIPLE images attached to one message.
+
+    Used by the RSL Hand Brake verification flow (see
+    detector/rsl_hand_brake_verifier.py), which sends the whole [N-2 .. N+2]
+    frame window to the model in a single call so it can judge temporal
+    consistency itself, instead of a single frame like verify_frame()
+    above. Frames are written to temp JPEGs and passed as file paths (same
+    reasoning as _call_ollama).
+    """
+    import cv2
+    import os
+    import tempfile
+    from ollama import Client
+
+    tmp_paths: List[str] = []
+    try:
+        for img in images_bgr:
+            fd, tmp_path = tempfile.mkstemp(suffix=".jpg", prefix="llmverify_rsl_")
+            os.close(fd)
+            ok = cv2.imwrite(tmp_path, img)
+            if not ok:
+                raise ValueError("Failed to JPEG-encode a frame for RSL LLM verification")
+            tmp_paths.append(tmp_path)
+
+        print(f"[llm_verifier] Calling Ollama (multi-image) model={OLLAMA_MODEL!r} "
+              f"host={OLLAMA_HOST or 'default(127.0.0.1:11434)'} "
+              f"label={log_label!r} images={tmp_paths}")
+
+        client = Client(host=OLLAMA_HOST) if OLLAMA_HOST else Client()
+
+        def _do_call() -> str:
+            response = client.chat(
+                model=OLLAMA_MODEL,
+                messages=[{"role": "user", "content": prompt_text, "images": tmp_paths}],
+                options={"temperature": OLLAMA_TEMPERATURE},
+            )
+            try:
+                return response["message"]["content"]
+            except (TypeError, KeyError):
+                return response.message.content  # type: ignore[union-attr]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_do_call)
+            try:
+                raw = future.result(timeout=OLLAMA_TIMEOUT_SECONDS)
+                print(f"[llm_verifier] RAW response (multi-image) for {log_label!r}: {raw!r}")
+                return raw
+            except concurrent.futures.TimeoutError as exc:
+                raise VerificationTimeoutError(
+                    f"Model call exceeded {OLLAMA_TIMEOUT_SECONDS}s"
+                ) from exc
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "connect" in msg or "connection" in msg:
+                    raise OllamaConnectionError(str(exc)) from exc
+                raise
+    finally:
+        for p in tmp_paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 # ── Response parsing (mirrors the standalone verify.py safe_parse logic) ────
 
 def _safe_parse(raw_text: str) -> Optional[dict]:
@@ -242,6 +307,41 @@ def _safe_parse(raw_text: str) -> Optional[dict]:
         }
     except Exception:
         return None
+
+
+def _safe_parse_rsl(raw_text: str, n_frames: int) -> Optional[dict]:
+    """Same as _safe_parse but also extracts the 1-indexed "best_frame"
+    field returned by the RSL Hand Brake multi-frame prompt, clamped into
+    [1, n_frames]."""
+    parsed = _safe_parse(raw_text)
+    if parsed is None:
+        return None
+
+    try:
+        text = (raw_text or "").strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        if not text.startswith("{"):
+            start, end = text.find("{"), text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                text = text[start:end + 1]
+        data = json.loads(text)
+        best_frame = int(data.get("best_frame", 0))
+    except Exception:
+        best_frame = 0
+
+    # Fall back to the geometric center frame (1-indexed) if the model
+    # didn't return a usable value.
+    if best_frame < 1 or best_frame > n_frames:
+        best_frame = (n_frames // 2) + 1
+
+    parsed["best_frame"] = best_frame
+    return parsed
 
 
 # ── Public entry point ───────────────────────────────────────────────────
@@ -388,3 +488,144 @@ def verify_frame(image_bgr: np.ndarray, event_type: str, log_label: str = "") ->
         reason=parsed["reason"], skipped=False,
     )
     return parsed
+
+
+# ── RSL Hand Brake — multi-frame entry point ────────────────────────────────
+#
+# Sends the whole [N-2 .. N+2] frame window (see
+# detector/rsl_hand_brake_verifier.py::extract_frame_window) to Qwen-VL in
+# ONE call, so the model itself judges signal-acknowledgement + brake-hand
+# presence + temporal consistency + LP/ALP role directly from the frames —
+# no separate MediaPipe re-pass over that window. The model also picks
+# which one of the frames it was shown is the best/most-confident evidence
+# frame; that pick is returned as a 0-based index into `frames` so the
+# caller can use the actual image, not just the geometric middle.
+
+def verify_rsl_hand_brake_frames(
+    frames: List[np.ndarray],
+    center_index: int,
+    log_label: str = "",
+) -> dict:
+    """
+    Verify the RSL Hand Brake candidate from a short sequence of frames.
+
+    Parameters
+    ----------
+    frames:
+        The [N-2, N-1, N, N+1, N+2] window (or however many were
+        successfully read — caller filters out None entries first),
+        in time order.
+    center_index:
+        0-based index within `frames` of the already-selected hand-raise
+        candidate frame N (i.e. where the frame that triggered this check
+        actually sits in the list you're passing in).
+    log_label:
+        Free-form label for logging/audit only.
+
+    Returns
+    -------
+    dict with:
+        verified, status ("TRUE"/"FALSE"), role, confidence (0-100),
+        reason, best_frame_index (0-based index into `frames`, always a
+        valid index into the list you passed in), skipped, llm_invoked.
+    """
+    n = len(frames)
+    fallback_idx = min(max(0, center_index), max(0, n - 1))
+
+    if n == 0:
+        return {
+            "verified": False, "status": "FALSE", "role": None, "confidence": 0,
+            "reason": "No frames available for RSL Hand Brake verification.",
+            "best_frame_index": 0, "skipped": True, "llm_invoked": False,
+        }
+
+    if not LLM_VERIFICATION_ENABLED:
+        reason = "LLM verification disabled by config."
+        _log_verification_json(
+            label=log_label, event_type="rsl_hand_brake",
+            candidate_violation=Violation.RSL_HAND_BRAKE, llm_invoked=False,
+            status="TRUE", role="AMBIGUOUS", confidence=0, reason=reason, skipped=True,
+        )
+        return {
+            "verified": True, "status": "TRUE", "role": "AMBIGUOUS", "confidence": 0,
+            "reason": reason, "best_frame_index": fallback_idx,
+            "skipped": True, "llm_invoked": False,
+        }
+
+    prompt_text = build_rsl_hand_brake_prompt(n, center_index + 1)
+
+    raw_text: Optional[str] = None
+    last_error: Optional[Exception] = None
+    for attempt in range(1, OLLAMA_MAX_RETRIES + 2):
+        try:
+            raw_text = _call_ollama_multi(prompt_text, frames, log_label=log_label)
+            break
+        except Exception as exc:
+            last_error = exc
+            log.warning(
+                "RSL Hand Brake LLM verify attempt %d/%d failed for %s: %s",
+                attempt, OLLAMA_MAX_RETRIES + 1, log_label, exc,
+            )
+
+    if raw_text is None:
+        fail_open = LLM_VERIFICATION_FAIL_OPEN
+        status, role = _status_role(fail_open, "Unknown")
+        reason = f"LLM verification unavailable: {last_error}"
+        log.error(
+            "RSL Hand Brake LLM verification unavailable for %s after retries: %s — %s",
+            log_label, last_error,
+            "failing OPEN (kept, unverified)" if fail_open else "failing CLOSED (rejected)",
+        )
+        _log_verification_json(
+            label=log_label, event_type="rsl_hand_brake",
+            candidate_violation=Violation.RSL_HAND_BRAKE, llm_invoked=True,
+            status=status, role=role, confidence=0, reason=reason, skipped=False,
+        )
+        return {
+            "verified": fail_open, "status": status, "role": role, "confidence": 0,
+            "reason": reason, "best_frame_index": fallback_idx,
+            "skipped": False, "llm_invoked": True,
+        }
+
+    parsed = _safe_parse_rsl(raw_text, n)
+    if parsed is None:
+        fail_open = LLM_VERIFICATION_FAIL_OPEN
+        status, role = _status_role(fail_open, "Unknown")
+        reason = "Model response could not be parsed as valid JSON."
+        log.warning(
+            "RSL Hand Brake LLM returned unparseable JSON for %s — %s",
+            log_label, "failing OPEN" if fail_open else "failing CLOSED (rejected)",
+        )
+        _log_verification_json(
+            label=log_label, event_type="rsl_hand_brake",
+            candidate_violation=Violation.RSL_HAND_BRAKE, llm_invoked=True,
+            status=status, role=role, confidence=0, reason=reason, skipped=False,
+            raw_response=raw_text,
+        )
+        return {
+            "verified": fail_open, "status": status, "role": role, "confidence": 0,
+            "reason": reason, "best_frame_index": fallback_idx,
+            "skipped": False, "llm_invoked": True,
+        }
+
+    status, role = _status_role(parsed["verified"], parsed["role"])
+    best_frame_index = max(0, min(n - 1, parsed["best_frame"] - 1))  # 1-based → 0-based
+
+    result = {
+        "verified":         parsed["verified"],
+        "status":           status,
+        "role":             role,
+        "confidence":       parsed["confidence"],
+        "reason":           parsed["reason"],
+        "best_frame_index": best_frame_index,
+        "skipped":          False,
+        "llm_invoked":      True,
+    }
+    print(f"[llm_verifier] RSL Hand Brake PARSED verdict for {log_label!r}: {result}")
+    _log_verification_json(
+        label=log_label, event_type="rsl_hand_brake",
+        candidate_violation=Violation.RSL_HAND_BRAKE, llm_invoked=True,
+        status=status, role=role, confidence=parsed["confidence"],
+        reason=parsed["reason"], skipped=False, best_frame_index=best_frame_index,
+    )
+    return result

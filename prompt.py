@@ -35,6 +35,7 @@ class Violation:
     DROWSINESS = "Drowsiness"
     HAND_RAISING = "Hand Raising"
     SEAT_ABSENCE = "Seat Absence"  # Loco cabin left unmanned -- now verified.
+    RSL_HAND_BRAKE = "RSL Hand Brake Held"  # Multi-frame signal + brake check.
 
 
 # --------------------------------------------------------------------------- #
@@ -275,6 +276,107 @@ _CRITERIA_BY_VIOLATION: dict[str, str] = {
     Violation.HAND_RAISING: _HAND_RAISING_CRITERIA,
     Violation.SEAT_ABSENCE: _SEAT_ABSENCE_CRITERIA,
 }
+
+
+# --------------------------------------------------------------------------- #
+# RSL Hand Brake -- multi-frame verification
+# --------------------------------------------------------------------------- #
+#
+# Unlike the single-frame violations above, this candidate is verified from
+# a short SEQUENCE of frames (N-2 .. N+2 around the already-selected
+# hand-raise frame N), sent to the model together, so it can judge temporal
+# consistency directly instead of relying on a separate pose-geometry pass.
+# See detector/rsl_hand_brake_verifier.py.
+
+_RSL_HAND_BRAKE_CRITERIA_TEMPLATE = """
+Candidate violation to verify: RSL HAND BRAKE HELD (Deadman's / Vigilance
+Brake), together with the SIGNAL ACKNOWLEDGEMENT that triggered it.
+
+You are being shown {n} sequential frames, in time order, taken a few
+frames apart from a single locomotive cabin camera. Frame {center} (of
+{n}) is the PRIMARY candidate frame: an upstream system has already
+detected a raised/extended-arm signal-acknowledgement gesture there. The
+other frames are its immediate neighbours in time, included ONLY so you
+can judge whether what you see is a real, sustained state rather than a
+one-frame fluke.
+
+Verify (verified = true) ONLY if ALL of the following are clearly true:
+
+1. SIGNAL ACKNOWLEDGEMENT -- in the primary candidate frame (frame
+   {center}), at least one crew member's arm is raised or intentionally
+   extended toward the front windshield, clearly distinguishable from a
+   normal resting posture.
+2. HAND ON THE RSL HAND BRAKE -- the OTHER crew member -- the one who is
+   NOT performing the signal acknowledgement, typically the Assistant
+   Loco Pilot -- has one hand, typically the right hand, clearly resting
+   on or gripping the RSL Hand Brake / Vigilance Brake lever on the
+   driving console, at console height, in front of their body.
+3. CONSISTENCY -- across the frames shown, the hand on the brake lever
+   stays in essentially the same place rather than only briefly passing
+   through that area in a single frame. A hand genuinely holding a fixed
+   lever barely moves frame to frame.
+
+A valid signal acknowledgement DOES NOT require the hand to be above the
+head, the elbow fully extended, or the fingertips visible; part of the
+raised arm may extend outside the camera frame.
+
+Reject (verified = false) if ANY of the following apply:
+- There is no raised/extended arm performing a signal acknowledgement in
+  the primary candidate frame.
+- No hand is visible on or near the RSL Hand Brake console lever in most
+  of the frames shown.
+- The hand that IS near the brake area moves noticeably between frames
+  (i.e. it is passing through, not holding the lever).
+- The frames are too blurry, dark, or occluded to judge either the
+  signal or the brake-holding hand with confidence.
+- You are not fully certain.
+
+When in doubt, reject.
+""".strip()
+
+
+_RSL_JSON_SCHEMA_TEMPLATE = """
+Respond with EXACTLY this JSON schema and nothing else -- no markdown
+fences, no explanation outside the JSON:
+
+{{
+  "verified": <true or false>,
+  "candidate_violation": "{violation}",
+  "role": "<Loco Pilot | Assistant Loco Pilot | Both | Unknown>",
+  "confidence": <integer 0-100>,
+  "best_frame": <integer 1-{n}, the single frame from the {n} shown that
+                 most clearly and unambiguously shows BOTH the signal
+                 acknowledgement and the hand on the brake at once -- this
+                 frame will be kept as the evidence image, so prefer the
+                 sharpest, least occluded, most representative frame>,
+  "reason": "<one concise sentence citing the specific visual evidence>"
+}}
+
+If verified is false, set role to "Unknown" and confidence to 0, but
+still return your best-guess "best_frame".
+""".strip()
+
+
+def build_rsl_hand_brake_prompt(n_frames: int, center_index_1based: int) -> str:
+    """
+    Build the multi-frame verification prompt for the RSL Hand Brake
+    candidate (see detector/rsl_hand_brake_verifier.py).
+
+    Parameters
+    ----------
+    n_frames:
+        Number of frames being sent to the model (typically 5: N-2..N+2).
+    center_index_1based:
+        1-indexed position, within the n_frames sequence as sent to the
+        model, of the already-selected hand-raise candidate frame N.
+    """
+    criteria = _RSL_HAND_BRAKE_CRITERIA_TEMPLATE.format(
+        n=n_frames, center=center_index_1based,
+    )
+    schema = _RSL_JSON_SCHEMA_TEMPLATE.format(
+        violation=Violation.RSL_HAND_BRAKE, n=n_frames,
+    )
+    return "\n\n".join([_BASE_RULES, criteria, _ROLE_RULES, schema])
 
 
 def build_verification_prompt(candidate_violation: str) -> str:

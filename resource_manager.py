@@ -1112,44 +1112,6 @@ class ResourceManager:
         log.warning("[Cleanup] cleanup_after_failure() job=%s reason=%s", job_id, reason)
         return self.cleanup_after_journey(job_id=job_id)
 
-    def cleanup_journey_workspace(self, job_id: str = "", journey_id: Optional[int] = None) -> None:
-        """
-        Removes this journey's local workspace folder
-        (JOURNEY_WORKSPACE_ROOT/journey_<journey_id>/ — the violation
-        frame images written to disk by ViolationStore._save_frame()
-        before each frame is uploaded to S3) once the journey has
-        finished, successfully or not.
-
-        Previously these per-journey frame folders were only ever removed
-        by _cleanup_stale_journey_workspaces() at the NEXT consumer
-        startup, and only once they were older than STALE_AGE_SECONDS (6h
-        by default) — so a busy worker could accumulate hours of
-        already-uploaded violation-frame images on local disk for no
-        reason. Since every frame is already durably stored in S3 by the
-        time analyze_journey() returns (or by the time a per-video/journey
-        failure is finalized), the local copies serve no further purpose
-        and are safe to delete immediately. Best-effort — never raises,
-        since losing this cleanup step must never fail the journey itself.
-        """
-        if journey_id is None:
-            return
-        workspace = os.path.join(JOURNEY_WORKSPACE_ROOT, f"journey_{journey_id}")
-        try:
-            if os.path.isdir(workspace):
-                shutil.rmtree(workspace, ignore_errors=True)
-                log.info(
-                    "[Cleanup] Removed local journey workspace %s (job=%s, "
-                    "journey=%d) — frames already uploaded to S3.",
-                    workspace, job_id, journey_id,
-                )
-        except Exception:
-            log.warning(
-                "[Cleanup] Failed to remove journey workspace %s (job=%s, "
-                "journey=%d) — will be swept by the next startup's stale-"
-                "workspace cleanup instead.", workspace, job_id, journey_id,
-                exc_info=True,
-            )
-
     def cleanup_on_shutdown(self) -> None:
         """
         Call once when the worker process is shutting down gracefully

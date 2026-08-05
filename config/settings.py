@@ -375,6 +375,34 @@ HAND_RAISE_RAW_MISS_TOLERANCE       = 1
 # fully self-contained.
 HAND_RAISE_ZONE_SPLIT_RATIO         = 0.57
 
+# ── RSL Hand Brake post-verification (NEW — additive) ─────────────────────────
+# See detector/rsl_hand_brake_verifier.py. Runs ONLY after hand_raise has
+# already confirmed a violation and the pipeline has selected its final
+# representative frame — never on every frame, never a standalone detector.
+#
+# The [N-radius .. N+radius] window is now sent DIRECTLY to Qwen-VL (see
+# llm_verifier.verify_rsl_hand_brake_frames / prompt.build_rsl_hand_brake_prompt)
+# for signal-acknowledgement + brake-hand + consistency + LP/ALP checking, in
+# place of a second MediaPipe pose pass over the window. Only the window
+# radius below is still used.
+
+# Verification window radius around the already-selected hand-raise frame
+# N: reads/sends-to-Qwen frames [N-radius .. N+radius] only — never a full
+# video re-scan.
+RSL_BRAKE_WINDOW_RADIUS                = 2
+
+# LEGACY — used only by the old geometry-based (MediaPipe landmark) window
+# check that verify_rsl_hand_brake() used before it was switched to send
+# frames directly to Qwen-VL. No longer read by detector/rsl_hand_brake_verifier.py;
+# kept here in case that geometry-only path is ever reinstated.
+RSL_BRAKE_VIS_THRESHOLD                = 0.5
+RSL_BRAKE_REGION_Y_MARGIN_FRACTION     = 0.20
+RSL_BRAKE_REGION_X_FRACTION            = 0.55
+RSL_BRAKE_MIN_VALID_FRAMES             = 3
+RSL_BRAKE_MIN_PASS_FRAMES              = 3
+RSL_BRAKE_MIN_PASS_RATIO               = 0.8
+RSL_BRAKE_MAX_POSITION_SPREAD_FRACTION = 0.35
+
 # ── LLM verification gate (NEW — additive) ────────────────────────────────────
 # Every candidate violation (Mobile Phone, Drowsiness, Hand Raising,
 # Seat Absence) produced by the detectors above is re-checked by the
