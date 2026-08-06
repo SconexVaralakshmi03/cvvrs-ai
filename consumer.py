@@ -1,4 +1,3 @@
-
 """
 consumer.py
 ───────────
@@ -396,11 +395,40 @@ def _nack(channel, pika_lock: threading.Lock,
         )
 
 
+def _violation_timestamp_sort_key(v: dict) -> float:
+    """Journey-global timestamp for a raw violation dict, used only to
+    order the list before it becomes the payload. Defensive about the
+    value's shape (plain float from analyzer.py at this stage, but be
+    tolerant of an already-formatted 'H:MM:SS' string just in case)."""
+    ts = v.get("timestamp", 0.0)
+    if isinstance(ts, str):
+        parts = ts.split(":")
+        try:
+            if len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            return float(ts)
+        except Exception:
+            return 0.0
+    try:
+        return float(ts or 0.0)
+    except Exception:
+        return 0.0
+
+
 def _video_result_from_dict(vr: dict) -> VideoResult:
     """Builds a VideoResult from the dict shape used both by the
     subprocess's clean-completion payload (result_q "result" type) and by
     the per-video crash-recovery snapshot (analyzer.py's
     _build_partial_video_result, carried on video_done events)."""
+    # FIX — raw violations arrive in per-detector emission order (e.g. the
+    # hand-raise detector's pass appends its events, then the RSL-hand-brake
+    # detector's pass appends its own, etc.), NOT in chronological order
+    # within the video. journey_log.py's v_sorted() already re-sorts for the
+    # plain-text log, but that sort never touched this list — which is the
+    # one that becomes the completion payload sent to Spring Boot and
+    # rendered into the PDF report. Sort here, once, so every downstream
+    # consumer (payload + PDF) sees violations in ascending timestamp order.
+    raw_violations = sorted(vr.get("violations", []), key=_violation_timestamp_sort_key)
     return VideoResult(
         video_id           = vr["videoId"] if isinstance(vr.get("videoId"), int) else int(vr["videoId"]),
         video_name         = vr["videoName"],
@@ -442,7 +470,7 @@ def _video_result_from_dict(vr: dict) -> VideoResult:
                 status                    = "TRUE" if v.get("status", True) else "FALSE",
                 role                      = v.get("role"),
             )
-            for v in vr.get("violations", [])
+            for v in raw_violations
         ],
     )
 
