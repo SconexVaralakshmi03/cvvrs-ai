@@ -377,18 +377,21 @@ HAND_RAISE_ZONE_SPLIT_RATIO         = 0.57
 
 # ── RSL Hand Brake post-verification (NEW — additive) ─────────────────────────
 # See detector/rsl_hand_brake_verifier.py. Runs ONLY after hand_raise has
-# already confirmed a violation and the pipeline has selected its final
-# representative frame — never on every frame, never a standalone detector.
+# already confirmed a violation on the signal frame and the pipeline has
+# selected its final representative frame — never on every frame, never a
+# standalone detector.
 #
-# The [N-radius .. N+radius] window is now sent DIRECTLY to Qwen-VL (see
-# llm_verifier.verify_rsl_hand_brake_frames / prompt.build_rsl_hand_brake_prompt)
-# for signal-acknowledgement + brake-hand + consistency + LP/ALP checking, in
-# place of a second MediaPipe pose pass over the window. Only the window
-# radius below is still used.
+# ONLY that single already-selected signal frame N is sent DIRECTLY to
+# Qwen-VL (see llm_verifier.verify_rsl_hand_brake_frame /
+# prompt.build_rsl_hand_brake_prompt) for signal-acknowledgement +
+# brake-hand checking, in place of a second MediaPipe pose pass. No
+# neighbouring-frame window is read or sent. If confirmed, role is always
+# "ALP".
 
-# Verification window radius around the already-selected hand-raise frame
-# N: reads/sends-to-Qwen frames [N-radius .. N+radius] only — never a full
-# video re-scan.
+# LEGACY — the ±N frame verification window around frame N has been
+# removed; RSL Hand Brake verification now reads/sends ONLY the single
+# already-selected signal frame. This constant is no longer read anywhere
+# and is kept only so old configs don't fail to import.
 RSL_BRAKE_WINDOW_RADIUS                = 2
 
 # LEGACY — used only by the old geometry-based (MediaPipe landmark) window

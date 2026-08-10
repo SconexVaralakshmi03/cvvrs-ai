@@ -15700,16 +15700,15 @@ class ViolationStore:
         already produced the final representative frame for every confirmed
         "hand_raise" violation.
 
-        For each such violation: reads a small +/-2 frame window around the
-        SAME already-selected frame from its source video (never a full
-        re-scan), re-derives pose landmarks for just those frames via the
-        existing HandRaisePoseEngine (imported, not modified), and -- if the
-        opposite hand is consistently on the RSL Hand Brake across that
-        window -- clones the exact same frame/timestamp/metadata into a new
-        "rsl_hand_brake" violation appended to self._violations. The clone
-        then flows through the existing extract_violation_frames() /
-        finalize() S3+DB upload path completely unmodified, exactly like
-        every other violation.
+        For each such violation: reads ONLY the SAME already-selected
+        signal frame from its source video (no neighbouring +/-2 frame
+        window, never a full re-scan), sends that single frame to Qwen-VL
+        (detector/rsl_hand_brake_verifier.py) -- and if confirmed, clones
+        the exact same frame/timestamp/metadata into a new
+        "rsl_hand_brake" violation appended to self._violations, with role
+        forced to "ALP". The clone then flows through the existing
+        extract_violation_frames() / finalize() S3+DB upload path
+        completely unmodified, exactly like every other violation.
         """
         import dataclasses as _dc
 
@@ -15733,61 +15732,53 @@ class ViolationStore:
         if not path_by_filename:
             return
 
-        from detector.hand_raise_detector import HandRaisePoseEngine
-        from detector.rsl_hand_brake_verifier import extract_frame_window, verify_rsl_hand_brake
+        from detector.rsl_hand_brake_verifier import extract_signal_frame, verify_rsl_hand_brake
 
-        engine = HandRaisePoseEngine()
         new_violations: List[_Violation] = []
 
-        try:
-            for v in hand_raise_violations:
-                src_file   = os.path.basename(getattr(v, "source_filename", "") or "")
-                video_path = path_by_filename.get(src_file)
-                if not video_path or not os.path.isfile(video_path):
-                    continue
+        for v in hand_raise_violations:
+            src_file   = os.path.basename(getattr(v, "source_filename", "") or "")
+            video_path = path_by_filename.get(src_file)
+            if not video_path or not os.path.isfile(video_path):
+                continue
 
-                cap = cv2.VideoCapture(video_path)
-                fps = (cap.get(cv2.CAP_PROP_FPS) or 25.0) if cap.isOpened() else 25.0
-                cap.release()
+            cap = cv2.VideoCapture(video_path)
+            fps = (cap.get(cv2.CAP_PROP_FPS) or 25.0) if cap.isOpened() else 25.0
+            cap.release()
 
-                local_str = getattr(v, "local_time_str", "0:00:00")
-                try:
-                    parts      = local_str.strip().split(":")
-                    local_secs = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-                except Exception:
-                    local_secs = 0.0
-
-                frames       = extract_frame_window(video_path, local_secs, fps)
-                center_frame = frames[len(frames) // 2] if frames else None
-                if center_frame is None:
-                    print(f"[ViolationStore] RSL verify: could not read the "
-                          f"selected hand_raise frame for {src_file} @ {local_secs:.2f}s -- skipping")
-                    continue
-
-                frame_h, frame_w = center_frame.shape[:2]
-                verdict = verify_rsl_hand_brake(frames, engine, frame_w, frame_h)
-                print(f"[ViolationStore] RSL verify for hand_raise "
-                      f"frame_index={v.frame_index} src={src_file}: {verdict}")
-
-                if not verdict["confirmed"]:
-                    continue
-
-                new_violations.append(_dc.replace(
-                    v,
-                    type            = "rsl_hand_brake",
-                    events          = ["rsl_hand_brake"],
-                    confidence      = round(float(verdict["confidence"]), 3),
-                    factors         = list(set(list(v.factors) + ["rsl_hand_brake", "opposite_hand_on_brake"])),
-                    annotated_frame = center_frame.copy(),
-                    frame_path      = None,
-                    status          = "TRUE",
-                    role            = None,
-                ))
-        finally:
+            local_str = getattr(v, "local_time_str", "0:00:00")
             try:
-                engine.close()
+                parts      = local_str.strip().split(":")
+                local_secs = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
             except Exception:
-                pass
+                local_secs = 0.0
+
+            signal_frame = extract_signal_frame(video_path, local_secs, fps)
+            if signal_frame is None:
+                print(f"[ViolationStore] RSL verify: could not read the "
+                      f"selected hand_raise frame for {src_file} @ {local_secs:.2f}s -- skipping")
+                continue
+
+            verdict = verify_rsl_hand_brake(
+                signal_frame, log_label=f"rsl_hand_brake:{src_file}@{local_secs:.2f}s",
+            )
+            print(f"[ViolationStore] RSL verify for hand_raise "
+                  f"frame_index={v.frame_index} src={src_file}: {verdict}")
+
+            if not verdict["confirmed"] or verdict["best_frame"] is None:
+                continue
+
+            new_violations.append(_dc.replace(
+                v,
+                type            = "rsl_hand_brake",
+                events          = ["rsl_hand_brake"],
+                confidence      = round(float(verdict["confidence"]), 3),
+                factors         = list(set(list(v.factors) + ["rsl_hand_brake", "opposite_hand_on_brake"])),
+                annotated_frame = verdict["best_frame"].copy(),
+                frame_path      = None,
+                status          = "TRUE",
+                role            = verdict["role"],
+            ))
 
         if new_violations:
             self._violations.extend(new_violations)

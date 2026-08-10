@@ -26200,19 +26200,17 @@ def analyze_journey(
     # This is not a standalone detector and never runs per-frame.
     #
     # For every confirmed "hand_raise" violation, this:
-    #   1. re-reads a small ±2 frame window around the SAME already-selected
-    #      frame from the correct source video (never a full re-scan),
-    #   2. sends ALL frames in that window directly to Qwen-VL in one call
+    #   1. re-reads ONLY the SAME already-selected signal frame from the
+    #      correct source video (no neighbouring ±2 frame window, never a
+    #      full re-scan),
+    #   2. sends that single frame directly to Qwen-VL in one call
     #      (detector/rsl_hand_brake_verifier.py → llm_verifier.py) — the
-    #      model itself judges signal acknowledgement, whether the
-    #      opposite/ALP hand is consistently on the RSL Hand Brake console
-    #      lever across the window, and LP/ALP role, with NO second
-    #      MediaPipe pass over the window,
-    #   3. Qwen also picks whichever ONE of those frames it judges the
-    #      clearest/most confident evidence frame, and
-    #   4. on success, clones the SAME timestamp/journey/video metadata
-    #      into a new "rsl_hand_brake" violation, using that model-chosen
-    #      frame (not necessarily the geometric middle) as its evidence.
+    #      model itself judges signal acknowledgement and whether the
+    #      opposite/ALP hand is on the RSL Hand Brake console lever in
+    #      that same frame, with NO second MediaPipe pass, and
+    #   3. on success, clones the SAME timestamp/journey/video metadata
+    #      into a new "rsl_hand_brake" violation, using that same frame
+    #      as its evidence and role forced to "ALP".
     #
     # The clone is appended to shared_vstore._violations BEFORE the existing
     # LLM-verification / frame-extraction / S3-upload loop below runs, so
@@ -26220,7 +26218,7 @@ def analyze_journey(
     # same way it already does for every other violation. Nothing here
     # mutates the original hand_raise violation or any existing logic above.
     try:
-        from detector.rsl_hand_brake_verifier import extract_frame_window, verify_rsl_hand_brake
+        from detector.rsl_hand_brake_verifier import extract_signal_frame, verify_rsl_hand_brake
 
         _rsl_path_by_filename: Dict[str, str] = {
             os.path.basename(vj.s3_key): tmp_paths[vj.video_id] for vj in ordered
@@ -26246,14 +26244,14 @@ def analyze_journey(
             fps        = _rsl_fps_by_filename.get(src_file) or 25.0
             local_secs = _hms_to_seconds(getattr(v, "local_time_str", "0:00:00"))
 
-            frames = extract_frame_window(tmp_path, local_secs, fps)
-            if not any(f is not None for f in frames):
-                print(f"[Analyzer:{job_id}]  RSL verify: could not read any frame in the "
-                      f"window for {src_file} @ {local_secs:.2f}s — skipping")
+            signal_frame = extract_signal_frame(tmp_path, local_secs, fps)
+            if signal_frame is None:
+                print(f"[Analyzer:{job_id}]  RSL verify: could not read the signal "
+                      f"frame for {src_file} @ {local_secs:.2f}s — skipping")
                 continue
 
             verdict = verify_rsl_hand_brake(
-                frames, log_label=f"rsl_hand_brake:{src_file}@{local_secs:.2f}s",
+                signal_frame, log_label=f"rsl_hand_brake:{src_file}@{local_secs:.2f}s",
             )
             print(f"[Analyzer:{job_id}]  RSL verify for hand_raise "
                   f"frame_index={v.frame_index} src={src_file}: "
@@ -26264,9 +26262,9 @@ def analyze_journey(
                 continue
 
             # Duplicate the exact same timestamp / journey / video /
-            # metadata — the type, events, factors, confidence, role and
-            # annotated_frame (the single best-confidence frame Qwen chose
-            # out of the 5 shown) differ.
+            # metadata — the type, events, factors, confidence, role
+            # (always "ALP" once confirmed) and annotated_frame (the same
+            # single signal frame that was sent to Qwen) differ.
             rsl_violation = dataclasses.replace(
                 v,
                 type            = "rsl_hand_brake",
