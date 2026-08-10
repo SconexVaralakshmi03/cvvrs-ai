@@ -385,8 +385,27 @@ HAND_RAISE_ZONE_SPLIT_RATIO         = 0.57
 # Qwen-VL (see llm_verifier.verify_rsl_hand_brake_frame /
 # prompt.build_rsl_hand_brake_prompt) for signal-acknowledgement +
 # brake-hand checking, in place of a second MediaPipe pose pass. No
-# neighbouring-frame window is read or sent. If confirmed, role is always
-# "ALP".
+# neighbouring-frame-in-TIME window is read or sent. If confirmed, role is
+# always "ALP".
+#
+# To help the model see a small/partially-occluded hand near the console
+# (root cause of missed RSL confirmations on otherwise-correct frames),
+# TWO images of that SAME frame are sent together: the full frame, and a
+# zoomed-in crop of the console/lever area cut from that identical frame.
+# This is spatial cropping of one frame, NOT a second frame in time.
+# Fractions are relative to full frame width/height (0.0-1.0), tuned to
+# this fleet's fixed in-cab camera framing (console lower-left, ALP
+# seat/console-edge center-right); adjust if a different camera mount is
+# introduced.
+RSL_BRAKE_ZOOM_X_START_FRACTION        = 0.05
+RSL_BRAKE_ZOOM_X_END_FRACTION          = 0.95
+RSL_BRAKE_ZOOM_Y_START_FRACTION        = 0.15
+RSL_BRAKE_ZOOM_Y_END_FRACTION          = 0.95
+
+# How much to upscale the cropped console region before sending it to
+# Qwen-VL, so a small hand/lever region isn't just a handful of pixels
+# once cropped out of a full cabin-wide frame.
+RSL_BRAKE_ZOOM_SCALE_FACTOR            = 2.0
 
 # LEGACY — the ±N frame verification window around frame N has been
 # removed; RSL Hand Brake verification now reads/sends ONLY the single
