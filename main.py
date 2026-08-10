@@ -1461,20 +1461,51 @@ class GadgetDetectionPipeline:
         # event_type="hand_raise" maps to the violationType string
         # "Hand Raise on signaling" — see the mapping added to
         # analyzer.py::_event_type_to_violation_type().
+        #
+        # BUGFIX (both LP and ALP signaling together only ever showed ONE of
+        # them) — hand_raise_log_events can contain MORE THAN ONE entry in
+        # the same cycle (one per pilot_id) when both crew members raise a
+        # hand at once, e.g. both acknowledging the same external signal.
+        # The old code took `next((hr for hr in hand_raise_results if
+        # hr.hand_raised), None)` — a SINGLE result — and called
+        # record_violation() ONCE regardless of how many pilots were in
+        # hand_raise_log_events that cycle, so the second pilot's gesture
+        # was silently dropped before it ever reached dedup/merge/LLM
+        # verification. Now loops over hand_raise_log_events and records
+        # one violation per pilot that actually signaled this cycle, each
+        # tagged with its own pilot_id (record_violation()'s dedup key now
+        # includes pilot_id — see utils/violation_store.py — so two
+        # simultaneous different-pilot events on the same global frame no
+        # longer collide into one).
+        #
+        # Also passes the LIVE in-memory `frame` as annotated_frame instead
+        # of None: unlike the phone_use/seat_absence/droop blocks above,
+        # hand_raise's event_local/event_global are NOT backdated
+        # (event_local = video_time, taken directly, no ALLOWED_DURATION
+        # subtraction), so the live frame at confirmation time IS already
+        # the correct evidence frame for the reported timestamp — no
+        # re-seek needed. This also means the RSL Hand Brake post-
+        # verification step (detector/rsl_hand_brake_verifier.py) can reuse
+        # this EXACT frame instead of re-seeking the video by timestamp a
+        # second time, removing any chance of the two checks ending up
+        # looking at two slightly different frames.
         if hand_raise_log_events:
-            hr_ref       = next((hr for hr in hand_raise_results if hr.hand_raised), None)
-            conf_hr      = hr_ref.confidence if hr_ref else 0.9
-            dur_hr       = hr_ref.timer_value if hr_ref else 0.0
             event_global = global_time
             event_local  = video_time
-            self.vstore.record_violation(
-                annotated_frame=None, original_frame=frame,
-                video_time=event_global, frame_index=global_frame,
-                event_type="hand_raise", severity="LOW",
-                confidence=conf_hr, risk_score=0, risk_level="LOW",
-                factors=["hand_raise", "signaling"], duration=dur_hr,
-                source_filename=self.source_filename, local_video_time=event_local,
-            )
+            hr_by_pilot  = {hr.pilot_id: hr for hr in hand_raise_results}
+            for _pid, _gesture_label in hand_raise_log_events:
+                hr_ref  = hr_by_pilot.get(_pid)
+                conf_hr = hr_ref.confidence  if hr_ref else 0.9
+                dur_hr  = hr_ref.timer_value if hr_ref else 0.0
+                self.vstore.record_violation(
+                    annotated_frame=frame.copy(), original_frame=frame,
+                    video_time=event_global, frame_index=global_frame,
+                    event_type="hand_raise", severity="LOW",
+                    confidence=conf_hr, risk_score=0, risk_level="LOW",
+                    factors=["hand_raise", "signaling"], duration=dur_hr,
+                    source_filename=self.source_filename, local_video_time=event_local,
+                    pilot_id=_pid,
+                )
             log_distraction(self.logger, event_global, event="Hand Raise on signaling", severity="LOW", frame=annotated)
 
         # ── NEW — close out true trigger→end durations (additive) ──────────────
@@ -1526,6 +1557,7 @@ class GadgetDetectionPipeline:
             self.vstore.close_violation_episode(
                 source_filename=self.source_filename, event_type="hand_raise",
                 start_video_time=_start_v, end_video_time=_end_v, duration=_true_dur,
+                pilot_id=_pid,
             )
 
         return annotated

@@ -15445,6 +15445,14 @@ class _Violation:
     #           always None when status == "FALSE". None until verified.
     status:                str            = "TRUE"
     role:                  Optional[str]  = None
+    # NEW — additive: which crew member (1/2, same convention as the rest
+    # of the pipeline) this specific violation instance belongs to, when
+    # known. None for every event type that doesn't tag it (unchanged
+    # behaviour for all of them). Populated for "hand_raise" so two
+    # different pilots signaling in the same cycle/time-window are never
+    # collapsed into a single violation — see record_violation(),
+    # _deduplicate_by_frame(), _merge_by_time_window() below.
+    pilot_id:              Optional[int]  = None
     # Kept for backward compatibility with any external code still reading
     # this attribute; no longer used to filter violations out of the
     # completion payload (rejected candidates are now kept, tagged
@@ -15517,16 +15525,25 @@ class ViolationStore:
         duration:         float = 0.0,
         source_filename:  str   = "",     # DB filename shown in original_video_timestamp
         local_video_time: float = -1.0,   # local time within the source file; -1 = same as video_time
+        pilot_id:         Optional[int] = None,  # NEW — see _Violation.pilot_id
     ) -> None:
         """
         Record one distraction event.
 
-        Deduplication key is (frame_index, event_type):
+        Deduplication key is (frame_index, event_type, pilot_id):
           • same event on the same global frame is recorded once
           • different events on the same global frame are each recorded
           • global frame_index is unique across videos (frame_offset applied in main.py)
+          • NEW — pilot_id is part of the key so two DIFFERENT pilots
+            triggering the SAME event_type on the SAME global frame (e.g.
+            both LP and ALP raising a hand to acknowledge the same signal
+            at once) are recorded as two separate violations instead of
+            the second silently deduplicating away. Callers that don't
+            pass pilot_id (every event type except hand_raise, unchanged)
+            keep the exact old behaviour — pilot_id=None is part of the
+            key for them too, so nothing changes for those event types.
         """
-        dedup_key = (frame_index, event_type)
+        dedup_key = (frame_index, event_type, pilot_id)
         if dedup_key in self._seen_frames:
             return
         self._seen_frames.add(dedup_key)
@@ -15569,6 +15586,7 @@ class ViolationStore:
                 annotated_frame  = (
                     annotated_frame.copy() if annotated_frame is not None else None
                 ),
+                pilot_id         = pilot_id,
             )
         )
 
@@ -15581,6 +15599,7 @@ class ViolationStore:
         start_video_time: float,
         end_video_time:   float,
         duration:         float,
+        pilot_id:         Optional[int] = None,  # NEW — see _Violation.pilot_id
     ) -> None:
         """
         Record that a previously-logged violation episode has genuinely
@@ -15591,29 +15610,40 @@ class ViolationStore:
         completed_events entry (see gadget_detector.py /
         seat_absence_detector.py / head_drop_detector.py). Finds the most
         recently recorded, not-yet-closed violation for this
-        (source_filename, event_type) and fills in its
+        (source_filename, event_type[, pilot_id]) and fills in its
         true_start_timestamp / true_end_timestamp / true_duration fields
         ONLY — every other field on that _Violation, and every other
         violation in the store, is left completely untouched. If no
         matching open violation is found (e.g. it was never actually
         confirmed/logged, or the episode was already closed), this is a
         harmless no-op.
+
+        NEW — pilot_id: when provided (currently only by the hand_raise
+        completion path in main.py), only a violation with a matching
+        pilot_id can be closed by this call. Without this, if both LP and
+        ALP had simultaneous open hand_raise episodes on the same source
+        file, this would always close whichever one was appended most
+        recently — potentially attributing one pilot's true_duration to
+        the other. Callers that don't pass pilot_id (every other event
+        type, unchanged) keep the exact old behaviour: match on
+        (source_filename, event_type) alone.
         """
         for v in reversed(self._violations):
             if (
                 v.source_filename == source_filename
                 and event_type in v.events
                 and v.true_duration is None
+                and (pilot_id is None or getattr(v, "pilot_id", None) == pilot_id)
             ):
                 v.true_start_timestamp = round(start_video_time, 2)
                 v.true_end_timestamp   = round(end_video_time, 2)
                 v.true_duration        = round(max(0.0, duration), 2)
                 print(f"[CLOSE-EPISODE] matched violation frame_index={v.frame_index} "
                       f"type={event_type!r} source={source_filename!r} "
-                      f"-> true_duration={v.true_duration}")
+                      f"pilot_id={pilot_id!r} -> true_duration={v.true_duration}")
                 return
         print(f"[CLOSE-EPISODE] NO MATCH for source={source_filename!r} "
-              f"event_type={event_type!r} (start={start_video_time:.2f} "
+              f"event_type={event_type!r} pilot_id={pilot_id!r} (start={start_video_time:.2f} "
               f"end={end_video_time:.2f} dur={duration:.2f}) — no open violation found")
 
     # ── Finalize ──────────────────────────────────────────────────────────────
@@ -15700,15 +15730,23 @@ class ViolationStore:
         already produced the final representative frame for every confirmed
         "hand_raise" violation.
 
-        For each such violation: reads ONLY the SAME already-selected
-        signal frame from its source video (no neighbouring +/-2 frame
-        window, never a full re-scan), sends that single frame to Qwen-VL
-        (detector/rsl_hand_brake_verifier.py) -- and if confirmed, clones
-        the exact same frame/timestamp/metadata into a new
-        "rsl_hand_brake" violation appended to self._violations, with role
-        forced to "ALP". The clone then flows through the existing
-        extract_violation_frames() / finalize() S3+DB upload path
-        completely unmodified, exactly like every other violation.
+        For each such violation: reuses the EXACT same frame already
+        captured for it in memory (v.annotated_frame -- set at detection
+        time in main.py, still populated at this point since this runs
+        BEFORE extract_violation_frames() clears it) whenever available,
+        so this step and the Hand Raising LLM check upstream are
+        guaranteed to be looking at the identical pixels for the identical
+        moment -- no second, independent re-seek of the video that could
+        land on a slightly different frame. Falls back to re-seeking via
+        extract_signal_frame() only if no in-memory frame is available
+        (e.g. an older/foreign _Violation that never carried one). Sends
+        that single frame to Qwen-VL (detector/rsl_hand_brake_verifier.py)
+        -- and if confirmed, clones the exact same frame/timestamp/
+        metadata into a new "rsl_hand_brake" violation appended to
+        self._violations, with role forced to "ALP". The clone then flows
+        through the existing extract_violation_frames() / finalize()
+        S3+DB upload path completely unmodified, exactly like every other
+        violation.
         """
         import dataclasses as _dc
 
@@ -15729,31 +15767,32 @@ class ViolationStore:
             if vp:
                 path_by_filename[os.path.basename(vp)] = vp
 
-        if not path_by_filename:
-            return
-
         from detector.rsl_hand_brake_verifier import extract_signal_frame, verify_rsl_hand_brake
 
         new_violations: List[_Violation] = []
 
         for v in hand_raise_violations:
             src_file   = os.path.basename(getattr(v, "source_filename", "") or "")
-            video_path = path_by_filename.get(src_file)
-            if not video_path or not os.path.isfile(video_path):
-                continue
-
-            cap = cv2.VideoCapture(video_path)
-            fps = (cap.get(cv2.CAP_PROP_FPS) or 25.0) if cap.isOpened() else 25.0
-            cap.release()
-
-            local_str = getattr(v, "local_time_str", "0:00:00")
+            local_str  = getattr(v, "local_time_str", "0:00:00")
             try:
                 parts      = local_str.strip().split(":")
                 local_secs = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
             except Exception:
                 local_secs = 0.0
 
-            signal_frame = extract_signal_frame(video_path, local_secs, fps)
+            if v.annotated_frame is not None:
+                # Preferred path — the exact frame already captured for
+                # this violation, no re-seek involved.
+                signal_frame = v.annotated_frame
+            else:
+                video_path = path_by_filename.get(src_file)
+                if not video_path or not os.path.isfile(video_path):
+                    continue
+                cap = cv2.VideoCapture(video_path)
+                fps = (cap.get(cv2.CAP_PROP_FPS) or 25.0) if cap.isOpened() else 25.0
+                cap.release()
+                signal_frame = extract_signal_frame(video_path, local_secs, fps)
+
             if signal_frame is None:
                 print(f"[ViolationStore] RSL verify: could not read the "
                       f"selected hand_raise frame for {src_file} @ {local_secs:.2f}s -- skipping")
@@ -15795,9 +15834,18 @@ class ViolationStore:
         # merging by time window the stored frame_index is the base's global
         # index). The safe dedup key must include source_filename so violations
         # from different source files never collide.
+        #
+        # FIX (both LP and ALP signaling together only ever showed ONE of
+        # them): the key must also include pilot_id — two DIFFERENT pilots'
+        # violations that happen to share the same (source_filename,
+        # frame_index) — e.g. both raising a hand in the same cycle — must
+        # stay distinct here too, or this step alone would collapse them
+        # right back into one even after record_violation()'s own dedup was
+        # fixed to tell them apart. pilot_id is None for every other event
+        # type, so this is a no-op change for all of them.
         unique: Dict[tuple, _Violation] = {}
         for v in self._violations:
-            key = (v.source_filename, v.frame_index)
+            key = (v.source_filename, v.frame_index, getattr(v, "pilot_id", None))
             if key not in unique:
                 unique[key] = v
             else:
@@ -15818,7 +15866,23 @@ class ViolationStore:
         merged: List[_Violation] = []
         group  = [self._violations[0]]
         for v in self._violations[1:]:
-            if abs(v.timestamp - group[-1].timestamp) <= MERGE_WINDOW:
+            # FIX (both LP and ALP signaling together only ever showed ONE
+            # of them): merging purely by elapsed time collapsed two
+            # DIFFERENT pilots' simultaneous violations (e.g. both
+            # acknowledging the same signal within MERGE_WINDOW seconds of
+            # each other) into a single _Violation, and _merge_group() below
+            # only ever kept ONE role — so the second pilot's event vanished
+            # from the report entirely. A violation only extends the current
+            # group now if it is untagged (pilot_id is None, i.e. every
+            # event type except hand_raise — unchanged behaviour) or its
+            # pilot_id matches every non-None pilot_id already in the group;
+            # otherwise it starts a new group so each pilot's own instance
+            # of the event survives as its own violation.
+            group_pilot_ids = {g.pilot_id for g in group if g.pilot_id is not None}
+            same_pilot_or_untagged = (
+                v.pilot_id is None or not group_pilot_ids or v.pilot_id in group_pilot_ids
+            )
+            if abs(v.timestamp - group[-1].timestamp) <= MERGE_WINDOW and same_pilot_or_untagged:
                 group.append(v)
             else:
                 merged.append(self._merge_group(group))
@@ -15871,6 +15935,7 @@ class ViolationStore:
             true_duration         = base.true_duration,
             role                  = base.role,
             llm_rejected          = base.llm_rejected,
+            pilot_id              = base.pilot_id,
         )
         print(f"[MERGE] frame_index={base.frame_index} true_durations "
               f"before={before_durations} -> after={merged.true_duration}")
