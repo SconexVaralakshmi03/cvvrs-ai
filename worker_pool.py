@@ -364,9 +364,13 @@ from journey_runner import run_worker_loop
 
 log = logging.getLogger("worker_pool")
 
-# Number of persistent GPU worker processes. Configurable — this is the
-# "GPU_WORKERS = 2" knob from the requirements. Each one keeps its own
-# YOLO/TensorRT/CUDA context loaded for as long as the service runs.
+# Size of the GPU worker POOL — this is the "GPU_WORKERS = 2" knob from
+# the requirements. This many worker processes are alive at any given
+# moment, but each individual worker process handles exactly ONE journey
+# and then exits (recycled) — see journey_runner.run_worker_loop() and
+# GPUWorkerPool.recycle_worker(). The pool itself is what stays at this
+# size for the life of the service; individual PIDs churn as each worker
+# finishes its journey and is replaced.
 GPU_WORKERS = int(os.environ.get("GPU_WORKERS", "2"))
 
 # How long to wait for a worker to exit cleanly after a shutdown/replace
@@ -390,12 +394,20 @@ class JourneyHandle:
     attributes consumer.py's existing polling loop already knows how to
     drain, plus the two outcomes that loop needs to distinguish:
 
-      • The journey finished (cleanly or with a caught error) — the
-        worker process itself is healthy. Call mark_finished() to return
-        it to the pool for the next journey.
-      • The journey's worker died or had to be killed (crash / OOM /
-        timeout) — call discard() instead. The pool replaces the worker
-        with a fresh one; it is never returned to the free list.
+      • The journey finished (cleanly, or with its failure already
+        reported) and the worker process itself handled it without
+        crashing. Call mark_finished() — per the worker memory-lifecycle
+        requirement, a worker is ALWAYS recycled (process exit + fresh
+        replacement) once it completes an entire journey; it is never
+        returned to the free pool for reuse. This guarantees every
+        native allocation the worker made while processing that journey
+        (YOLO/PyTorch/CUDA context, OpenCV buffers, MediaPipe graphs,
+        frame arrays, ViolationStore, temp journey objects, ...) is
+        released back to the OS when its process exits.
+      • The journey's worker died or had to be killed (native crash /
+        OOM / hung / timeout) — call discard() instead. Same end state
+        (worker retired, fresh replacement spawned) but logged/handled
+        as an abnormal outcome rather than a normal completion.
     """
 
     def __init__(self, worker: "_Worker", pool: "GPUWorkerPool"):
@@ -412,13 +424,25 @@ class JourneyHandle:
     def is_alive(self) -> bool:
         return self._worker.process.is_alive()
 
-    def mark_finished(self) -> None:
-        """The journey finished and the worker process is still healthy —
-        return it to the pool so it can pick up the next queued journey."""
+    def mark_finished(self, reason: str = "JOURNEY_COMPLETE") -> None:
+        """
+        The worker finished processing its ENTIRE journey — every video
+        attempted, the final journey result already handed off to the
+        parent over result_q — without the process itself crashing.
+
+        `reason` is JOURNEY_COMPLETE for a normal completion or
+        JOURNEY_FAILED when the journey ended because it was marked
+        FAILED and its failure result was already sent (see consumer.py's
+        call site). Either way the worker is recycled the same way: it is
+        NEVER returned to the free pool for reuse. This worker is retired
+        for good and a fresh replacement is spawned immediately after, so
+        GPU_WORKERS stays constant and every OTHER worker keeps running
+        completely untouched.
+        """
         if self._resolved:
             return
         self._resolved = True
-        self._pool.release(self._worker)
+        self._pool.recycle_worker(self._worker, reason=reason)
 
     def discard(self) -> None:
         """The worker crashed, hung, or had to be force-killed after a
@@ -483,7 +507,7 @@ class GPUWorkerPool:
             self._workers.append(worker)
             self._free_list.append(worker)
             self._not_empty.notify()
-        log.info("[WorkerPool] Worker %d started  pid=%s", wid, process.pid)
+        log.info("[WORKER START] worker_id=%d pid=%s", wid, process.pid)
         return worker
 
     def shutdown(self) -> None:
@@ -518,7 +542,15 @@ class GPUWorkerPool:
             return self._free_list.pop(0)
 
     def release(self, worker: "_Worker") -> None:
-        """Return a healthy, idle worker to the free pool."""
+        """
+        Return a healthy, idle worker to the free pool for reuse.
+
+        NOT used by mark_finished() any more — per the worker
+        memory-lifecycle requirement every worker is recycled (see
+        recycle_worker() below) after completing a journey rather than
+        reused, so its runtime memory is guaranteed to be released back
+        to the OS. Kept only as a low-level primitive / for tests.
+        """
         if not worker.process.is_alive():
             # Died between finishing its journey and being released —
             # treat exactly like any other crash.
@@ -528,6 +560,68 @@ class GPUWorkerPool:
             if worker in self._workers and worker not in self._free_list:
                 self._free_list.append(worker)
                 self._not_empty.notify()
+
+    def recycle_worker(self, worker: "_Worker", reason: str = "JOURNEY_COMPLETE") -> None:
+        """
+        Retire a worker that just finished its ONE journey (successfully,
+        or with its failure already reported) and spawn a fresh
+        replacement so the pool always has exactly `size` live workers.
+
+        This is the core of the worker memory-lifecycle requirement:
+        journey_runner.run_worker_loop() processes exactly one journey
+        per worker process and then returns, letting the process exit on
+        its own right after the final result is safely on result_q. That
+        process exit is what guarantees the OS reclaims every native
+        allocation the worker made (YOLO/PyTorch/CUDA context, OpenCV
+        buffers, MediaPipe graphs, NumPy frame arrays, the journey's
+        ViolationStore/frame cache, temp journey objects, ...) — we don't
+        rely on Python-level garbage collection alone for that.
+
+        Only the ONE worker passed in is touched: every other worker in
+        the pool keeps running its own journey completely undisturbed,
+        RabbitMQ / the consumer connection are untouched, and no other
+        global state is cleared.
+        """
+        pid = worker.process.pid
+        log.info("[WORKER RECYCLE] worker_id=%d pid=%s reason=%s", worker.id, pid, reason)
+
+        # The worker exits on its own (run_worker_loop returns) right
+        # after finishing its journey — give it a bounded window to do
+        # so cleanly. Only if it's still alive after that (e.g. stuck in
+        # a hung CUDA sync during its own cleanup) do we force it, so a
+        # single misbehaving worker can never stall the whole pool.
+        try:
+            worker.process.join(timeout=_WORKER_JOIN_TIMEOUT_SECONDS)
+            if worker.process.is_alive():
+                log.warning(
+                    "[WorkerPool] Worker %d (pid=%s) did not exit within "
+                    "%.0fs of finishing its journey — forcing termination.",
+                    worker.id, pid, _WORKER_JOIN_TIMEOUT_SECONDS,
+                )
+                worker.process.terminate()
+                worker.process.join(timeout=5)
+                if worker.process.is_alive():
+                    worker.process.kill()
+                    worker.process.join(timeout=5)
+        except Exception:
+            log.warning("[WorkerPool] Error joining worker %d during recycle",
+                        worker.id, exc_info=True)
+
+        exit_code = worker.process.exitcode
+        log.info("[WORKER EXIT] worker_id=%d pid=%s exit_code=%s", worker.id, pid, exit_code)
+
+        with self._lock:
+            if worker in self._workers:
+                self._workers.remove(worker)
+            if worker in self._free_list:
+                self._free_list.remove(worker)
+
+        if self._started:
+            new_worker = self._spawn_worker()
+            log.info(
+                "[WORKER REPLACEMENT] worker_id=%d old_pid=%s new_pid=%s",
+                worker.id, pid, new_worker.process.pid,
+            )
 
     def replace_dead_worker(self, worker: "_Worker") -> None:
         """A worker crashed, hung, or was force-killed after a timeout —

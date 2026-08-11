@@ -2980,6 +2980,29 @@ def run_journey_in_subprocess(
     )
 
 
+def _worker_memory_line(job_id: str = "") -> str:
+    """
+    Best-effort 'RSS=...GB GPU=...GB' fragment for worker lifecycle log
+    lines (see run_worker_loop below). Reuses the same RSS/GPU snapshot
+    helpers analyzer.py and resource_manager.py already use elsewhere, so
+    the numbers are directly comparable to the rest of the memory logging
+    around a journey. Never raises — falls back to 'n/a' fields.
+    """
+    rss_str = "n/a"
+    gpu_str = "n/a"
+    try:
+        from resource_manager import get_process_snapshot, get_gpu_memory_info
+        snap = get_process_snapshot()
+        if snap.rss_gb >= 0:
+            rss_str = f"{snap.rss_gb:.3f}GB"
+        gpu = get_gpu_memory_info()
+        if gpu.available:
+            gpu_str = f"{gpu.reserved_gb:.3f}GB"
+    except Exception:
+        pass
+    return f"RSS={rss_str} GPU={gpu_str}"
+
+
 def run_worker_loop(
     worker_id: int,
     job_queue: "mp.Queue",
@@ -2987,74 +3010,107 @@ def run_worker_loop(
     result_q: "mp.Queue",
 ) -> None:
     """
-    Target function for a PERSISTENT GPU worker process (multiprocessing
-    .Process, spawned once at service startup by worker_pool.py and kept
-    alive for the lifetime of the service).
+    Target function for a GPU worker process (multiprocessing.Process,
+    spawned by worker_pool.py — once at service startup for the initial
+    pool, and again by GPUWorkerPool.recycle_worker() every time a worker
+    finishes a journey).
 
-    Loads nothing eagerly. The YOLO model (gadget_detector._get_model())
-    lazy-loads on the first video of the first journey this worker
-    processes, and then stays resident — model weights, CUDA context, the
-    works — in this process's memory for every subsequent journey handed
-    to it, for as long as this worker lives. That is the entire point of
-    the persistent worker-pool architecture: journeys arrive one after
-    another on job_queue, but "Load YOLO / Load TensorRT / Initialize
-    CUDA" only ever happens once per worker, not once per journey.
+    ── Worker memory lifecycle ─────────────────────────────────────────
+    This worker processes EXACTLY ONE journey and then returns, letting
+    the process exit on its own. It does NOT loop back to wait for a
+    second journey. That single-journey-per-process design is the whole
+    point: process exit is the only mechanism that reliably guarantees
+    the OS reclaims every native allocation the journey made — YOLO
+    model runtime memory, PyTorch CPU/CUDA memory and the worker's CUDA
+    context, OpenCV native buffers/VideoCapture/VideoWriter resources,
+    MediaPipe native graph resources, NumPy frame arrays, the journey's
+    ViolationStore/frame cache, temp journey objects, and any other
+    native allocation belonging to this worker. gc.collect() /
+    torch.cuda.empty_cache() alone (already run inside
+    resource_manager.cleanup_after_journey(), see below) cannot
+    guarantee that; only the process actually exiting can.
+
+    worker_pool.py (the parent) detects this worker's exit, joins it, and
+    immediately spawns a fresh replacement worker so the configured
+    GPU_WORKERS pool size is always maintained. GPU_WORKERS is never
+    reduced by this — see GPUWorkerPool.recycle_worker(). Only THIS
+    worker is recycled; every other worker keeps processing its own
+    journey completely undisturbed.
+
+    The worker is recycled only after the ENTIRE journey finishes — every
+    video in it has been attempted and the final journey result (success
+    or already-marked-failed) has been safely handed to the parent over
+    result_q — never mid-journey / after a single video.
 
     job_queue protocol
     ───────────────────
-    Each item is either:
+    The single item this worker ever reads is either:
       • a 5-tuple (job_id, journey_id, folder_name, video_jobs, tmp_paths)
-        — process this journey, then loop back and wait for the next one.
-      • None — shutdown sentinel; exit the loop and let the process end.
-
-    events_q / result_q are the SAME pair of queues for every journey this
-    worker ever processes (created once by worker_pool.py alongside
-    job_queue) — the caller distinguishes one journey's events from
-    another's by only ever having one journey in flight per worker at a
-    time (worker_pool.py enforces this: a worker is only handed a new job
-    once the previous one's result has been consumed).
+        — process this one journey, then exit.
+      • None — shutdown sentinel (no journey was ever assigned to this
+        worker); exit immediately.
     """
     # Keep OpenCV/MKL/etc. from oversubscribing CPU when several worker
     # processes run concurrently on the same host.
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_MSMF", "0")
 
-    print(f"[GPUWorker-{worker_id}]  Started  pid={os.getpid()}  "
-          f"— waiting for journeys (model loads lazily on first video)...")
+    pid = os.getpid()
+    print(f"[WORKER START] worker_id={worker_id} pid={pid}")
+    print(f"[GPUWorker-{worker_id}]  Started  pid={pid}  "
+          f"— waiting for one journey (model loads lazily on first video)...")
 
-    while True:
-        job = job_queue.get()  # blocks until a journey arrives or shutdown
-        if job is None:
-            print(f"[GPUWorker-{worker_id}]  Shutdown signal received — exiting.")
-            break
+    job = job_queue.get()  # blocks until a journey arrives or shutdown
+    if job is None:
+        print(f"[GPUWorker-{worker_id}]  Shutdown signal received before "
+              f"any journey was assigned — exiting.")
+        print(f"[WORKER EXIT] worker_id={worker_id} pid={pid} exit_code=0")
+        return
 
-        job_id, journey_id, folder_name, video_jobs, tmp_paths = job
-        print(f"[GPUWorker-{worker_id}]  Picked up journey job={job_id} "
-              f"({len(video_jobs)} video(s)).")
+    job_id, journey_id, folder_name, video_jobs, tmp_paths = job
+    print(f"[GPUWorker-{worker_id}]  Picked up journey job={job_id} "
+          f"({len(video_jobs)} video(s)).")
+    print(f"[JOURNEY START] worker_id={worker_id} pid={pid} "
+          f"journey_id={journey_id}\n{_worker_memory_line(job_id)}")
+
+    recycle_reason = "JOURNEY_COMPLETE"
+    try:
+        _process_one_journey(
+            job_id, journey_id, folder_name, video_jobs, tmp_paths,
+            events_q, result_q,
+        )
+    except BaseException as exc:  # noqa: BLE001 - last line of defense
+        # _process_one_journey already catches everything it can and
+        # reports via result_q itself; this only fires for something
+        # unexpected in the loop plumbing around it. A true native
+        # crash (OOM/access violation/segfault) will NOT reach this
+        # except — it kills the process directly, which worker_pool.py
+        # detects via is_alive() and handles the same way (replacement
+        # spawned) via its crash path instead.
+        recycle_reason = "JOURNEY_FAILED"
         try:
-            _process_one_journey(
-                job_id, journey_id, folder_name, video_jobs, tmp_paths,
-                events_q, result_q,
-            )
-        except BaseException as exc:  # noqa: BLE001 - last line of defense
-            # _process_one_journey already catches everything it can and
-            # reports via result_q itself; this only fires for something
-            # unexpected in the loop plumbing around it. A true native
-            # crash (OOM/access violation/segfault) will NOT reach this
-            # except — it kills the process directly, which worker_pool.py
-            # detects via is_alive() and handles by spawning a replacement.
-            try:
-                result_q.put({
-                    "type":      "error",
-                    "message":   str(exc),
-                    "traceback": traceback.format_exc(),
-                })
-            except Exception:
-                pass
-        # ── Loop back — model/CUDA context stay loaded ────────────────────
-        # Only this journey's temporary resources were released above
-        # (resource_manager.cleanup_after_journey(), inside
-        # _process_one_journey's finally block). The worker is now idle
-        # and ready for the next journey worker_pool.py assigns it.
-        print(f"[GPUWorker-{worker_id}]  Finished journey job={job_id} "
-              f"— waiting for next journey.")
+            result_q.put({
+                "type":      "error",
+                "message":   str(exc),
+                "traceback": traceback.format_exc(),
+            })
+        except Exception:
+            pass
+
+    print(f"[JOURNEY COMPLETE] worker_id={worker_id} pid={pid} "
+          f"journey_id={journey_id}\n{_worker_memory_line(job_id)}")
+
+    # ── Recycle this worker — process exit, not reuse ─────────────────────
+    # Every journey-temporary resource has already been released above
+    # (resource_manager.cleanup_after_journey(), run inside
+    # _process_one_journey's finally block — CUDA cache flush + GC). What
+    # remains resident (YOLO model weights, CUDA context, any lingering
+    # native handles) is released only by this process actually exiting,
+    # which is exactly what returning from run_worker_loop now does —
+    # worker_pool.py's recycle_worker() is waiting on this process to
+    # exit and will spawn this worker's replacement the moment it does.
+    print(f"[GPUWorker-{worker_id}]  Finished journey job={job_id} — "
+          f"recycling this worker (reason={recycle_reason}).")
+    print(f"[WORKER RECYCLE] worker_id={worker_id} pid={pid} "
+          f"reason={recycle_reason}")
+    print(f"[WORKER EXIT] worker_id={worker_id} pid={pid} exit_code=0")

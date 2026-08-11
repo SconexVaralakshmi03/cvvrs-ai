@@ -26005,11 +26005,14 @@ def analyze_journey(
         #   • Break out of the loop — do NOT attempt any more videos.
         #   • Preserved: all VideoResult / violation data for videos 1..idx-1.
         #
-        # We catch BaseException (not just Exception) because pipeline.run()
-        # calls sys.exit(1) on unreadable files — SystemExit is a BaseException.
-        # KeyboardInterrupt and SystemExit are re-raised so they propagate
-        # to the consumer's outer handler (nack + DLQ) instead of being
-        # treated as per-video errors.
+        # We catch BaseException (not just Exception) as defense-in-depth.
+        # Unreadable/unopenable video files raise an ordinary RuntimeError
+        # (see main.py's run() — "Cannot open source") which is caught as
+        # a normal per-video failure below and does NOT stop the journey.
+        # KeyboardInterrupt and SystemExit are still explicitly re-raised
+        # so a genuine interpreter-level interrupt/exit propagates to the
+        # consumer's outer handler (nack + DLQ) instead of being silently
+        # treated as a per-video error.
         #
         # video_done_cb is fired after every video (success OR failure) so the
         # parent subprocess monitor always knows which videos finished before a

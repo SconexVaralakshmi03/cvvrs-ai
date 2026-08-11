@@ -763,9 +763,17 @@ def _run_journey_supervised(
 
     # ── Clean outcome: the worker computed a full result ───────────────────
     if result_payload is not None:
-        # The worker process itself is healthy — return it to the pool so
-        # it can pick up the next queued journey (model stays loaded).
-        handle.mark_finished()
+        # The worker process itself finished its journey without
+        # crashing. Per the worker memory-lifecycle requirement it is
+        # ALWAYS recycled here (process exit + fresh replacement), never
+        # returned to the pool for reuse — see worker_pool.py's
+        # recycle_worker(). `reason` is only used for logging: a normal
+        # completion vs. a journey that ended because it was marked
+        # FAILED and its failure result was already handed off above.
+        handle.mark_finished(
+            reason="JOURNEY_COMPLETE"
+            if result_payload.get("type") == "result" else "JOURNEY_FAILED"
+        )
 
         if result_payload.get("type") == "result":
             video_results = [_video_result_from_dict(vr) for vr in result_payload["video_results"]]

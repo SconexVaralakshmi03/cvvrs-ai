@@ -995,7 +995,24 @@ class GadgetDetectionPipeline:
                 cap.release()
             except Exception:
                 pass
-            sys.exit(1)
+            # FIX (skip-unreadable-video): this used to be sys.exit(1),
+            # which raises SystemExit. analyzer.py's per-video try/except
+            # deliberately re-raises SystemExit/KeyboardInterrupt (so a
+            # real interpreter-level exit still propagates), which meant
+            # one unreadable/corrupt video file killed the ENTIRE worker
+            # process — no remaining videos in the journey were processed
+            # and no journey JSON was ever produced.
+            #
+            # Raising a plain RuntimeError instead makes this an ordinary
+            # per-video failure: analyzer.py's `except BaseException as
+            # video_exc` catches it, classify_video_error() maps the
+            # "Cannot open source" message to error_type=DECODE_ERROR
+            # (see callback_client.py), this video is recorded as failed
+            # with zero violations, and the loop continues on to the next
+            # video in the journey. The journey then finishes normally and
+            # the final result JSON is generated for every video that
+            # could be processed.
+            raise RuntimeError(f"Cannot open source: {self.source!r}")
 
         _raw_fps = cap.get(cv2.CAP_PROP_FPS)
         fps    = _raw_fps or 25.0
