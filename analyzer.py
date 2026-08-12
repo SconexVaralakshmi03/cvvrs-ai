@@ -25843,7 +25843,6 @@ def analyze_journey(
     tmp_paths:     Dict[int, str],       # video_id → local tmp file path
     progress_cb    = None,               # optional callable(pct, msg, current_video)
     video_done_cb  = None,               # optional callable(video_id, ok, error, error_type, stack_trace, reason, video_result)
-    heartbeat_cb   = None,               # optional callable(video_id, raw_frame_no, video_time) — see journey_runner.py
 ) -> Tuple[List[VideoResult], float, Dict[int, str]]:
     """
     Run the full detection pipeline over all videos in a journey.
@@ -25980,11 +25979,6 @@ def analyze_journey(
             time_offset      = time_offset,
             frame_offset     = frame_offset,
             source_filename  = db_filename,
-            heartbeat_cb     = (
-                (lambda raw_frame_no, video_time, _vid=vj.video_id:
-                    heartbeat_cb(_vid, raw_frame_no, video_time))
-                if heartbeat_cb is not None else None
-            ),
         )
 
         # ── Per-video error isolation (Scenario 1 & 2) ───────────────────────
@@ -26159,38 +26153,6 @@ def analyze_journey(
         # already explicitly shut down/closed) can be collected promptly
         # rather than living until the next loop iteration reassigns it.
         del pipeline
-
-        # FIX (RSS climbs steadily video-over-video with no exception,
-        # eventually OOM-killed by the OS mid-video with zero traceback —
-        # observed: RSS 0.5→1.7→2.1→2.6→2.8→3.1→3.4GB over videos 1-6,
-        # worker silently killed partway through video 7 of 10).
-        #
-        # `del pipeline` above only drops ONE reference. GadgetDetectionPipeline
-        # owns a ThreadPoolExecutor, several MediaPipe graphs, and a YOLO/torch
-        # detector — native-extension objects that commonly hold internal
-        # reference CYCLES (e.g. callback closures capturing self, C++ handle
-        # wrappers referencing their owning Python object). A cycle is NOT
-        # freed by refcounting alone; it only gets collected the next time
-        # Python's cyclic garbage collector actually runs, which is
-        # threshold-based, not deterministic — so a fresh ~300-500MB/video
-        # pipeline can sit alive-but-unreachable for an arbitrary number of
-        # further videos before gc happens to run, compounding until the
-        # process is OOM-killed by the OS (no Python exception at all, since
-        # the OS kill is a SIGKILL, not something Python can catch).
-        #
-        # Forcing collection HERE, immediately after the only reference is
-        # dropped and before the next (heavier) pipeline is constructed,
-        # reclaims that cycle deterministically every single video instead
-        # of leaving it to chance.
-        _gc_rss_before = _rss_gb()
-        gc.collect()
-        _gc_rss_after  = _rss_gb()
-        if _gc_rss_before >= 0 and _gc_rss_after >= 0:
-            print(
-                f"[Analyzer:{job_id}]  gc.collect() after video_id={vj.video_id}: "
-                f"RSS {_gc_rss_before:.3f}GB → {_gc_rss_after:.3f}GB "
-                f"(freed {_gc_rss_before - _gc_rss_after:+.3f}GB)"
-            )
 
         # Advance offsets for the next video regardless of success/failure.
         # Using the metadata we already captured keeps offsets consistent for
