@@ -25592,6 +25592,8 @@ import gc
 import json
 import logging
 import os
+import shutil
+import tempfile
 import threading
 import time
 from typing import Dict, List, Tuple
@@ -25817,11 +25819,46 @@ def _persist_and_release_video_evidence(
     if not mine:
         return
 
-    # Unmodified existing extraction logic -- writes local JPEGs under
-    # outputs/<analysis_id>/frames/, sets v.frame_path to the local
-    # relative path, and clears v.annotated_frame for every violation in
-    # `mine`.
-    shared_vstore.extract_violation_frames(video_path)
+    # ── Root-cause fix (0 frames saved for videos 3/4) ─────────────────────
+    # ViolationStore.extract_violation_frames() (unmodified — shared with
+    # standalone/CLI mode, see utils/violation_store.py) matches violations
+    # to a video purely by comparing os.path.basename(video_path) against
+    # each violation's v.source_filename. It assumes the path it's given
+    # is named like the real/original video file.
+    #
+    # In journey/batch mode (this function), `video_path` is actually
+    # `tmp_path` — the video downloaded to a RANDOMLY-NAMED local temp file
+    # (e.g. "/tmp/tmpu_9l0ypv.mp4"), whose basename never equals
+    # db_filename (e.g. "003_ch04_20260202030309.mp4", the name
+    # v.source_filename was recorded with in main.py). That mismatch made
+    # extract_violation_frames()'s internal filter match nothing, hence
+    # "[ViolationStore] 0 frames saved for 'tmpu_9l0ypv.mp4'" and
+    # "Persisted 0/16" / "Persisted 0/4" in the logs even though 16 and 4
+    # suspected violations existed for those videos.
+    #
+    # Fix: give extract_violation_frames() a same-content path whose
+    # basename IS db_filename (a symlink to the real tmp file — no extra
+    # video-sized disk copy), instead of changing
+    # extract_violation_frames() itself, which other callers (standalone
+    # mode, where video_path's basename already equals source_filename)
+    # rely on unmodified.
+    alias_dir  = tempfile.mkdtemp(prefix="evidence_src_")
+    alias_path = os.path.join(alias_dir, db_filename)
+    try:
+        try:
+            os.symlink(os.path.abspath(video_path), alias_path)
+        except OSError:
+            # Symlinks unsupported/denied on this filesystem — fall back
+            # to a real copy so extraction still works.
+            shutil.copy2(video_path, alias_path)
+
+        # Unmodified existing extraction logic -- writes local JPEGs under
+        # outputs/<analysis_id>/frames/, sets v.frame_path to the local
+        # relative path, and clears v.annotated_frame for every violation
+        # in `mine`.
+        shared_vstore.extract_violation_frames(alias_path)
+    finally:
+        shutil.rmtree(alias_dir, ignore_errors=True)
 
     uploaded = 0
     for v in mine:

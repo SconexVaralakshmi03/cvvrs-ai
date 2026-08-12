@@ -162,19 +162,36 @@ If verified is false, set role to "Unknown" and confidence to 0.
 _MOBILE_PHONE_CRITERIA = """
 Candidate violation to verify: MOBILE PHONE USAGE.
 
-Verify (verified = true) ONLY if ALL of the following are clearly true:
-- A mobile phone is clearly and unmistakably visible.
-- A person is visibly holding the phone.
-- The object is unambiguously a mobile phone (not a similarly shaped
-  object).
+Verify (verified = true) ONLY if ALL of the following criteria are unambiguously met:
+
+1. HARDWARE IDENTIFICATION: An actual physical mobile phone device is directly visible.
+   You must clearly identify physical electronic device attributes, such as a flat
+   rectangular face, glass screen reflection, camera bump, straight device edges, or
+   a distinct phone case/bezel.
+2. PHYSICAL GRASP: Human fingers or a hand are visibly gripping or holding that
+   distinct physical electronic object.
+3. VISUAL SEPARATION: The phone object must be visually distinct from human skin,
+   ears, hair, clothing, background shadows, or cabin hardware.
 
 Reject (verified = false) if ANY of the following apply:
-- The phone (or suspected phone) is blurry or partially hidden.
-- The object's identity as a phone is uncertain.
-- The phone belongs to a different person than the one being evaluated.
-- It is a dashboard-mounted phone / device rather than being held by a
-  person.
-- You are not fully certain.
+
+- HAND-TO-HEAD POSES (FALSE POSITIVE HAZARD): The person's hand, fist, thumb, or
+  fingers are resting on or positioned near the ear, cheek, temple, chin, or mouth,
+  BUT no physical rectangular electronic device is visible between/under the fingers.
+- NATURAL CABIN GESTURES: The person is rubbing their face, resting their head on
+  their hand, scratching their head/ear, resting their chin, or adjusting eyeglasses/headsets.
+- AMBIGUOUS OCCLUSION: The space between the hand and face is shadowed, dark, or
+  partially hidden such that you must GUESS or INFER that a phone is present.
+- OTHER CABIN OBJECTS: The object held is a walkie-talkie, microphone, logbook, pen,
+  cup, paper, or cabin lever/switch.
+- DASHBOARD DEVICES: The screen or device is fixed to the cabin console or mounted
+  rather than actively held in a crew member's hand.
+
+CRITICAL DISAMBIGUATION RULE:
+A hand held near the face or ear is NOT evidence of a mobile phone. You are strictly
+forbidden from assuming a phone is present behind or inside a closed hand. If the
+physical hardware frame/screen of the phone itself cannot be clearly seen separate
+from skin tones, set verified = false.
 """.strip()
 
 
@@ -195,92 +212,116 @@ Reject (verified = false) if ANY of the following apply:
 
 _HAND_RAISING_CRITERIA = """
 Candidate violation to verify: HAND RAISING ON SIGNAL.
+IMPORTANT:
+This is a STRICT VISUAL VERIFICATION task. Judge only what is visibly
+present in this single image. Do NOT infer the person's intention or
+assume that an extended arm is a signal.
+A valid hand-raising signal requires CLEAR visual evidence that at least
+one crew member is performing a distinct raised-arm gesture away from the
+normal working/resting position.
+Verify (verified = true) ONLY if ALL of the following are clearly visible:
 
-This violation represents the standard railway signal acknowledgement
-performed by railway crew members: a deliberate arm-raise/point gesture
-directed OUT toward the front windshield / an external signal, NOT any
-hand movement toward the driving console itself.
+1. At least one arm is clearly RAISED or distinctly EXTENDED away from the
+   person's normal resting/working position.
+2. The raised hand and forearm are clearly AWAY FROM and UNSUPPORTED BY the
+   table, console, dashboard, or other working surface.
+3. The raised hand is NOT touching, holding, gripping, resting on, or
+   operating a control, lever, switch, throttle, brake handle, joystick,
+   knob, gauge, or other console equipment.
+4. The arm posture is clearly distinguishable from a normal relaxed,
+   resting, reaching, or equipment-operating posture.
+5. The raised/extended arm clearly belongs to the crew member being
+   evaluated.
+   HAND SHAPE:
+   The exact finger configuration is NOT important.
+   Accept a hand that is:
 
-Verify (verified = true) ONLY if ALL of the following are clearly true:
-
-- At least one arm is raised or intentionally extended toward the front
-  windshield / outside the cabin, clearly aimed away from the console.
-- The hand is open or pointing (e.g. an extended index finger, an open
-  palm) -- NOT gripping, curled around, or in contact with any lever,
-  joystick, throttle handle, switch, knob, or other console control.
-- The raised or extended arm clearly belongs to the evaluated person.
-- The gesture is visually distinguishable from normal resting or
-  operating posture.
-
-A valid signal acknowledgement DOES NOT require:
-
-- the hand to be above the head,
-- the elbow to be fully extended,
-- the entire hand or fingertips to be visible,
-- both hands to be raised.
-
-It is acceptable if:
-
-- only one hand is raised,
-- the OTHER hand (not the one being evaluated) remains on the driving
-  controls,
-- part of the raised hand extends outside the camera frame,
-- the fingertips are cropped but the arm direction is clearly visible.
-
-Reject (verified = false) if ANY of the following apply:
-
-- There is no raised or forward-extended arm.
-- The arm is resting, or is reaching toward / gripping / resting on any
-  part of the driving console -- including the throttle handle, brake
-  lever, joystick, switches, or gauges -- even if the arm looks
-  moderately extended. Operating or holding a control is NOT a signal
-  acknowledgement, regardless of arm angle or extension.
-- The person is leaning forward to operate equipment rather than
-  gesturing outward/upward away from the console.
-- The movement is clearly unrelated to signal acknowledgement
-  (scratching, adjusting clothing, adjusting hair, stretching, reaching
-  for an object inside the cabin, etc.).
-- The arm direction cannot be determined because of severe blur or
-  occlusion.
-- There is insufficient visual evidence to distinguish the gesture from
-  routine console operation.
-- You are not fully certain this is a genuine signal-acknowledgement
-  gesture rather than routine cabin activity.
-
-When in doubt, reject -- false positives here (routine console/throttle
-operation misread as a signal gesture) are as unacceptable as missed
-genuine gestures. Do not reject solely because part of the hand or
-forearm lies outside the image boundary, but never let arm extension
-alone substitute for a hand that is visibly open/pointing and clearly
-NOT in contact with a control.
-""".strip()
+- fully open,
+- partially open,
+- pointing with one or more fingers,
+- in a salute-like configuration,
+- partially closed,
+- or otherwise visibly raised.
+  Do NOT require all fingers to be open and do NOT require a specific
+  finger position.
+  ARM ANGLE:
+  There is NO fixed required arm angle.
+  The arm does NOT need to form exactly 90 degrees with the shoulder,
+  upper arm, or forearm.
+  Accept reasonable variation in:
+- shoulder position,
+- elbow bend,
+- forearm direction,
+- wrist angle,
+- hand height,
+- and overall arm orientation.
+  The hand does NOT need to be above the head.
+  The elbow does NOT need to be fully straight.
+  Only one hand needs to be raised.
+  CRITICAL TABLE / CONSOLE RULE:
+  A hand or forearm resting on, supported by, or extended across the
+  table/console/work surface is NOT a hand-raising signal.
+  Do NOT classify an arm as raised merely because it is extended forward
+  over the console or table.
+  Reject (verified = false) if ANY of the following apply:
+- The hand or forearm is resting on the table, console, dashboard, or
+  other working surface.
+- The arm is extended across or toward the console/table as part of
+  normal cabin activity.
+- The person is reaching for an object inside the cabin.
+- The hand is touching, holding, gripping, or operating any control or
+  equipment.
+- The arm is in a normal relaxed or working position.
+- The posture is consistent with stretching, reaching, resting, adjusting
+  clothing, adjusting hair, or another routine cabin activity.
+- The image does not clearly show that the arm is actually raised away
+  from the working/resting surface.
+- The raised arm cannot be confidently distinguished from ordinary cabin
+  activity.
+- The arm direction or hand position cannot be determined because of
+  severe blur, occlusion, cropping, or poor image quality.
+- You are not fully certain that the visible posture satisfies the
+  criteria above.
+  DO NOT infer intent:
+  Do not decide that a person is signalling simply because the arm is
+  extended, pointing, elevated, or directed toward the front of the cabin.
+  The visual posture itself must provide sufficient evidence of a distinct
+  raised-arm gesture.
+  When in doubt, reject the candidate.
+  False positives caused by interpreting stretching, reaching, resting,
+  or console/table activity as a hand-raising signal are unacceptable.
+  """.strip()
 
 
 _SEAT_ABSENCE_CRITERIA = """
-Candidate violation to verify: SEAT ABSENCE (Loco Left Unmanned).
+Candidate violation to verify: SEAT ABSENCE / LOCO LEFT UNMANNED.
 
-This checks whether the locomotive cabin has been left completely
-unattended -- i.e. no crew member is present in the driving position at
-all.
+This candidate checks whether the cabin is completely deserted and unmanned.
 
-Verify (verified = true) ONLY if:
-- No person is visible anywhere in the frame, OR
-- The primary driving seat is clearly and unambiguously empty, with no
-  part of a person (hand, arm, shoulder, head, torso) visible in or at
-  the driving position.
+MANDATORY EDGE-TO-EDGE SCAN (Check BEFORE verdict):
+You MUST scan the entire frame, paying particular attention to the BOTTOM, LEFT, RIGHT,
+and TOP EDGES, as well as background areas. Look for ANY visible part of a human body
+(head, hair, forehead, glasses, shoulder, arm, hand, leg, shirt collar, or silhouette).
 
-Reject (verified = false) if ANY of the following apply:
-- Any person, or any clearly identifiable body part of a person, is
-  visible anywhere in the frame -- even if partially visible, at the
-  edge of the frame, in the background, or momentarily leaning out of
-  the seat.
-- The driving seat's occupancy is unclear due to camera angle, occlusion,
-  poor lighting, or motion blur.
-- You are not fully certain the cabin is empty.
+Verify (verified = true) ONLY if ALL of the following conditions are met:
 
-Because this violation carries serious safety implications, treat any
-visible trace of a person -- however partial -- as sufficient to reject
-the candidate.
+1. ABSOLUTE ZERO HUMAN PRESENCE: There is NO human person visible anywhere in the image.
+2. EMPTY DRIVING SEAT & CABIN: The primary driving position, secondary seat, and cabin
+   floor/perimeter are entirely devoid of human presence.
+
+Reject (verified = false) IMMEDIATELY if ANY of the following apply:
+
+- CROPPED / PARTIAL PERSON AT EDGE: Any portion of a person's head, forehead, hair,
+  glasses, ear, shoulder, arm, or hand is visible at the edge or bottom of the frame
+  (even if they are leaning down, bent over, or partially cut off by the camera boundary).
+- SEATED OR STANDING CREW: A crew member is sitting, standing, walking, bending down,
+  or moving anywhere inside the cabin.
+- POOR LIGHTING / MOTION BLUR: You cannot determine with 100% certainty that the cabin
+  is empty due to darkness, shadow, or blur.
+
+STRICT RULE: "Unmanned" means ZERO traces of a human body anywhere in the frame. If even
+a tiny fraction of a head, hair, or forehead is visible at the bottom or sides of the
+image, verified MUST be false.
 """.strip()
 
 
