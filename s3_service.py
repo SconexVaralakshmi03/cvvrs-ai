@@ -3452,6 +3452,41 @@ def upload_frame_from_path(
     return s3_key
 
 
+def download_frame(s3_key: str) -> np.ndarray:
+    """
+    Download a previously-uploaded evidence frame from S3 and decode it
+    back into a BGR numpy array.
+
+    Counterpart to upload_frame() / upload_frame_from_path() -- used by the
+    journey-end LLM verification stage (analyzer.py::analyze_journey) to
+    retrieve suspected evidence frames that were persisted to S3 during
+    each video's own processing (see
+    analyzer.py::_persist_and_release_video_evidence), instead of relying
+    on in-memory frame data that used to be kept in the worker until the
+    whole journey finished.
+
+    Parameters
+    ──────────
+    s3_key : S3 key (or full s3:// URI) as returned by upload_frame() /
+             upload_frame_from_path().
+
+    Returns a BGR numpy array. Raises on failure (missing object, decode
+    error, etc.) -- callers should catch and handle this non-fatally, the
+    same way existing upload_frame()/download_video() call sites do.
+    """
+    key = _strip_s3_uri(s3_key)
+    bkt = _bucket()
+
+    print(f"[S3] Downloading frame  <-  s3://{bkt}/{key}")
+    obj  = _s3_client().get_object(Bucket=bkt, Key=key)
+    data = obj["Body"].read()
+
+    frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError(f"Failed to decode frame downloaded from s3://{bkt}/{key}")
+    return frame
+
+
 def upload_text_log(
     text:        str,
     folder_name: str,

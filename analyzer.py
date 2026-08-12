@@ -25606,7 +25606,7 @@ except ImportError:
     _PSUTIL_AVAILABLE = False
 
 from models import VideoJob, VideoResult, ViolationResult
-from s3_service import upload_frame, upload_frame_from_path
+from s3_service import upload_frame, upload_frame_from_path, download_frame
 
 # Import the existing pipeline and store — unchanged
 from main import GadgetDetectionPipeline
@@ -25759,6 +25759,106 @@ def _local_frame_path(vstore: ViolationStore, relative_path: str) -> str:
     """
     filename = os.path.basename(relative_path)
     return os.path.join(OUTPUTS_ROOT, vstore.analysis_id, "frames", filename)
+
+
+def _frame_filename_for_video(v, video_id: int, sequence_no: int) -> str:
+    """
+    Same filename convention as _frame_filename() (below), extended with
+    video_id and the video's sequence_no so every evidence frame persisted
+    to S3 during per-video processing (see
+    _persist_and_release_video_evidence()) can be traced back to its
+    job/journey/video/sequence purely from its filename. job_id/journey_id
+    are already encoded in the S3 folder prefix (folder_name, passed to
+    upload_frame_from_path() unchanged) -- this only adds the two pieces
+    that prefix doesn't carry.
+    """
+    distraction   = "_".join(sorted(v.events))
+    filename_time = v.time_str.replace(":", "-")
+    return f"video{video_id}_seq{sequence_no}_{distraction}_{filename_time}_{v.frame_index}.jpg"
+
+
+def _persist_and_release_video_evidence(
+    job_id:        str,
+    journey_id:    int,
+    folder_name:   str,
+    shared_vstore: ViolationStore,
+    video_path:    str,
+    db_filename:   str,
+    video_id:      int,
+    sequence_no:   int,
+) -> None:
+    """
+    Upload THIS video's suspected evidence frames to S3 immediately after
+    its own processing finishes, then release the local copies, instead of
+    carrying them in the worker (in memory or on local disk) until the
+    entire journey finishes.
+
+    This is the only change to the evidence-frame lifecycle: detector
+    behaviour, thresholds, timers and LLM verification logic are untouched.
+    Suspected-violation frames still flow through the exact same,
+    unmodified ViolationStore.extract_violation_frames() (decodes any
+    in-memory annotated_frame, or re-seeks video_path via local_time_str)
+    -- this function only adds an S3 upload + local cleanup step right
+    after that, per video, instead of once for the whole journey at the
+    very end.
+
+    Uploaded frames are NOT deleted from S3 -- they are downloaded again by
+    the existing journey-end LLM verification loop in analyze_journey()
+    (see download_frame() usage in the "Case 2" branch below).
+    """
+    # Snapshot which violations belong to THIS video and don't yet have
+    # evidence persisted anywhere, before extract_violation_frames() below
+    # sets v.frame_path for exactly this set (and clears their
+    # annotated_frame, if any).
+    mine = [
+        v for v in shared_vstore._violations
+        if v.source_filename == db_filename and v.frame_path is None
+    ]
+    if not mine:
+        return
+
+    # Unmodified existing extraction logic -- writes local JPEGs under
+    # outputs/<analysis_id>/frames/, sets v.frame_path to the local
+    # relative path, and clears v.annotated_frame for every violation in
+    # `mine`.
+    shared_vstore.extract_violation_frames(video_path)
+
+    uploaded = 0
+    for v in mine:
+        if not v.frame_path:
+            continue  # extraction failed for this one (e.g. seek failure) -- nothing to persist
+        local_path = _local_frame_path(shared_vstore, v.frame_path)
+        if not os.path.isfile(local_path):
+            continue
+
+        filename = _frame_filename_for_video(v, video_id, sequence_no)
+        try:
+            s3_key = upload_frame_from_path(
+                local_path, journey_id, filename=filename, folder_name=folder_name,
+            )
+        except Exception as exc:
+            # Non-fatal: leave v.frame_path pointing at the local file so
+            # the existing journey-end LLM-verification loop can still
+            # find and use it (its "local file exists" branch), and the
+            # evidence is not lost. It will simply stay on local disk a
+            # little longer than the normal case for this one frame.
+            print(f"[Analyzer:{job_id}]  Evidence-frame S3 upload failed for "
+                  f"{local_path} (video_id={video_id}): {exc} -- keeping local copy")
+            continue
+
+        v.frame_path = s3_key
+        uploaded += 1
+        # Release the local file now that it's safely in S3 -- this is the
+        # actual memory/disk-footprint fix: the next video no longer
+        # carries this video's evidence frames.
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+
+    print(f"[Analyzer:{job_id}]  Persisted {uploaded}/{len(mine)} suspected "
+          f"evidence frame(s) to S3 for video_id={video_id} seq={sequence_no} "
+          f"({db_filename}); released local copies.")
 
 
 def _hms_to_seconds(hms: str) -> float:
@@ -26102,6 +26202,19 @@ def analyze_journey(
             frame_offset += total_frames
             del pipeline
 
+            # ── Evidence-frame lifecycle: persist THIS video's suspected
+            # evidence to S3 now and release the local/in-memory copies,
+            # even though the journey is stopping here — otherwise this
+            # video's evidence would be lost instead of just deferred.
+            try:
+                _persist_and_release_video_evidence(
+                    job_id, journey_id, folder_name, shared_vstore,
+                    tmp_path, db_filename, vj.video_id, vj.sequence_no,
+                )
+            except Exception as exc:
+                print(f"[Analyzer:{job_id}]  Evidence persistence failed for "
+                      f"video_id={vj.video_id} (non-fatal): {exc}")
+
             # Report every video that comes AFTER this one as NOT_PROCESSED.
             # "After" = sequence_no > current vj's position in the ordered list.
             # We iterate from the NEXT video to the end of ordered.
@@ -26153,6 +26266,24 @@ def analyze_journey(
         # already explicitly shut down/closed) can be collected promptly
         # rather than living until the next loop iteration reassigns it.
         del pipeline
+
+        # ── Evidence-frame lifecycle fix ──────────────────────────────────
+        # Persist THIS video's suspected evidence frames to S3 now, and
+        # release the local/in-memory copies, instead of carrying them in
+        # the worker until the whole journey finishes (see
+        # _persist_and_release_video_evidence() docstring above). Runs for
+        # both a successful video and an ordinary per-video failure
+        # (Scenario 2) — either way, any evidence already recorded for this
+        # video before it finished should be persisted, not lost or carried
+        # forward into the next video's memory.
+        try:
+            _persist_and_release_video_evidence(
+                job_id, journey_id, folder_name, shared_vstore,
+                tmp_path, db_filename, vj.video_id, vj.sequence_no,
+            )
+        except Exception as exc:
+            print(f"[Analyzer:{job_id}]  Evidence persistence failed for "
+                  f"video_id={vj.video_id} (non-fatal): {exc}")
 
         # Advance offsets for the next video regardless of success/failure.
         # Using the metadata we already captured keeps offsets consistent for
@@ -26251,6 +26382,20 @@ def analyze_journey(
                 # verified/shown as evidence. annotated_frame is stored as
                 # JPEG bytes (see _encode_frame) — decode before use.
                 signal_frame = _decode_frame(v.annotated_frame)
+            elif v.frame_path and not os.path.isfile(_local_frame_path(shared_vstore, v.frame_path)):
+                # Evidence-frame lifecycle fix: this violation's frame was
+                # already persisted to S3 during its own video's per-video
+                # processing (see _persist_and_release_video_evidence()),
+                # so annotated_frame was cleared and the local copy no
+                # longer exists. Download the EXACT same frame back from S3
+                # instead of re-seeking the source video, preserving the
+                # "identical pixels" guarantee this step relies on.
+                try:
+                    signal_frame = download_frame(v.frame_path)
+                except Exception as exc:
+                    print(f"[Analyzer:{job_id}]  RSL verify: could not download "
+                          f"evidence frame from S3 ({v.frame_path}): {exc}")
+                    signal_frame = None
             else:
                 tmp_path = _rsl_path_by_filename.get(src_file, "")
                 if not tmp_path or not os.path.isfile(tmp_path):
@@ -26403,17 +26548,47 @@ def analyze_journey(
                 except Exception as exc:
                     print(f"[Analyzer:{job_id}]  Frame upload failed ({local_path}): {exc}")
             else:
-                print(f"[Analyzer:{job_id}]  Frame file not found on disk: {local_path}")
-                # FIX — previously this branch left v.status / v.role on the
-                # bare _Violation dataclass defaults ("TRUE" / None) because
-                # verify_frame() was never called here, producing status=true
-                # with role=null in the completion payload. Tag it the same
-                # way the other "couldn't verify" branches in llm_verifier.py
-                # do: unverified pass-through, so role is never None while
-                # status is TRUE.
-                n_llm_skipped += 1
-                v.status = "TRUE"
-                v.role   = "AMBIGUOUS"
+                # Evidence-frame lifecycle fix: no local file means this
+                # violation's evidence frame was already persisted to S3
+                # during its own video's per-video processing (see
+                # _persist_and_release_video_evidence()) — v.frame_path is
+                # already the S3 key, not a local path. Download it back
+                # for the LLM check; it does not need to be re-uploaded
+                # (same bytes, same key, already in S3).
+                try:
+                    frame_img = download_frame(v.frame_path)
+                except Exception as exc:
+                    print(f"[Analyzer:{job_id}]  Could not download evidence frame "
+                          f"from S3 for LLM check ({v.frame_path}): {exc} — uploading unverified")
+                    frame_img = None
+
+                if frame_img is None:
+                    # FIX — previously this branch left v.status / v.role on
+                    # the bare _Violation dataclass defaults ("TRUE" / None)
+                    # because verify_frame() was never called here,
+                    # producing status=true with role=null in the
+                    # completion payload. Tag it the same way the other
+                    # "couldn't verify" branches in llm_verifier.py do:
+                    # unverified pass-through, so role is never None while
+                    # status is TRUE.
+                    n_llm_skipped += 1
+                    v.status = "TRUE"
+                    v.role   = "AMBIGUOUS"
+                else:
+                    verdict = llm_verifier.verify_frame(frame_img, v.type, log_label=v.frame_path)
+                    if verdict["skipped"]:
+                        n_llm_skipped += 1
+                    elif verdict["status"] == "FALSE":
+                        n_llm_rejected += 1
+                        print(f"[Analyzer:{job_id}]  LLM REJECTED violation "
+                              f"(type={v.type} file={v.frame_path}): {verdict['reason']}")
+                    else:
+                        n_llm_verified += 1
+                    v.status = verdict["status"]
+                    v.role   = verdict["role"]
+                    # v.frame_path is already the correct, final S3 key —
+                    # no re-upload needed, the bytes are identical to what
+                    # was just downloaded and verified.
             continue
 
         # ── Case 3: no frame at all — seek into the correct source video ─────
