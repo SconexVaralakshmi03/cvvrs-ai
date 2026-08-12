@@ -25610,7 +25610,7 @@ from s3_service import upload_frame, upload_frame_from_path
 
 # Import the existing pipeline and store — unchanged
 from main import GadgetDetectionPipeline
-from utils.violation_store import ViolationStore
+from utils.violation_store import ViolationStore, _decode_frame, _encode_frame
 
 # NEW — LLM verification gate (Qwen2.5-VL via Ollama). Every candidate
 # violation is re-checked by this module before its frame is uploaded to
@@ -26248,8 +26248,9 @@ def analyze_journey(
                 # are looking at identical pixels for the identical
                 # moment — no second, independent re-seek that could land
                 # on a slightly different frame than what was actually
-                # verified/shown as evidence.
-                signal_frame = v.annotated_frame
+                # verified/shown as evidence. annotated_frame is stored as
+                # JPEG bytes (see _encode_frame) — decode before use.
+                signal_frame = _decode_frame(v.annotated_frame)
             else:
                 tmp_path = _rsl_path_by_filename.get(src_file, "")
                 if not tmp_path or not os.path.isfile(tmp_path):
@@ -26283,7 +26284,9 @@ def analyze_journey(
                 events          = ["rsl_hand_brake"],
                 confidence      = round(float(verdict["confidence"]), 3),
                 factors         = list(set(list(v.factors) + ["rsl_hand_brake", "opposite_hand_on_brake"])),
-                annotated_frame = verdict["best_frame"].copy(),
+                # Encode to JPEG bytes rather than store a raw array copy —
+                # see _encode_frame() docstring in utils/violation_store.py.
+                annotated_frame = _encode_frame(verdict["best_frame"]),
                 frame_path      = None,
                 status          = "TRUE",
                 role            = verdict["role"],
@@ -26341,7 +26344,9 @@ def analyze_journey(
         # ── Case 1: annotated frame already in memory — upload directly ──────
         if v.annotated_frame is not None:
             filename  = _frame_filename(v)
-            frame_img = v.annotated_frame
+            # annotated_frame is JPEG bytes (see _encode_frame) — decode to
+            # a raw array before handing pixels to the LLM verifier / S3 upload.
+            frame_img = _decode_frame(v.annotated_frame)
 
             verdict = llm_verifier.verify_frame(frame_img, v.type, log_label=filename)
             if verdict["skipped"]:

@@ -446,6 +446,13 @@ LLM_VERIFICATION_FAIL_OPEN  = False
 
 OLLAMA_MODEL                 = "qwen2.5vl:7b"
 OLLAMA_HOST                  = None   # None = ollama client default (http://localhost:11434)
-OLLAMA_TIMEOUT_SECONDS        = 120
-OLLAMA_MAX_RETRIES            = 2
+# Worst-case time a single stuck/slow violation frame can block the
+# journey: OLLAMA_TIMEOUT_SECONDS x (OLLAMA_MAX_RETRIES + 1) attempts.
+# Was 120s x 3 = 360s (6 min) PER FRAME, run serially for every candidate
+# violation in the journey — on a journey with many violations this can
+# silently consume most of the journey's timeout budget. Lowered to
+# 45s x 2 = 90s per frame; tune these based on your Ollama server's
+# actual observed p99 response time, not a guess.
+OLLAMA_TIMEOUT_SECONDS        = 45
+OLLAMA_MAX_RETRIES            = 1
 OLLAMA_TEMPERATURE            = 0.1

@@ -15405,6 +15405,39 @@ import numpy as np
 OUTPUTS_ROOT = "outputs"
 MERGE_WINDOW = 2.0
 
+# JPEG quality used for in-memory violation frame storage (see _encode_frame).
+# 90 is visually near-lossless for evidence purposes while cutting a raw
+# 1280x720 BGR frame (~2.76MB) down to roughly 150-300KB (~10-18x smaller).
+_FRAME_JPEG_QUALITY = 90
+
+
+# ── Memory-footprint fix ─────────────────────────────────────────────────────
+# _Violation.annotated_frame used to hold a raw uncompressed numpy array for
+# every candidate violation, for every video, for the ENTIRE journey (only
+# freed once, in a pass that runs after ALL videos in the journey have been
+# processed — see analyzer.py::analyze_journey / extract_violation_frames
+# below). On a journey with many violations across several videos this meant
+# peak RAM grew with the TOTAL violation count across the whole journey, not
+# per-video — a real contributor to OOM/resource-exhaustion aborts on later
+# videos in a journey (e.g. journey stops partway through, remaining videos
+# marked "Not Processed - Worker Resource Exhaustion").
+#
+# Fix: store the JPEG-encoded bytes instead of the raw array. Encoding is
+# cheap (a few ms) and the size reduction (~10-18x) directly shrinks the
+# amount of RAM held per in-flight violation. Decode on demand only where a
+# raw array is actually needed (upload, LLM verification, resize-before-save).
+def _encode_frame(frame: "np.ndarray") -> bytes:
+    """JPEG-encode a BGR frame for compact in-memory violation storage."""
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _FRAME_JPEG_QUALITY])
+    if not ok:
+        raise ValueError("Failed to JPEG-encode frame for violation storage")
+    return buf.tobytes()
+
+
+def _decode_frame(data: bytes) -> "np.ndarray":
+    """Decode a JPEG byte buffer (from _encode_frame) back to a BGR numpy array."""
+    return cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INTERNAL DATA CLASS
@@ -15426,7 +15459,11 @@ class _Violation:
     source_filename: str                  = ""    # DB filename e.g. "mobile.mp4"
     local_time_str:  str                  = ""    # local time within that file e.g. "00:00:23"
     frame_path:      Optional[str]        = None
-    annotated_frame: Optional[np.ndarray] = None
+    # NOTE: holds JPEG-ENCODED BYTES (see _encode_frame/_decode_frame near the
+    # top of this file), not a raw numpy array — this is the memory-footprint
+    # fix (was ~2.76MB/frame raw, now ~150-300KB/frame). Decode with
+    # _decode_frame() before any pixel operation (resize, upload, LLM call).
+    annotated_frame: Optional[bytes]      = None
     # NEW — additive, filled in later (if at all) by close_violation_episode().
     # True trigger→end span: true_end_timestamp - true_start_timestamp ==
     # true_duration. Stay None if the episode was still ongoing when the
@@ -15583,8 +15620,10 @@ class ViolationStore:
                 factors          = list(factors),
                 source_filename  = source_filename,
                 local_time_str   = local_str,
+                # Encode to JPEG bytes rather than keep a raw array copy —
+                # see _encode_frame() docstring near the top of this file.
                 annotated_frame  = (
-                    annotated_frame.copy() if annotated_frame is not None else None
+                    _encode_frame(annotated_frame) if annotated_frame is not None else None
                 ),
                 pilot_id         = pilot_id,
             )
@@ -15782,8 +15821,10 @@ class ViolationStore:
 
             if v.annotated_frame is not None:
                 # Preferred path — the exact frame already captured for
-                # this violation, no re-seek involved.
-                signal_frame = v.annotated_frame
+                # this violation, no re-seek involved. annotated_frame is
+                # stored as JPEG bytes (see _encode_frame) — decode before
+                # handing pixels to verify_rsl_hand_brake().
+                signal_frame = _decode_frame(v.annotated_frame)
             else:
                 video_path = path_by_filename.get(src_file)
                 if not video_path or not os.path.isfile(video_path):
@@ -15813,7 +15854,9 @@ class ViolationStore:
                 events          = ["rsl_hand_brake"],
                 confidence      = round(float(verdict["confidence"]), 3),
                 factors         = list(set(list(v.factors) + ["rsl_hand_brake", "opposite_hand_on_brake"])),
-                annotated_frame = verdict["best_frame"].copy(),
+                # Encode to JPEG bytes rather than store a raw array copy —
+                # see _encode_frame() docstring near the top of this file.
+                annotated_frame = _encode_frame(verdict["best_frame"]),
                 frame_path      = None,
                 status          = "TRUE",
                 role            = verdict["role"],
@@ -15990,7 +16033,10 @@ class ViolationStore:
         need_video = []
         for v in mine:
             if v.annotated_frame is not None:
-                v.frame_path      = self._save_frame(v.annotated_frame, v.events, v.time_str, v.frame_index)
+                # annotated_frame is JPEG bytes (see _encode_frame) —
+                # decode before _save_frame(), which resizes/re-writes it.
+                v.frame_path      = self._save_frame(_decode_frame(v.annotated_frame),
+                                                      v.events, v.time_str, v.frame_index)
                 v.annotated_frame = None   # free memory
                 saved += 1
             else:
