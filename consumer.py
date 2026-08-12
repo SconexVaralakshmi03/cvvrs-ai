@@ -147,9 +147,9 @@ _ENV_PATH = os.path.join(
 load_dotenv(_ENV_PATH)
 
 RABBITMQ_URL       = os.environ.get("RABBITMQ_URL",              "amqp://guest:guest@localhost:5672/")
-QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "dev.analysis.jobs")
-EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "dev.analysis.exchange")
-ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "dev.analysis.jobs.created")
+QUEUE_NAME         = os.environ.get("ANALYSIS_QUEUE",             "analysis.jobs")
+EXCHANGE_NAME      = os.environ.get("ANALYSIS_EXCHANGE",          "analysis.exchange")
+ROUTING_KEY        = os.environ.get("ANALYSIS_ROUTING",           "analysis.jobs.created")
 # Defaults to GPU_WORKERS: with N persistent GPU workers we want the broker
 # to have up to N unacked messages in flight so all N workers can be busy
 # at once (see worker_pool.py). Override explicitly via RABBITMQ_PREFETCH
@@ -209,50 +209,18 @@ JOURNEY_TIMEOUT_BASE_SECONDS = float(os.environ.get("JOURNEY_TIMEOUT_BASE_SECOND
 # overriding; if set, it becomes the floor rather than a hard fixed value).
 JOURNEY_TIMEOUT_SECONDS = int(os.environ.get("JOURNEY_TIMEOUT_SECONDS", "3600"))
 
-# ── Stall detection (replaces "total elapsed time since journey start") ──
-# PROBLEM this fixes: the old design killed the whole journey once TOTAL
-# elapsed time exceeded a fixed budget, even if the worker was actively
-# finishing videos the entire time — just slower than the calibration
-# estimate (heavier videos, or GPU_WORKERS>1 sharing the GPU with another
-# journey). That meant a journey processing videos correctly but a bit
-# slowly got its LATER videos killed and reported as NOT_PROCESSED, even
-# though nothing was actually stuck. Real-world symptom: "first 3 of 5
-# videos succeed, last 2 fail with 'GPU worker crashed or was killed after
-# timeout'" purely because the journey crossed the 1-hour mark.
-#
-# FIX: track time since the LAST video actually finished (video_done
-# event), not time since the journey started. A worker that keeps
-# completing videos — even slowly — is never killed. Only a genuine stall
-# (no video finishing for STALL_TIMEOUT_SECONDS) is treated as a hang.
-# JOURNEY_TIMEOUT_SECONDS still applies as the stall budget BEFORE the
-# first video finishes (covers model load + first video + a true hang on
-# video 1, when there's no "last video" yet to measure from).
-STALL_TIMEOUT_MULTIPLIER = float(os.environ.get("STALL_TIMEOUT_MULTIPLIER", "3"))
-
 
 def _compute_journey_timeout(n_videos: int) -> float:
     """
-    Retained for logging / the pre-first-video stall budget. No longer
-    used as a hard total-elapsed ceiling for the whole journey — see
-    STALL_TIMEOUT_MULTIPLIER / _compute_stall_timeout() below, which is
-    what the poll loop actually enforces once at least one video has
-    completed.
+    Scaled per-journey timeout: base overhead + (per-video budget × video
+    count), with JOURNEY_TIMEOUT_SECONDS as a floor so small journeys keep
+    at least the previous fixed protection window. A genuinely hung
+    process is still caught — it just has to actually exceed a budget
+    sized for the ACTUAL number of videos in this journey, not an
+    arbitrary fixed number picked for a smaller test batch.
     """
     scaled = JOURNEY_TIMEOUT_BASE_SECONDS + (PER_VIDEO_TIMEOUT_SECONDS * max(n_videos, 1))
     return max(scaled, JOURNEY_TIMEOUT_SECONDS)
-
-
-def _compute_stall_timeout() -> float:
-    """
-    How long we tolerate NO video finishing before treating the worker as
-    genuinely hung, once at least one video has already completed. Set
-    generously above PER_VIDEO_TIMEOUT_SECONDS (default 3x) so normal
-    per-video variance (a longer clip, momentary GPU contention from a
-    second concurrent journey) is never mistaken for a hang — it only
-    fires when a video has been in flight far longer than even a
-    pessimistic single-video budget.
-    """
-    return max(PER_VIDEO_TIMEOUT_SECONDS * STALL_TIMEOUT_MULTIPLIER, JOURNEY_TIMEOUT_BASE_SECONDS)
 
 # How often the parent polls the child's events_q for per-video progress
 # while waiting for it to finish (also doubles as the keepalive cadence
@@ -566,21 +534,11 @@ def _run_journey_supervised(
     partial_results: Dict[int, dict] = {}
     start_time = time.time()
 
-    # journey_timeout: stall budget that applies BEFORE the first video
-    # finishes (no "last progress" timestamp exists yet to measure a stall
-    # from). stall_timeout: stall budget that applies AFTER at least one
-    # video has finished — see _compute_stall_timeout()'s docstring for why
-    # this replaced a flat total-elapsed-time ceiling.
     journey_timeout = _compute_journey_timeout(n_videos)
-    stall_timeout   = _compute_stall_timeout()
-    last_progress_time = start_time
-    videos_completed_so_far = 0
     log.info(
-        "[Job %s]  Journey timeout budget: %.0fs for %d video(s) before "
-        "first progress (base=%.0fs + %.0fs/video); stall budget after "
-        "that: %.0fs of no video finishing.", job_id, journey_timeout,
-        n_videos, JOURNEY_TIMEOUT_BASE_SECONDS, PER_VIDEO_TIMEOUT_SECONDS,
-        stall_timeout,
+        "[Job %s]  Journey timeout budget: %.0fs for %d video(s) "
+        "(base=%.0fs + %.0fs/video)", job_id, journey_timeout, n_videos,
+        JOURNEY_TIMEOUT_BASE_SECONDS, PER_VIDEO_TIMEOUT_SECONDS,
     )
 
     def _report_failure_immediately(vid: int, error_message: str,
@@ -743,18 +701,10 @@ def _run_journey_supervised(
                     break
                 drained_any = True
                 _handle_video_done_event(ev)
-                if ev.get("type") == "video_done":
-                    # A video actually finished (success OR a clean
-                    # per-video failure) — the worker is demonstrably not
-                    # stuck. Reset the stall clock so a slow-but-working
-                    # journey is never killed purely for taking a while in
-                    # total; see _compute_stall_timeout() docstring.
-                    last_progress_time = time.time()
-                    videos_completed_so_far += 1
-                    if progress_cb:
-                        pct = 10 + int((len(completed_ids) / max(n_videos, 1)) * 80)
-                        progress_cb(pct, f"Analyzed video {len(completed_ids)} of {n_videos}",
-                                    len(completed_ids))
+                if ev.get("type") == "video_done" and progress_cb:
+                    pct = 10 + int((len(completed_ids) / max(n_videos, 1)) * 80)
+                    progress_cb(pct, f"Analyzed video {len(completed_ids)} of {n_videos}",
+                                len(completed_ids))
 
             # ── "Did this journey finish?" signal ────────────────────────
             # A persistent worker never exits between journeys (that's the
@@ -776,36 +726,14 @@ def _run_journey_supervised(
                 handle.discard()
                 break
 
-            # Before the first video finishes there's no "last progress"
-            # timestamp to measure a stall from, so fall back to the
-            # original total-elapsed check against journey_timeout — this
-            # still catches a worker that's hung on model load / video 1
-            # and never makes any progress at all.
-            if videos_completed_so_far == 0:
-                if time.time() - start_time > journey_timeout:
-                    log.error(
-                        "[Job %s]  No video finished within %.0fs of "
-                        "journey start — treating as hung and killing/"
-                        "replacing its GPU worker (pid=%s).",
-                        job_id, journey_timeout, handle.pid,
-                    )
-                    handle.discard()  # kills the stuck worker, spawns a replacement
-                    break
-            else:
-                stall_elapsed = time.time() - last_progress_time
-                if stall_elapsed > stall_timeout:
-                    log.error(
-                        "[Job %s]  No video has finished in %.0fs (stall "
-                        "budget %.0fs) after %d/%d videos already "
-                        "completed — treating as hung and killing/"
-                        "replacing its GPU worker (pid=%s). This is a "
-                        "genuine stall, not just a slow-but-working "
-                        "journey, since progress had stopped entirely.",
-                        job_id, stall_elapsed, stall_timeout,
-                        videos_completed_so_far, n_videos, handle.pid,
-                    )
-                    handle.discard()  # kills the stuck worker, spawns a replacement
-                    break
+            if time.time() - start_time > journey_timeout:
+                log.error(
+                    "[Job %s]  Journey exceeded timeout (%.0fs for %d "
+                    "videos) — killing and replacing its GPU worker "
+                    "(pid=%s).", job_id, journey_timeout, n_videos, handle.pid,
+                )
+                handle.discard()  # kills the stuck worker, spawns a replacement
+                break
             if not drained_any:
                 time.sleep(EVENTS_POLL_INTERVAL_SECONDS)
     except BaseException as exc:
