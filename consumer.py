@@ -180,47 +180,39 @@ RECOVERY_RETRY_SECONDS = int(os.environ.get("RECOVERY_RETRY_SECONDS", "5"))
 # that child — never the consumer process itself, never RabbitMQ's
 # connection, never other in-flight jobs.
 #
-# JOURNEY_TIMEOUT_SECONDS: per-video time budget used to compute each
-# journey's timeout dynamically (see _compute_journey_timeout below), so a
-# 20-video journey isn't held to the same wall-clock ceiling as a 5-video
-# one. If exceeded, the parent treats it the same as a crash (kills the
-# child, marks remaining videos failed, sends send_failed). Prevents a
-# hung/looping child from blocking the worker forever — this is the same
-# "no job stuck in PROCESSING forever" requirement as the frontend timeout,
-# just enforced at the worker level too.
+# ═══════════════════════════════════════════════════════════════════════════
+# Fix 1 — PROGRESS-BASED WATCHDOG (replaces the old fixed/scaled journey
+# timeout as the PRIMARY mechanism for detecting a hung video).
+# ═══════════════════════════════════════════════════════════════════════════
 #
-# Real-world calibration note: a 1280x720@25fps ~43-minute video has been
-# observed taking ~108s of pure model inference plus ~115s of overhead
-# (S3 download, decode setup, violation frame upload) — roughly 220s
-# end-to-end per video of that length. PER_VIDEO_TIMEOUT_SECONDS defaults
-# generously above that observed figure to leave headroom for slower
-# videos/hardware without being so loose it stops catching real hangs.
-PER_VIDEO_TIMEOUT_SECONDS = float(os.environ.get("PER_VIDEO_TIMEOUT_SECONDS", "420"))
+# The old design computed a single wall-clock budget for the WHOLE journey
+# (base + per_video_budget × video_count) and killed the entire worker the
+# moment total elapsed time exceeded it — even if every video was actually
+# still making healthy progress. A journey with one genuinely slow (but
+# healthy) video, or more videos than the constant the budget was calibrated
+# for, could get killed while doing perfectly good work.
+#
+# WATCHDOG_STUCK_SECONDS is now the primary signal: a video is only ever
+# considered stuck when it has produced NO measurable progress (no frame
+# advance, no heartbeat — see main.py's progress_cb / analyzer.py's
+# video_progress_cb) for this many consecutive seconds. A video that keeps
+# advancing — 20 minutes, 1 hour, 2 hours — is left alone indefinitely.
+WATCHDOG_STUCK_SECONDS = float(os.environ.get("WATCHDOG_STUCK_SECONDS", "600"))  # 10 min
 
-# Fixed overhead added once per journey on top of the per-video budget —
-# covers model load (first video in the process), RabbitMQ/S3 connection
-# setup, and journey-level finalization (dedup, text log build/upload)
-# that happens after the last video.
-JOURNEY_TIMEOUT_BASE_SECONDS = float(os.environ.get("JOURNEY_TIMEOUT_BASE_SECONDS", "300"))
+# How many times a video that's detected as stuck is retried FROM SCRATCH
+# (Fix 7 — frame-level resume is out of scope; a full re-run of just that
+# video is the first implementation) before it is given up on and marked
+# FAILED so the rest of the journey can continue.
+WATCHDOG_MAX_VIDEO_RETRIES = int(os.environ.get("WATCHDOG_MAX_VIDEO_RETRIES", "1"))
 
-# Floor — even a 1-video journey gets at least this much time. Also acts
-# as the old fixed-timeout behavior for anyone who still sets
-# JOURNEY_TIMEOUT_SECONDS explicitly (kept for backward-compatible env
-# overriding; if set, it becomes the floor rather than a hard fixed value).
-JOURNEY_TIMEOUT_SECONDS = int(os.environ.get("JOURNEY_TIMEOUT_SECONDS", "3600"))
-
-
-def _compute_journey_timeout(n_videos: int) -> float:
-    """
-    Scaled per-journey timeout: base overhead + (per-video budget × video
-    count), with JOURNEY_TIMEOUT_SECONDS as a floor so small journeys keep
-    at least the previous fixed protection window. A genuinely hung
-    process is still caught — it just has to actually exceed a budget
-    sized for the ACTUAL number of videos in this journey, not an
-    arbitrary fixed number picked for a smaller test batch.
-    """
-    scaled = JOURNEY_TIMEOUT_BASE_SECONDS + (PER_VIDEO_TIMEOUT_SECONDS * max(n_videos, 1))
-    return max(scaled, JOURNEY_TIMEOUT_SECONDS)
+# ABSOLUTE_JOURNEY_CEILING_SECONDS is an OPT-IN, generous last-resort safety
+# valve only — 0 (the default) disables it entirely. Per the fix
+# requirement, wall-clock elapsed time must never be the PRIMARY reason a
+# healthy, still-progressing journey gets killed; this exists only to catch
+# truly pathological situations (e.g. the watchdog/progress-reporting path
+# itself is broken) an operator may want an outer bound on. Left at 0
+# unless explicitly configured.
+ABSOLUTE_JOURNEY_CEILING_SECONDS = float(os.environ.get("ABSOLUTE_JOURNEY_CEILING_SECONDS", "0"))
 
 # How often the parent polls the child's events_q for per-video progress
 # while waiting for it to finish (also doubles as the keepalive cadence
@@ -491,40 +483,57 @@ def _video_result_from_dict(vr: dict) -> VideoResult:
 # died — marks every video that never reported completion as failed too,
 # then returns a failed_videos dict covering ALL of them (the one that
 # actually crashed AND any after it that never got a chance to run).
-def _run_journey_supervised(
-    job_id:      str,
-    journey_id:  int,
-    folder_name: str,
-    video_jobs:  list,
-    tmp_paths:   Dict[int, str],
+def _run_journey_batch(
+    job_id:       str,
+    journey_id:   int,
+    folder_name:  str,
+    video_jobs:   list,          # only the videos THIS batch should attempt
+    tmp_paths:    Dict[int, str],
     progress_cb,
+    reported_ids: set,           # SHARED across retries — never double-report
+    n_videos_total: int,         # for progress_cb's percentage (whole journey)
+    n_already_done: int,         # videos completed in EARLIER batches
+    initial_time_offset:  float, # Fix 7 — keeps timestamps continuous on retry
+    initial_frame_offset: int,
 ):
     """
-    Returns (video_results, wall_seconds, failed_videos, video_error_details)
-    — failed_videos/video_error_details have the same shape analyze_journey()
-    produces, plus this function ALSO calls send_video_failed() immediately
-    for every video as its failure becomes known (Phase 1 requirement: "no
-    failed video should wait until journey completion to be reported") —
-    runs the actual work in an isolated child process so a native crash
-    can't take down the consumer.
+    Runs ONE submission to the GPU worker pool — either the initial attempt
+    at a journey, or (Fix 7) a retry covering only the videos that hadn't
+    yet completed after a previous batch's video was found stuck. Returns:
+
+        (outcome, video_results, batch_wall_seconds, failed_videos,
+         detail_by_id, stuck_video_id)
+
+    outcome is one of:
+      "done"     — the worker completed this batch cleanly (or with a
+                   caught journey-level error). stuck_video_id is None.
+      "stuck"    — Fix 1/6/7: the watchdog determined the CURRENT video
+                   (stuck_video_id) has made no measurable progress for
+                   WATCHDOG_STUCK_SECONDS. Its worker has already been
+                   discarded. Videos in this batch that completed BEFORE
+                   the stuck one are included in video_results/failed_videos
+                   as normal; the stuck video and everything after it in
+                   this batch are NOT included — the caller decides whether
+                   to retry (from the stuck video onward) or give up.
+      "abnormal" — worker crash / native OOM / parent-side interruption.
+                   Every not-yet-completed video in THIS batch is marked
+                   failed/not-processed (old crash-recovery behavior,
+                   unchanged), stuck_video_id is None.
     """
-    # Blocks only if all GPU_WORKERS workers are already busy on other
-    # journeys — otherwise returns immediately with a free, already-warm
-    # (model already loaded, if this worker has handled a journey before)
-    # worker. See worker_pool.py.
     handle   = worker_pool.submit(job_id, journey_id, folder_name,
-                                   video_jobs, tmp_paths)
+                                   video_jobs, tmp_paths,
+                                   initial_time_offset=initial_time_offset,
+                                   initial_frame_offset=initial_frame_offset)
     events_q = handle.events_q
     result_q = handle.result_q
-    log.info("[Job %s]  Journey dispatched to GPU worker  pid=%s",
-             job_id, handle.pid)
+    log.info("[Job %s]  Journey batch (%d video(s)) dispatched to GPU worker  "
+             "pid=%s%s", job_id, len(video_jobs), handle.pid,
+             "  [retry/continuation]" if initial_time_offset else "")
 
     ordered    = sorted(video_jobs, key=lambda v: v.sequence_no)
     n_videos   = len(ordered)
     completed_ids: Dict[int, bool] = {}      # video_id -> ok
-    error_by_id:   Dict[int, str]  = {}       # video_id -> error message
     detail_by_id:  Dict[int, dict] = {}       # video_id -> {"errorType","reason"}
-    reported_ids:  set            = set()     # video_ids already sent to /failed
     # Best-effort per-video VideoResult snapshots (dict shape — see
     # analyzer.py's _build_partial_video_result), captured the moment each
     # video succeeds. If the child process then dies abnormally (native
@@ -532,20 +541,33 @@ def _run_journey_supervised(
     # these snapshots let us PRESERVE the already-succeeded videos' real
     # data instead of discarding it and marking them failed too.
     partial_results: Dict[int, dict] = {}
-    start_time = time.time()
+    batch_start_time = time.time()
 
-    journey_timeout = _compute_journey_timeout(n_videos)
-    log.info(
-        "[Job %s]  Journey timeout budget: %.0fs for %d video(s) "
-        "(base=%.0fs + %.0fs/video)", job_id, journey_timeout, n_videos,
-        JOURNEY_TIMEOUT_BASE_SECONDS, PER_VIDEO_TIMEOUT_SECONDS,
-    )
+    # ── Fix 1: progress-based watchdog state ──────────────────────────────
+    # last_progress_at resets to "now" whenever EITHER a per-frame progress
+    # event OR a video_done event arrives for the video currently at the
+    # front of `ordered` that hasn't completed yet — i.e. whenever there is
+    # any evidence the current video is still moving forward.
+    last_progress_at = time.time()
+
+    def _current_video_id():
+        """The video this batch is presumed to be working on right now —
+        the first one in sequence order that hasn't reported done yet.
+        Sequential-per-worker processing (analyzer.py processes one video
+        at a time) makes this reliable without needing to trust event
+        ordering across a multiprocessing.Queue."""
+        for vj in ordered:
+            if vj.video_id not in completed_ids:
+                return vj.video_id
+        return None
 
     def _report_failure_immediately(vid: int, error_message: str,
                                       error_type: str | None,
                                       stack_trace: str | None,
                                       reason: str | None) -> None:
-        """Calls the failed endpoint for one video, exactly once."""
+        """Calls the failed endpoint for one video, exactly once (across
+        this batch AND any earlier/later retry batches — reported_ids is
+        shared with the caller)."""
         if vid in reported_ids:
             return
         reported_ids.add(vid)
@@ -563,13 +585,23 @@ def _run_journey_supervised(
             log.error("[Job %s]  send_video_failed failed for video=%d: %s",
                        job_id, vid, exc)
 
-    def _handle_video_done_event(ev: dict) -> None:
+    def _handle_event(ev: dict) -> None:
         """Shared per-event handling, used by every drain site (the
-        polling loop, the post-exit final drain, AND the new interrupt-
+        polling loop, the post-exit final drain, AND the interrupt-
         triggered drain below) so a parent-side interruption never skips
         this bookkeeping the way it used to."""
-        if ev.get("type") != "video_done":
+        nonlocal last_progress_at
+        ev_type = ev.get("type")
+
+        if ev_type == "progress":
+            # Fix 1/6: real evidence this video is still moving forward.
+            last_progress_at = ev.get("last_progress_time") or time.time()
             return
+
+        if ev_type != "video_done":
+            return
+
+        last_progress_at = time.time()  # finishing a video is progress too
         vid = ev["video_id"]
         ok  = ev.get("ok", False)
         completed_ids[vid] = ok
@@ -579,7 +611,6 @@ def _run_journey_supervised(
                 partial_results[vid] = snapshot
         if not ok:
             err = ev.get("error") or "Unknown per-video failure"
-            error_by_id[vid] = err
             detail_by_id[vid] = {
                 "errorType": ev.get("error_type") or "PROCESSING_ERROR",
                 "reason":    ev.get("reason"),
@@ -598,16 +629,17 @@ def _run_journey_supervised(
                 ev = events_q.get_nowait()
             except _queue.Empty:
                 break
-            _handle_video_done_event(ev)
+            _handle_event(ev)
 
     def _finalize_abnormal(label: str, crash_reason: str):
-        """Shared finalization for BOTH a crashed/timed-out child AND a
-        parent-side interruption (Ctrl+C, KeyboardInterrupt, RabbitMQ
-        connection loss, any unexpected exception) while the parent was
-        waiting on the child. Preserves real VideoResult data for any
-        video whose success snapshot already arrived on events_q, and
-        marks only the genuinely-unfinished videos as failed/not-processed
-        — never discards already-completed work."""
+        """Shared finalization for a crashed child, a genuinely STUCK
+        video giving up permanently, or a parent-side interruption
+        (Ctrl+C, KeyboardInterrupt, RabbitMQ connection loss, any
+        unexpected exception) while the parent was waiting on the child.
+        Preserves real VideoResult data for any video whose success
+        snapshot already arrived on events_q, and marks only the
+        genuinely-unfinished videos as failed/not-processed — never
+        discards already-completed work."""
         try:
             resource_manager.emergency_cleanup(reason=label)
         except Exception:
@@ -670,29 +702,20 @@ def _run_journey_supervised(
                 _report_failure_immediately(vj.video_id, crash_reason,
                                               "NOT_PROCESSED", None, reason_msg)
 
-        return video_results, time.time() - start_time, failed_videos, detail_by_id
+        return "abnormal", video_results, time.time() - batch_start_time, failed_videos, detail_by_id, None
 
     # ── Drain events_q while waiting for the child to finish ──────────────
     #
-    # FIX (parent-side interruption while waiting): this loop used to have
-    # NO try/except of its own — a KeyboardInterrupt (Ctrl+C), a connection-
-    # loss-triggered exception, or any other interruption that landed while
-    # the parent was inside time.sleep()/process.join() here would propagate
-    # straight out of this function, BEFORE the "Abnormal exit" handling
-    # below ever ran. That meant any videos that had already completed (and
-    # whose video_done events were sitting un-drained on events_q) were
-    # silently lost, the journey was reported as if zero videos succeeded,
-    # AND the child process was left running orphaned in the background.
-    #
-    # Now: any interruption here is caught, a final drain collects whatever
-    # the child already finished, the child is terminated cleanly, and we
+    # Any interruption here is caught, a final drain collects whatever the
+    # child already finished, the child is terminated cleanly, and we
     # finalize through the SAME "abnormal exit" logic used for a crashed
     # child — so already-completed videos are never lost and no process is
     # left orphaned.
     result_payload = None
     try:
         while True:
-            # Pull any progress events that arrived since the last poll.
+            # Pull any progress/video_done events that arrived since the
+            # last poll.
             drained_any = False
             while True:
                 try:
@@ -700,17 +723,18 @@ def _run_journey_supervised(
                 except _queue.Empty:
                     break
                 drained_any = True
-                _handle_video_done_event(ev)
+                _handle_event(ev)
                 if ev.get("type") == "video_done" and progress_cb:
-                    pct = 10 + int((len(completed_ids) / max(n_videos, 1)) * 80)
-                    progress_cb(pct, f"Analyzed video {len(completed_ids)} of {n_videos}",
-                                len(completed_ids))
+                    done_so_far = n_already_done + len(completed_ids)
+                    pct = 10 + int((done_so_far / max(n_videos_total, 1)) * 80)
+                    progress_cb(pct, f"Analyzed video {done_so_far} of {n_videos_total}",
+                                done_so_far)
 
-            # ── "Did this journey finish?" signal ────────────────────────
+            # ── "Did this batch finish?" signal ──────────────────────────
             # A persistent worker never exits between journeys (that's the
             # whole point — see worker_pool.py), so we can no longer use
             # process.exitcode to detect completion the way the old
-            # one-shot-subprocess code did. The journey is done, cleanly or
+            # one-shot-subprocess code did. The batch is done, cleanly or
             # with a caught error, the moment its result lands on result_q.
             try:
                 result_payload = result_q.get_nowait()
@@ -724,16 +748,66 @@ def _run_journey_supervised(
                     "crash.", job_id, handle.pid,
                 )
                 handle.discard()
-                break
-
-            if time.time() - start_time > journey_timeout:
-                log.error(
-                    "[Job %s]  Journey exceeded timeout (%.0fs for %d "
-                    "videos) — killing and replacing its GPU worker "
-                    "(pid=%s).", job_id, journey_timeout, n_videos, handle.pid,
+                return _finalize_abnormal(
+                    label="GPU worker crashed",
+                    crash_reason="GPU worker crashed — video was not processed.",
                 )
-                handle.discard()  # kills the stuck worker, spawns a replacement
-                break
+
+            # ── Fix 1/6/7: progress-based watchdog ───────────────────────
+            # Only active while there is a "current video" still in flight
+            # in THIS batch — once every video in the batch has reported
+            # done, the worker is in journey-level finalization (dedup,
+            # LLM verification pass, journey text log) which is not a
+            # per-video stall this watchdog is meant to catch.
+            stuck_vid = _current_video_id()
+            if stuck_vid is not None and \
+                    (time.time() - last_progress_at) > WATCHDOG_STUCK_SECONDS:
+                log.error(
+                    "[Job %s]  WATCHDOG: video_id=%d has made no progress "
+                    "for %.0fs (limit=%.0fs) — treating as stuck. Killing "
+                    "its GPU worker (pid=%s); the REST of the journey is "
+                    "NOT affected.", job_id, stuck_vid,
+                    time.time() - last_progress_at, WATCHDOG_STUCK_SECONDS,
+                    handle.pid,
+                )
+                handle.discard()  # kills only this worker; pool replaces it
+                # Videos in `ordered` BEFORE the stuck one already completed
+                # (successfully OR with an ordinary per-video failure) in
+                # this batch — return them as real results / real failures.
+                # The stuck video itself and anything after it are simply
+                # omitted here; the caller (retry loop) decides to retry
+                # from the stuck video onward or give up on it.
+                video_results = [
+                    _video_result_from_dict(partial_results[vid_])
+                    for vid_ in completed_ids
+                    if completed_ids[vid_] and vid_ in partial_results
+                ]
+                pre_stuck_failed = {
+                    vid_: (detail_by_id.get(vid_, {}) or {}).get("reason")
+                          or "Video processing failed — see worker log for details"
+                    for vid_ in completed_ids
+                    if not completed_ids[vid_]
+                }
+                return ("stuck", video_results, time.time() - batch_start_time,
+                        pre_stuck_failed, detail_by_id, stuck_vid)
+
+            if ABSOLUTE_JOURNEY_CEILING_SECONDS and \
+                    (time.time() - batch_start_time) > ABSOLUTE_JOURNEY_CEILING_SECONDS:
+                log.error(
+                    "[Job %s]  Batch exceeded the opt-in absolute ceiling "
+                    "(%.0fs) — killing and replacing its GPU worker "
+                    "(pid=%s).", job_id, ABSOLUTE_JOURNEY_CEILING_SECONDS,
+                    handle.pid,
+                )
+                handle.discard()
+                return _finalize_abnormal(
+                    label="absolute journey ceiling exceeded",
+                    crash_reason=(
+                        "Worker exceeded the configured absolute journey "
+                        "ceiling — video was not processed."
+                    ),
+                )
+
             if not drained_any:
                 time.sleep(EVENTS_POLL_INTERVAL_SECONDS)
     except BaseException as exc:
@@ -769,19 +843,20 @@ def _run_journey_supervised(
 
         if result_payload.get("type") == "result":
             video_results = [_video_result_from_dict(vr) for vr in result_payload["video_results"]]
-            return (video_results, result_payload["wall_seconds"],
-                    result_payload["failed_videos"], detail_by_id)
+            return ("done", video_results, result_payload["wall_seconds"],
+                     result_payload["failed_videos"], detail_by_id, None)
 
         if result_payload.get("type") == "error":
             # Worker returned cleanly (from its own point of view) but
             # analyze_journey raised above its own per-video isolation —
-            # treat ALL videos as failed, and report every single one
-            # immediately (none were reported yet, since this is a
-            # journey-level error, not per-video).
+            # treat every not-yet-completed video in THIS batch as failed,
+            # and report every single one immediately.
             log.error("[Job %s]  GPU worker reported an error: %s",
                        job_id, result_payload.get("message"))
             failed_videos = {}
             for vj in ordered:
+                if vj.video_id in completed_ids and completed_ids[vj.video_id]:
+                    continue
                 msg = result_payload.get("message", "Unknown error")
                 failed_videos[vj.video_id] = msg
                 detail_by_id[vj.video_id] = {"errorType": "PROCESSING_ERROR", "reason": None}
@@ -789,22 +864,135 @@ def _run_journey_supervised(
                     vj.video_id, msg, "PROCESSING_ERROR",
                     result_payload.get("traceback"), None,
                 )
-            return [], time.time() - start_time, failed_videos, detail_by_id
+            return ("done", [], time.time() - batch_start_time, failed_videos, detail_by_id, None)
 
-    # ── Abnormal outcome: crash, OOM-kill, timeout-kill, segfault, etc. ────
+    # ── Abnormal outcome: crash, OOM-kill, segfault, etc. ───────────────────
     # By the time we get here the worker has already been discarded (via
     # handle.discard() above) and the pool has spawned its replacement.
     log.error(
         "[Job %s]  GPU worker died/was killed abnormally  "
-        "videos_completed=%d/%d", job_id, len(completed_ids), n_videos,
+        "videos_completed=%d/%d (this batch)", job_id, len(completed_ids), n_videos,
     )
     return _finalize_abnormal(
-        label="GPU worker crashed or was killed after timeout",
-        crash_reason=(
-            "GPU worker crashed or was killed after exceeding its "
-            "timeout — video was not processed."
-        ),
+        label="GPU worker crashed",
+        crash_reason="GPU worker crashed — video was not processed.",
     )
+
+
+def _run_journey_supervised(
+    job_id:      str,
+    journey_id:  int,
+    folder_name: str,
+    video_jobs:  list,
+    tmp_paths:   Dict[int, str],
+    progress_cb,
+):
+    """
+    Returns (video_results, wall_seconds, failed_videos, video_error_details)
+    — failed_videos/video_error_details have the same shape analyze_journey()
+    produces, plus this function ALSO calls send_video_failed() immediately
+    for every video as its failure becomes known (Phase 1 requirement: "no
+    failed video should wait until journey completion to be reported") —
+    runs the actual work in an isolated child process so a native crash
+    can't take down the consumer.
+
+    Fix 1/7 — this is now a thin RETRY LOOP around `_run_journey_batch()`.
+    The old implementation killed the ENTIRE journey (every video, even
+    ones that hadn't started yet, and re-attempted nothing) the moment a
+    single fixed wall-clock timeout was exceeded. Now: a progress-based
+    watchdog inside `_run_journey_batch()` detects only the ONE video that
+    is actually stuck, that video's worker is discarded, and the video is
+    retried FROM SCRATCH (frame-level resume is out of scope — see Fix 7)
+    in a fresh batch covering just the stuck video onward. Videos before
+    it are never re-run; videos after it simply haven't started yet. Only
+    after WATCHDOG_MAX_VIDEO_RETRIES failed retries of the SAME video is
+    it finally given up on and marked FAILED, and the journey continues
+    with whatever comes after it.
+    """
+    ordered        = sorted(video_jobs, key=lambda v: v.sequence_no)
+    n_videos_total = len(ordered)
+    outer_start    = time.time()
+
+    all_video_results: list            = []
+    all_failed_videos: Dict[int, str]  = {}
+    all_detail_by_id:  Dict[int, dict] = {}
+    reported_ids:      set             = set()   # shared across every retry batch
+    retry_count_by_video: Dict[int, int] = {}
+
+    remaining = list(ordered)
+    time_offset_seed  = 0.0
+    frame_offset_seed = 0
+
+    while remaining:
+        outcome, video_results, _batch_wall, failed_videos, detail_by_id, stuck_vid = \
+            _run_journey_batch(
+                job_id, journey_id, folder_name, remaining, tmp_paths,
+                progress_cb, reported_ids, n_videos_total,
+                len(all_video_results),
+                time_offset_seed, frame_offset_seed,
+            )
+
+        all_video_results.extend(video_results)
+        all_failed_videos.update(failed_videos)
+        all_detail_by_id.update(detail_by_id)
+
+        if outcome == "done":
+            break
+
+        if outcome == "abnormal":
+            # Old crash-recovery behavior, scoped to whatever was still
+            # `remaining` — everything before this batch (earlier retries)
+            # is already safely accumulated above.
+            break
+
+        # outcome == "stuck"
+        retry_count_by_video[stuck_vid] = retry_count_by_video.get(stuck_vid, 0) + 1
+        stuck_idx = next(i for i, vj in enumerate(remaining) if vj.video_id == stuck_vid)
+
+        # Recompute continuity seeds from everything genuinely completed so
+        # far (across ALL batches so far), so journey-global violation
+        # timestamps stay continuous across the retry.
+        time_offset_seed  = sum(vr.duration_seconds for vr in all_video_results)
+        frame_offset_seed = int(time_offset_seed * 25.0)  # 25fps fallback estimate — cosmetic only, never used for timestamps
+
+        if retry_count_by_video[stuck_vid] <= WATCHDOG_MAX_VIDEO_RETRIES:
+            log.warning(
+                "[Job %s]  Retrying stuck video_id=%d from scratch "
+                "(attempt %d/%d) — journey continues, no other video is "
+                "affected.", job_id, stuck_vid,
+                retry_count_by_video[stuck_vid], WATCHDOG_MAX_VIDEO_RETRIES,
+            )
+            remaining = remaining[stuck_idx:]  # stuck video + everything after it (never started)
+            continue
+
+        # Retries exhausted — give up on this ONE video, mark it FAILED,
+        # and continue the journey with whatever comes after it (Fix 7:
+        # "if a video gets stuck, do not kill the entire journey").
+        msg = (
+            f"Video exceeded the watchdog stall limit "
+            f"({WATCHDOG_STUCK_SECONDS:.0f}s with no progress) after "
+            f"{WATCHDOG_MAX_VIDEO_RETRIES} retry(ies) — marked FAILED; "
+            "remaining videos in the journey continue."
+        )
+        log.error("[Job %s]  Giving up on video_id=%d: %s", job_id, stuck_vid, msg)
+        all_failed_videos[stuck_vid] = msg
+        all_detail_by_id[stuck_vid]  = {"errorType": "STALLED", "reason": msg}
+        try:
+            send_video_failed(
+                job_id        = job_id,
+                journey_id    = journey_id,
+                video_id      = stuck_vid,
+                error_type    = "STALLED",
+                error_message = msg,
+                stack_trace   = "",
+                reason        = msg,
+            )
+        except Exception as exc:
+            log.error("[Job %s]  send_video_failed failed for stalled "
+                       "video=%d: %s", job_id, stuck_vid, exc)
+        remaining = remaining[stuck_idx + 1:]  # skip the failed video, keep going
+
+    return all_video_results, time.time() - outer_start, all_failed_videos, all_detail_by_id
 
 
 # ── Fatal-interruption finalization (partial-journey recovery) ────────────

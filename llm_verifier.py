@@ -38,6 +38,28 @@ Design notes
   temporarily-down verifier can never silently take down the whole
   pipeline in a way ops doesn't control. Default is fail CLOSED (reject)
   to match the "when in doubt, reject" philosophy of prompt.py.
+
+Deterministic override layer (integrated from the standalone
+verify_violation.py CLI tool)
+---------------------------------------------------------------------------
+For Mobile Phone, Seat Absence, and Hand Raising, the model's own
+"verified: true" verdict is no longer trusted blindly — it is
+cross-checked against the STRUCTURED fields the model was asked to fill
+in for that violation type (e.g. `device_hardware_visible`,
+`hand_is_elevated_in_air`, `body_part_location`) and, for Hand Raising,
+against the free-text `person_descriptions` too. If any of those
+structured/textual signals contradict a "verified: true" claim (e.g. the
+model says verified=true but also says `hand_is_elevated_in_air=false`),
+the candidate is deterministically REJECTED regardless of what the
+top-level `verified` field said — this is exactly the reference
+behaviour of the standalone verify_violation.py tool, now applied inside
+the live pipeline instead of only being available as an offline CLI.
+This only ever makes rejection MORE likely (never invents a violation
+the model didn't already claim to see) and never changes YOLO/MediaPipe
+detection logic or which frames get sent for verification in the first
+place — it only tightens what happens to the LLM's verdict on the three
+violation types that have these extra structured fields defined in
+prompt.py. Toggle: LLM_DETERMINISTIC_OVERRIDE_ENABLED (default True).
 """
 
 from __future__ import annotations
@@ -45,7 +67,7 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -75,6 +97,12 @@ OLLAMA_HOST                 = _cfg("OLLAMA_HOST", None)  # None = client default
 OLLAMA_TIMEOUT_SECONDS       = int(_cfg("OLLAMA_TIMEOUT_SECONDS", 120))
 OLLAMA_MAX_RETRIES           = int(_cfg("OLLAMA_MAX_RETRIES", 2))
 OLLAMA_TEMPERATURE           = float(_cfg("OLLAMA_TEMPERATURE", 0.1))
+
+# Deterministic cross-check layer (see module docstring above) — applied
+# on top of the model's own "verified" verdict for Mobile Phone, Seat
+# Absence, and Hand Raising only. Default on; can be disabled to fall back
+# to trusting the model's top-level "verified" field alone.
+LLM_DETERMINISTIC_OVERRIDE_ENABLED = bool(_cfg("LLM_DETERMINISTIC_OVERRIDE_ENABLED", True))
 
 
 # Internal detector event_type (as stored on _Violation.type, e.g. from
@@ -300,14 +328,286 @@ def _safe_parse(raw_text: str) -> Optional[dict]:
 
         reason = str(data.get("reason", "")).strip() or "No reason provided."
 
-        return {
+        result = {
             "verified":   verified,
             "role":       role,
             "confidence": confidence,
             "reason":     reason,
         }
+        # Fix (integration): keep every OTHER structured field the model
+        # returned (device_hardware_visible, hand_is_elevated_in_air,
+        # person_descriptions, body_part_location, etc.) alongside the
+        # normalized ones above, instead of discarding them. Without this,
+        # the deterministic override checks below have nothing to
+        # cross-check "verified" against — this is exactly the extra
+        # per-violation-type structured data prompt.py's schemas ask the
+        # model for, and the standalone verify_violation.py tool relies on.
+        for k, v in data.items():
+            if k not in result:
+                result[k] = v
+        return result
     except Exception:
         return None
+
+
+# ── Deterministic cross-check / override layer ──────────────────────────────
+#
+# Integrated from the standalone verify_violation.py reference CLI tool.
+# Re-evaluates the model's top-level "verified" claim against the
+# STRUCTURED fields (and, for Hand Raising, the free-text
+# person_descriptions) it was asked to fill in for that specific violation
+# type — only Mobile Phone, Seat Absence, and Hand Raising have such
+# fields defined in prompt.py today. This can only turn a "verified: true"
+# into a rejection; it never fabricates a violation the model didn't
+# already claim to see, and it never runs at all when
+# LLM_DETERMINISTIC_OVERRIDE_ENABLED is False.
+
+def _apply_mobile_phone_override(parsed: dict) -> Tuple[bool, Optional[str]]:
+    """Deterministic check for Mobile Phone violation."""
+    model_verified = bool(parsed.get("verified", False))
+    if not model_verified:
+        return False, None
+
+    red_flags = []
+    if parsed.get("device_hardware_visible") is False:
+        red_flags.append("no physical device hardware visible")
+    if parsed.get("object_visually_separate_from_skin") is False:
+        red_flags.append("object not visually separate from skin/hand")
+    if parsed.get("hand_gripping_object") is False:
+        red_flags.append("fingers not visibly gripping a distinct object")
+    if parsed.get("hand_to_head_pose") is True:
+        red_flags.append("hand is simply resting on the face/ear/chin")
+
+    if red_flags:
+        override_reason = (
+            "Overridden to REJECTED: model's own reported observations "
+            "indicate a hand-to-face gesture, not a held phone ("
+            + "; ".join(red_flags) + ")."
+        )
+        return False, override_reason
+
+    return True, None
+
+
+def _apply_seat_absence_override(parsed: dict) -> Tuple[bool, Optional[str]]:
+    """Deterministic check for Seat Absence violation."""
+    model_verified = bool(parsed.get("verified", False))
+    if not model_verified:
+        return False, None
+
+    red_flags = []
+    if parsed.get("human_body_part_visible") is True:
+        red_flags.append("a human body part was reported visible in the frame")
+    location = parsed.get("body_part_location")
+    if location and location != "none":
+        red_flags.append(f"body part location reported as '{location}'")
+    part_type = parsed.get("body_part_type")
+    if part_type and part_type not in ("none",):
+        red_flags.append(f"body part type reported as '{part_type}'")
+    if parsed.get("seat_and_cabin_empty") is False:
+        red_flags.append("seat/cabin reported as not fully empty")
+
+    if red_flags:
+        override_reason = (
+            "Overridden to REJECTED: model's own edge-scan observations "
+            "indicate a person is at least partially visible in the frame ("
+            + "; ".join(red_flags) + ")."
+        )
+        return False, override_reason
+
+    return True, None
+
+
+_SIGNAL_KEYWORDS = (
+    "arm raised", "arm extended", "arms raised", "arms extended",
+    "hand raised", "raised hand", "extended outward", "extended toward",
+    "reaching toward the window", "reaching toward the front",
+    "extended arm", "arm up", "hand up", "raising",
+    "arm out toward", "pointing toward the window",
+    "pointing toward the front", "pointing upwards", "pointing upward",
+    "pointing", "salute",
+)
+_SIGNAL_NEGATION_KEYWORDS = (
+    "not raised", "not extended", "arm not raised", "arms not raised",
+    "no arm raised", "not signaling",
+)
+_STRETCH_KEYWORDS = (
+    "both arms", "both hands above", "stretching", "stretch", "yawn",
+    "yawning", "leaning back", "leaned back", "reclin", "arched back",
+    "hands clasped", "clasped overhead", "clasped behind",
+)
+_LP_POSITION_KEYWORDS = (
+    "driver's seat", "primary driving", "main console", "throttle seat",
+    "driving position", "seated at the main", "seated at the controls",
+    "seated", "foreground",
+)
+_ALP_POSITION_KEYWORDS = (
+    "standing near door", "secondary seat", "assistant", "standing",
+    "walking", "near the door", "standing behind", "background",
+)
+_DESK_POSTURE_KEYWORDS = (
+    "hands on controls", "hand on control", "arm posture normal",
+    "resting on console", "resting on desk", "seated at console",
+    "hands at desk", "operating controls", "at desk level",
+)
+
+_KNOWN_BOILERPLATE_PHRASES = (
+    "standing near door, right arm extended outward at shoulder height "
+    "toward the window, hand open, not touching anything",
+    "seated at console, right hand resting on throttle lever, "
+    "arm not raised",
+)
+
+
+def _looks_like_boilerplate(description: str) -> bool:
+    if not description:
+        return False
+    text = description.lower().strip()
+    return any(text == phrase or phrase in text for phrase in _KNOWN_BOILERPLATE_PHRASES)
+
+
+def _find_signaling_description(person_descriptions: list) -> Tuple[Optional[int], Optional[str]]:
+    for idx, desc in enumerate(person_descriptions or []):
+        if not isinstance(desc, str):
+            continue
+        text = desc.lower()
+        has_signal = any(kw in text for kw in _SIGNAL_KEYWORDS)
+        has_negation = any(kw in text for kw in _SIGNAL_NEGATION_KEYWORDS)
+        if has_signal and not has_negation:
+            return idx, desc
+    return None, None
+
+
+def _guess_role_from_description(description: str) -> str:
+    if not description:
+        return "Unknown"
+    text = description.lower()
+    if any(kw in text for kw in _LP_POSITION_KEYWORDS):
+        return "Loco Pilot"
+    if any(kw in text for kw in _ALP_POSITION_KEYWORDS):
+        return "Assistant Loco Pilot"
+    return "Unknown"
+
+
+def _apply_hand_raising_override(parsed: dict) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Deterministically re-evaluate Hand Raising violation with cross-
+    validation between structured flags and textual observations, to
+    catch model hallucinations (e.g. claiming "verified: true" while its
+    own person_descriptions/structured fields describe hands resting on
+    the console, not elevated in the air).
+
+    Returns (verified, override_reason_or_None, resolved_role_or_None).
+    """
+    person_descriptions = parsed.get("person_descriptions") or []
+
+    # 1. Boilerplate check — the model repeating a known template
+    #    description verbatim is itself a hallucination signal.
+    for suspect in person_descriptions:
+        if isinstance(suspect, str) and _looks_like_boilerplate(suspect):
+            return (
+                False,
+                "REJECTED: person_descriptions entry matches boilerplate template.",
+                None,
+            )
+
+    red_flags = []
+
+    # 2. Detect hallucinated elevation using the free-text descriptions.
+    desk_count = 0
+    for desc in person_descriptions:
+        if isinstance(desc, str):
+            text = desc.lower()
+            if any(kw in text for kw in _DESK_POSTURE_KEYWORDS):
+                desk_count += 1
+    if desk_count > 0 and desk_count == len(person_descriptions):
+        red_flags.append("person_descriptions explicitly state hands are resting on controls/desk")
+
+    # 3. Structured field checks.
+    if parsed.get("hand_is_elevated_in_air") is False:
+        red_flags.append("hand_is_elevated_in_air reported as false")
+    if parsed.get("hand_height") == "at_desk_level":
+        red_flags.append("hand_height reported at desk level")
+    if parsed.get("arm_direction") == "low_at_console":
+        red_flags.append("arm_direction reported as low at console")
+
+    # 4. Strict stretch/yawn posture checks.
+    if parsed.get("arms_raised_count") == 2:
+        red_flags.append("both arms raised (stretching posture)")
+    if parsed.get("hands_clasped_overhead") is True:
+        red_flags.append("hands_clasped_overhead is True")
+    if parsed.get("torso_leaning_back") is True or parsed.get("head_tilted_back") is True:
+        red_flags.append("torso or head is tilted/leaning back in relaxation")
+    if parsed.get("arm_direction") == "straight_up_ceiling":
+        red_flags.append("arm direction is straight up toward ceiling")
+
+    # Check the free-text description for the same stretch keywords.
+    idx, description = _find_signaling_description(person_descriptions)
+    if description is not None:
+        text = description.lower()
+        if any(kw in text for kw in _STRETCH_KEYWORDS):
+            red_flags.append("description contains explicit stretching/overhead cues")
+
+    if red_flags:
+        override_reason = (
+            "Overridden to REJECTED: invalid posture or low hand height detected ("
+            + "; ".join(red_flags) + ")."
+        )
+        return False, override_reason, None
+
+    if not parsed.get("verified", False) and description is None:
+        return (
+            False,
+            "No description or signal indication for an elevated raised hand.",
+            None,
+        )
+
+    sig_desc = description if description else parsed.get("signaling_person_description", "")
+    role = _guess_role_from_description(sig_desc)
+    model_role = parsed.get("role")
+    if model_role in ("Loco Pilot", "Assistant Loco Pilot", "Both"):
+        role = model_role
+
+    override_reason = "ACCEPTED based on valid elevated hand raising gesture."
+    return True, override_reason, role
+
+
+def _apply_deterministic_override(candidate_violation: str, parsed: dict) -> Tuple[bool, str, int, str]:
+    """
+    Dispatches to the right override function for `candidate_violation`
+    (Mobile Phone / Seat Absence / Hand Raising only — every other
+    violation type is returned unchanged) and returns the possibly-revised
+    (verified, role, confidence, reason). Mirrors the standalone
+    verify_violation.py tool's post-processing of the model's raw verdict
+    exactly, including its confidence/role reset behaviour on override.
+    """
+    verified   = bool(parsed.get("verified", False))
+    role       = parsed.get("role", "Unknown")
+    confidence = parsed.get("confidence", 0)
+    reason     = parsed.get("reason", "")
+
+    if not LLM_DETERMINISTIC_OVERRIDE_ENABLED:
+        return verified, role, confidence, reason
+
+    if candidate_violation == Violation.HAND_RAISING:
+        new_verified, override_note, resolved_role = _apply_hand_raising_override(parsed)
+        if override_note:
+            reason     = override_note
+            confidence = 90 if new_verified else 0
+            role       = resolved_role if new_verified else "Unknown"
+        verified = new_verified
+    elif candidate_violation == Violation.MOBILE_PHONE:
+        new_verified, override_note = _apply_mobile_phone_override(parsed)
+        if override_note:
+            reason, confidence, role = override_note, 0, "Unknown"
+        verified = new_verified
+    elif candidate_violation == Violation.SEAT_ABSENCE:
+        new_verified, override_note = _apply_seat_absence_override(parsed)
+        if override_note:
+            reason, confidence, role = override_note, 0, "Unknown"
+        verified = new_verified
+
+    return verified, role, confidence, reason
 
 
 # ── Public entry point ───────────────────────────────────────────────────
@@ -440,6 +740,28 @@ def verify_frame(image_bgr: np.ndarray, event_type: str, log_label: str = "") ->
             "skipped":     False,
             "llm_invoked": True,
         }
+
+    # ── Deterministic cross-check / override layer ───────────────────────
+    # Re-evaluates the model's own "verified" claim against the structured
+    # fields it filled in for THIS violation type, for Mobile Phone, Seat
+    # Absence, and Hand Raising only (see module docstring). Only ever
+    # makes rejection MORE likely — never invents a violation the model
+    # didn't already claim to see.
+    override_verified, override_role, override_confidence, override_reason = \
+        _apply_deterministic_override(candidate_violation, parsed)
+    if (override_verified, override_role, override_confidence, override_reason) != (
+        parsed["verified"], parsed["role"], parsed["confidence"], parsed["reason"],
+    ):
+        log.info(
+            "Deterministic override changed verdict for %s (%s): "
+            "verified %s -> %s (%s)",
+            log_label, candidate_violation, parsed["verified"], override_verified,
+            override_reason,
+        )
+    parsed["verified"]   = override_verified
+    parsed["role"]       = override_role
+    parsed["confidence"] = override_confidence
+    parsed["reason"]     = override_reason
 
     status, role = _status_role(parsed["verified"], parsed["role"])
     parsed["skipped"]     = False

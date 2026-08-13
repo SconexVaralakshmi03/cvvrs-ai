@@ -24,6 +24,24 @@ Integrated into the main journey pipeline via analyzer.py + llm_verifier.py:
 every candidate violation frame is run through this verification prompt
 before it is uploaded to S3 or included in the completion payload sent to
 the Java backend.
+
+Structured per-type JSON schemas (Mobile Phone / Hand Raising / Seat
+Absence)
+------------------------------------------------------------------------
+In addition to the always-present "verified" / "role" / "confidence" /
+"reason" fields, these three violation types now request a handful of
+EXTRA structured boolean/enum fields specific to that violation (e.g.
+"device_hardware_visible" for Mobile Phone, "hand_is_elevated_in_air" for
+Hand Raising, "body_part_location" for Seat Absence). The prose criteria
+above are UNCHANGED — these extra fields don't change what the model is
+told to look for, only what it reports back about what it saw. They exist
+so llm_verifier.py's deterministic override layer can cross-check the
+model's own top-level "verified" claim against its own structured
+observations (e.g. reject a "verified: true" Hand Raising candidate whose
+own hand_is_elevated_in_air field says false) instead of trusting a
+single free-form "verified" boolean at face value. Drowsiness and RSL
+Hand Brake keep their existing schemas (no override layer is defined for
+them).
 """
 
 from __future__ import annotations
@@ -153,6 +171,94 @@ Respond with EXACTLY this JSON schema and nothing else:
 
 If verified is false, set role to "Unknown" and confidence to 0.
 """.strip()
+
+
+# --------------------------------------------------------------------------- #
+# Structured per-type JSON schemas — Mobile Phone / Hand Raising / Seat
+# Absence request a few EXTRA structured fields (on top of the standard
+# verified/role/confidence/reason) so llm_verifier.py's deterministic
+# override layer can cross-check the model's own "verified" claim against
+# its own reported observations. The prose criteria above (unchanged) still
+# govern what the model is told to look for — these schemas only change
+# what it reports back.
+# --------------------------------------------------------------------------- #
+
+_MOBILE_PHONE_JSON_SCHEMA = """
+Respond with EXACTLY this JSON schema and nothing else:
+
+{{
+  "device_hardware_visible": <true or false -- is physical phone body/screen clearly visible?>,
+  "object_visually_separate_from_skin": <true or false>,
+  "hand_gripping_object": <true or false>,
+  "hand_to_head_pose": <true or false>,
+  "verified": <true or false>,
+  "candidate_violation": "{violation}",
+  "role": "<Loco Pilot | Assistant Loco Pilot | Both | Unknown>",
+  "confidence": <integer 0-100>,
+  "reason": "<one concise sentence citing visual evidence>"
+}}
+
+If verified is false, set role to "Unknown" and confidence to 0.
+""".strip()
+
+
+_HAND_RAISING_JSON_SCHEMA = """
+CRITICAL VISUAL GROUNDING RULES FOR HAND RAISING:
+1. Examine the height of the hands relative to the DASHBOARD/CONSOLE LEDGE.
+2. If hands are resting on switches, levers, throttle, desk, paper logbook, or window sill, they are AT DESK LEVEL. You MUST set hand_is_elevated_in_air to false and hand_height to "at_desk_level".
+3. A hand is ONLY "elevated in air" if there is clear daylight/space between the hand/arm and any console/desk surface, reaching UP towards the windshield or ceiling.
+4. Do NOT hallucinate an elevated arm if both crew members have their hands on or near the control desk.
+5. ONLY classify as STRETCHING/YAWNING if BOTH arms are raised overhead, hands are clasped, or the person is leaning/tilted back in a relaxation posture.
+
+Respond with EXACTLY this JSON schema and nothing else:
+
+{{
+  "persons_observed": <integer count of visible crew members>,
+  "person_descriptions": [
+    "<for EACH visible person, write a fresh 8-15 word description covering: (a) position, (b) exact hand location relative to console desk, (c) whether hand is in air or on desk.>"
+  ],
+  "signaling_person": "<loco_pilot | assistant_loco_pilot | none>",
+  "signaling_person_description": "<exact string from person_descriptions for the signaling person, or '' if none>",
+  "hand_is_elevated_in_air": <true or false -- false if hand is on/near desk or controls>,
+  "arms_raised_count": <0, 1, or 2>,
+  "hand_height": "<at_desk_level | shoulder_height | above_head | unclear>",
+  "torso_leaning_back": <true or false>,
+  "head_tilted_back": <true or false>,
+  "hands_clasped_overhead": <true or false>,
+  "arm_direction": "<toward_windshield | toward_window_or_wall | straight_up_ceiling | low_at_console | unclear>",
+  "verified": <true or false>,
+  "candidate_violation": "Hand Raising",
+  "role": "<Loco Pilot | Assistant Loco Pilot | Both | Unknown>",
+  "confidence": <integer 0-100>,
+  "reason": "<one concise sentence>"
+}}
+""".strip()
+
+
+_SEAT_ABSENCE_JSON_SCHEMA = """
+Respond with EXACTLY this JSON schema and nothing else:
+
+{{
+  "human_body_part_visible": <true or false>,
+  "body_part_location": "<none | driving_seat | secondary_seat | edge_of_frame | background | floor>",
+  "body_part_type": "<none | head_hair | arm_hand | leg_foot | torso | partial>",
+  "seat_and_cabin_empty": <true or false>,
+  "verified": <true or false>,
+  "candidate_violation": "Seat Absence",
+  "role": "Unknown",
+  "confidence": <integer 0-100>,
+  "reason": "<one concise sentence>"
+}}
+""".strip()
+
+# Dispatch table used by build_verification_prompt() below — only the
+# three types above have an extra structured schema; every other
+# verifiable type keeps using the generic _JSON_SCHEMA.
+_STRUCTURED_JSON_SCHEMA_BY_VIOLATION: dict[str, str] = {
+    Violation.MOBILE_PHONE: _MOBILE_PHONE_JSON_SCHEMA,
+    Violation.HAND_RAISING: _HAND_RAISING_JSON_SCHEMA,
+    Violation.SEAT_ABSENCE: _SEAT_ABSENCE_JSON_SCHEMA,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -461,6 +567,16 @@ def build_verification_prompt(candidate_violation: str) -> str:
         if candidate_violation == Violation.SEAT_ABSENCE
         else _ROLE_RULES
     )
-    schema = _JSON_SCHEMA.format(violation=candidate_violation)
+    # Fix (integration): Mobile Phone / Hand Raising / Seat Absence get the
+    # richer structured schema (extra fields for llm_verifier.py's
+    # deterministic override layer to cross-check); every other verifiable
+    # type keeps the original generic schema — unchanged behaviour for
+    # Drowsiness.
+    if candidate_violation in _STRUCTURED_JSON_SCHEMA_BY_VIOLATION:
+        schema = _STRUCTURED_JSON_SCHEMA_BY_VIOLATION[candidate_violation].format(
+            violation=candidate_violation
+        )
+    else:
+        schema = _JSON_SCHEMA.format(violation=candidate_violation)
 
     return "\n\n".join([_BASE_RULES, criteria, role_rules, schema])
