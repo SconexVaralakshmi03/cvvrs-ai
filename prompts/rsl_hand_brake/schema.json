@@ -1,0 +1,3 @@
+{
+  "schema_text": "Respond with EXACTLY this JSON schema and nothing else -- no markdown\nfences, no explanation outside the JSON:\n\n{\n  \"verified\": <true or false>,\n  \"candidate_violation\": \"%%VIOLATION%%\",\n  \"confidence\": <integer 0-100>,\n  \"reason\": \"<one concise sentence citing the specific visual evidence,\n             noting if Image 2 (the zoomed crop) was what made the\n             hand/lever visible>\"\n}\n\nIf verified is false, set confidence to 0. Do not include a \"role\" field\n-- when this candidate is verified true, the hand-on-brake crew member is\nby definition the Assistant Loco Pilot (ALP), so role is assigned by the\ncaller, not the model."
+}

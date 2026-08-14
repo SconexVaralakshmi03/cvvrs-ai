@@ -1,0 +1,4 @@
+Role identification: not applicable for this violation type. Always set
+role to "Unknown" regardless of the verdict, since by definition no crew
+member's role can be identified when verifying whether the cabin is
+unmanned.

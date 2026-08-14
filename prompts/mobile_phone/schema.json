@@ -1,0 +1,3 @@
+{
+  "schema_text": "Respond with EXACTLY this JSON schema and nothing else:\n\n{\n  \"device_hardware_visible\": <true or false -- is physical phone body/screen clearly visible?>,\n  \"object_visually_separate_from_skin\": <true or false>,\n  \"hand_gripping_object\": <true or false>,\n  \"hand_to_head_pose\": <true or false>,\n  \"verified\": <true or false>,\n  \"candidate_violation\": \"%%VIOLATION%%\",\n  \"role\": \"<Loco Pilot | Assistant Loco Pilot | Both | Unknown>\",\n  \"confidence\": <integer 0-100>,\n  \"reason\": \"<one concise sentence citing visual evidence>\"\n}\n\nIf verified is false, set role to \"Unknown\" and confidence to 0."
+}

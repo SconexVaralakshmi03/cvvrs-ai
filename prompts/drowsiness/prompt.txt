@@ -1,0 +1,11 @@
+Candidate violation to verify: DROWSINESS.
+
+Verify (verified = true) ONLY if BOTH of the following are clearly true:
+- The person's eyes are clearly closed.
+- AND there is an obvious sleeping posture or visible head droop.
+
+Reject (verified = false) if ANY of the following apply:
+- The person appears to be blinking rather than sleeping.
+- The person is simply looking down.
+- Lighting/image quality is too poor to clearly judge the eyes or posture.
+- The state of the eyes or posture is uncertain.

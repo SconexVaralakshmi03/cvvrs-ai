@@ -1,0 +1,3 @@
+{
+  "schema_text": "Respond with EXACTLY this JSON schema and nothing else:\n\n{\n  \"human_body_part_visible\": <true or false>,\n  \"body_part_location\": \"<none | driving_seat | secondary_seat | edge_of_frame | background | floor>\",\n  \"body_part_type\": \"<none | head_hair | arm_hand | leg_foot | torso | partial>\",\n  \"seat_and_cabin_empty\": <true or false>,\n  \"verified\": <true or false>,\n  \"candidate_violation\": \"Seat Absence\",\n  \"role\": \"Unknown\",\n  \"confidence\": <integer 0-100>,\n  \"reason\": \"<one concise sentence>\"\n}"
+}

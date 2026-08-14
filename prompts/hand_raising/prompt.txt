@@ -1,0 +1,79 @@
+Candidate violation to verify: HAND RAISING ON SIGNAL.
+IMPORTANT:
+This is a STRICT VISUAL VERIFICATION task. Judge only what is visibly
+present in this single image. Do NOT infer the person's intention or
+assume that an extended arm is a signal.
+A valid hand-raising signal requires CLEAR visual evidence that at least
+one crew member is performing a distinct raised-arm gesture away from the
+normal working/resting position.
+Verify (verified = true) ONLY if ALL of the following are clearly visible:
+
+1. At least one arm is clearly RAISED or distinctly EXTENDED away from the
+   person's normal resting/working position.
+2. The raised hand and forearm are clearly AWAY FROM and UNSUPPORTED BY the
+   table, console, dashboard, or other working surface.
+3. The raised hand is NOT touching, holding, gripping, resting on, or
+   operating a control, lever, switch, throttle, brake handle, joystick,
+   knob, gauge, or other console equipment.
+4. The arm posture is clearly distinguishable from a normal relaxed,
+   resting, reaching, or equipment-operating posture.
+5. The raised/extended arm clearly belongs to the crew member being
+   evaluated.
+   HAND SHAPE:
+   The exact finger configuration is NOT important.
+   Accept a hand that is:
+
+- fully open,
+- partially open,
+- pointing with one or more fingers,
+- in a salute-like configuration,
+- partially closed,
+- or otherwise visibly raised.
+  Do NOT require all fingers to be open and do NOT require a specific
+  finger position.
+  ARM ANGLE:
+  There is NO fixed required arm angle.
+  The arm does NOT need to form exactly 90 degrees with the shoulder,
+  upper arm, or forearm.
+  Accept reasonable variation in:
+- shoulder position,
+- elbow bend,
+- forearm direction,
+- wrist angle,
+- hand height,
+- and overall arm orientation.
+  The hand does NOT need to be above the head.
+  The elbow does NOT need to be fully straight.
+  Only one hand needs to be raised.
+  CRITICAL TABLE / CONSOLE RULE:
+  A hand or forearm resting on, supported by, or extended across the
+  table/console/work surface is NOT a hand-raising signal.
+  Do NOT classify an arm as raised merely because it is extended forward
+  over the console or table.
+  Reject (verified = false) if ANY of the following apply:
+- The hand or forearm is resting on the table, console, dashboard, or
+  other working surface.
+- The arm is extended across or toward the console/table as part of
+  normal cabin activity.
+- The person is reaching for an object inside the cabin.
+- The hand is touching, holding, gripping, or operating any control or
+  equipment.
+- The arm is in a normal relaxed or working position.
+- The posture is consistent with stretching, reaching, resting, adjusting
+  clothing, adjusting hair, or another routine cabin activity.
+- The image does not clearly show that the arm is actually raised away
+  from the working/resting surface.
+- The raised arm cannot be confidently distinguished from ordinary cabin
+  activity.
+- The arm direction or hand position cannot be determined because of
+  severe blur, occlusion, cropping, or poor image quality.
+- You are not fully certain that the visible posture satisfies the
+  criteria above.
+  DO NOT infer intent:
+  Do not decide that a person is signalling simply because the arm is
+  extended, pointing, elevated, or directed toward the front of the cabin.
+  The visual posture itself must provide sufficient evidence of a distinct
+  raised-arm gesture.
+  When in doubt, reject the candidate.
+  False positives caused by interpreting stretching, reaching, resting,
+  or console/table activity as a hand-raising signal are unacceptable.

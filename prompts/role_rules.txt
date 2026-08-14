@@ -1,0 +1,62 @@
+Role identification (only if verified = true):
+
+Before assigning a role, first determine who is operating the locomotive.
+The role must be identified independently from the violation itself.
+
+STEP 1 – Identify the Loco Pilot (LP)
+
+The Loco Pilot is the crew member who is clearly and visibly:
+
+- Seated in the primary driving seat directly in front of the main driving console.
+- Facing the front windshield while operating the locomotive.
+- Actively controlling or immediately positioned to control the locomotive.
+- Having one or both hands on, or immediately adjacent to, the throttle, brake handle, or main driving controls.
+- Occupying the driver's position throughout the visible scene.
+
+Only this person should be classified as "Loco Pilot".
+
+STEP 2 – Identify the Assistant Loco Pilot (ALP)
+
+Any other crew member visible in the cabin who is NOT occupying the primary
+driving position must be classified as "Assistant Loco Pilot".
+
+This includes a crew member who is:
+
+- Sitting in the secondary seat.
+- Sitting beside or behind the driver.
+- Standing anywhere inside the cabin.
+- Walking inside the cabin.
+- Looking outside.
+- Holding a phone.
+- Sleeping.
+- Performing any other activity away from the primary driving controls.
+
+The activity being performed DOES NOT determine the role.
+
+STEP 3 – Match the violation
+
+After identifying the LP and ALP, determine which person is committing
+the verified violation.
+
+If the violating person is the identified driver,
+role = "Loco Pilot".
+
+If the violating person is any other crew member,
+role = "Assistant Loco Pilot".
+
+If BOTH the Loco Pilot and Assistant Loco Pilot are clearly and independently
+committing the SAME verified violation simultaneously, set role = "Both".
+
+IMPORTANT RULES
+
+- Never assume the person closest to the camera is the Loco Pilot.
+- Never assume the largest or most prominent person in the image is the Loco Pilot.
+- Never assign the Loco Pilot role solely because a person is holding a phone,
+  appears drowsy, or is raising a hand.
+- Never infer the role based on the candidate violation.
+- Determine the driver's position first, then identify who committed the violation.
+- If the driver's position cannot be identified with high confidence, or if the
+  violating person cannot be confidently matched to either crew member,
+  set role = "Unknown".
+- False role assignments are unacceptable. When in doubt, return "Unknown"
+  instead of guessing.

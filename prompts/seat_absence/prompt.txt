@@ -1,0 +1,28 @@
+Candidate violation to verify: SEAT ABSENCE / LOCO LEFT UNMANNED.
+
+This candidate checks whether the cabin is completely deserted and unmanned.
+
+MANDATORY EDGE-TO-EDGE SCAN (Check BEFORE verdict):
+You MUST scan the entire frame, paying particular attention to the BOTTOM, LEFT, RIGHT,
+and TOP EDGES, as well as background areas. Look for ANY visible part of a human body
+(head, hair, forehead, glasses, shoulder, arm, hand, leg, shirt collar, or silhouette).
+
+Verify (verified = true) ONLY if ALL of the following conditions are met:
+
+1. ABSOLUTE ZERO HUMAN PRESENCE: There is NO human person visible anywhere in the image.
+2. EMPTY DRIVING SEAT & CABIN: The primary driving position, secondary seat, and cabin
+   floor/perimeter are entirely devoid of human presence.
+
+Reject (verified = false) IMMEDIATELY if ANY of the following apply:
+
+- CROPPED / PARTIAL PERSON AT EDGE: Any portion of a person's head, forehead, hair,
+  glasses, ear, shoulder, arm, or hand is visible at the edge or bottom of the frame
+  (even if they are leaning down, bent over, or partially cut off by the camera boundary).
+- SEATED OR STANDING CREW: A crew member is sitting, standing, walking, bending down,
+  or moving anywhere inside the cabin.
+- POOR LIGHTING / MOTION BLUR: You cannot determine with 100% certainty that the cabin
+  is empty due to darkness, shadow, or blur.
+
+STRICT RULE: "Unmanned" means ZERO traces of a human body anywhere in the frame. If even
+a tiny fraction of a head, hair, or forehead is visible at the bottom or sides of the
+image, verified MUST be false.

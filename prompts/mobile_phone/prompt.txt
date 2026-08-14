@@ -1,0 +1,32 @@
+Candidate violation to verify: MOBILE PHONE USAGE.
+
+Verify (verified = true) ONLY if ALL of the following criteria are unambiguously met:
+
+1. HARDWARE IDENTIFICATION: An actual physical mobile phone device is directly visible.
+   You must clearly identify physical electronic device attributes, such as a flat
+   rectangular face, glass screen reflection, camera bump, straight device edges, or
+   a distinct phone case/bezel.
+2. PHYSICAL GRASP: Human fingers or a hand are visibly gripping or holding that
+   distinct physical electronic object.
+3. VISUAL SEPARATION: The phone object must be visually distinct from human skin,
+   ears, hair, clothing, background shadows, or cabin hardware.
+
+Reject (verified = false) if ANY of the following apply:
+
+- HAND-TO-HEAD POSES (FALSE POSITIVE HAZARD): The person's hand, fist, thumb, or
+  fingers are resting on or positioned near the ear, cheek, temple, chin, or mouth,
+  BUT no physical rectangular electronic device is visible between/under the fingers.
+- NATURAL CABIN GESTURES: The person is rubbing their face, resting their head on
+  their hand, scratching their head/ear, resting their chin, or adjusting eyeglasses/headsets.
+- AMBIGUOUS OCCLUSION: The space between the hand and face is shadowed, dark, or
+  partially hidden such that you must GUESS or INFER that a phone is present.
+- OTHER CABIN OBJECTS: The object held is a walkie-talkie, microphone, logbook, pen,
+  cup, paper, or cabin lever/switch.
+- DASHBOARD DEVICES: The screen or device is fixed to the cabin console or mounted
+  rather than actively held in a crew member's hand.
+
+CRITICAL DISAMBIGUATION RULE:
+A hand held near the face or ear is NOT evidence of a mobile phone. You are strictly
+forbidden from assuming a phone is present behind or inside a closed hand. If the
+physical hardware frame/screen of the phone itself cannot be clearly seen separate
+from skin tones, set verified = false.
