@@ -84,7 +84,7 @@ from detector.seat_absence_detector import SeatAbsenceDetector
 from detector.head_drop_detector import HeadDroopDetector
 from detector.hand_raise_detector import HandRaiseDetector, HandRaisePoseEngine
 # NEW — additive: curve-checking (ALP looking outside the door on a curve).
-from detector.curve_checking import CurveCheckingDetector, draw_door_roi, draw_curve_check_overlay
+from detector.curve_checking import CurveCheckingDetector, draw_door_roi, draw_driver_roi, draw_curve_check_overlay
 
 _STOP = object()
 READ_QUEUE_MAXSIZE  = 8
@@ -526,13 +526,15 @@ class GadgetDetectionPipeline:
 
         future_gadget  = self.executor.submit(self.detector.process, frame, round(global_time, 3), pose_landmarks_by_pilot) if run_gadget  else None
         future_droop   = self.executor.submit(self.droop_detector.process, frame, global_time, prev_frame_detection) if run_droop else None
-        # NEW — additive: curve-checking uses self._prev_pilot_boxes (the
-        # LP/ALP boxes from the most recent gadget-detector cycle) purely to
-        # EXCLUDE the seated pilots from candidates — same "most recent
-        # known" pattern SeatAbsenceDetector uses via self._absence_pilot_boxes.
+        # UPDATED — curve-checking no longer takes pilot boxes from
+        # GadgetDetector. Detection logic is now a faithful port of the
+        # standalone prototype, which selects and excludes its own
+        # "driver" internally (DRIVER_ROI/select_driver, see
+        # detector/curve_checking.py) from its own per-cycle YOLO pose
+        # pass — it doesn't rely on another detector's boxes at all.
         future_curve   = self.executor.submit(
             self.curve_check_detector.process, frame, global_time,
-            self._prev_pilot_boxes, frame.shape[1], frame.shape[0],
+            frame.shape[1], frame.shape[0],
         ) if run_curve else None
 
         results,         log_events,         gadget_completed  = [], [], []
@@ -622,9 +624,12 @@ class GadgetDetectionPipeline:
             for ar in absence_results:
                 if ar.calibrated and ar.seat_zone is not None:
                     draw_seat_zone(annotated, ar.seat_zone, ar.pilot_id)
-            # NEW — additive: curve-checking door-zone overlay.
-            door_roi_px = self.curve_check_detector._door_roi_px(frame.shape[1], frame.shape[0])
-            annotated = draw_door_roi(annotated, door_roi_px)
+            # NEW — additive: curve-checking door-zone + driver-ROI overlay.
+            # door_roi is now a fixed literal-pixel polygon (exact
+            # standalone DOOR_ROI, not rescaled per frame) — no more
+            # _door_roi_px() scaling call.
+            annotated = draw_door_roi(annotated, self.curve_check_detector._door_roi)
+            annotated = draw_driver_roi(annotated, self.curve_check_detector._driver_roi)
             for cr in curve_results:
                 annotated = draw_curve_check_overlay(annotated, cr)
 
@@ -861,20 +866,27 @@ class GadgetDetectionPipeline:
         # curve) rather than a sustained ABNORMAL state — LOW severity/risk,
         # not backdated (event_local/event_global = the live confirmation-
         # time values, matching hand_raise's reasoning: no re-seek needed).
+        #
+        # UPDATED — duration is fixed at 0.0. The standalone script this
+        # detector is now a faithful port of has no start/end episode
+        # concept: it's a cooldown-gated snapshot event (see save_event()
+        # in the standalone script), not a sustained-state timer, so
+        # there's no true duration to report. (hand_raise's dur_hr above
+        # uses its own detector's timer_value — that detector is unrelated
+        # to this change and unaffected.)
         if curve_log_events:
             event_global = global_time
             event_local  = video_time
             cr_by_pilot  = {cr.pilot_id: cr for cr in curve_results}
             for _pid, _event_label in curve_log_events:
                 cr_ref  = cr_by_pilot.get(_pid)
-                conf_cc = cr_ref.score       if cr_ref else 0.9
-                dur_cc  = cr_ref.timer_value if cr_ref else 0.0
+                conf_cc = cr_ref.score if cr_ref else 0.9
                 self.vstore.record_violation(
                     annotated_frame=frame.copy(), original_frame=frame,
                     video_time=event_global, frame_index=global_frame,
                     event_type="curve_checking", severity="LOW",
                     confidence=conf_cc, risk_score=0, risk_level="LOW",
-                    factors=["curve_checking", "outside_view"], duration=dur_cc,
+                    factors=["curve_checking", "outside_view"], duration=0.0,
                     source_filename=self.source_filename, local_video_time=event_local,
                     pilot_id=_pid,
                 )
@@ -934,6 +946,15 @@ class GadgetDetectionPipeline:
 
         # NEW — additive: closes out the curve-checking episode's true
         # trigger→end duration, same pattern as the blocks above.
+        #
+        # UPDATED — curve_completed is now always [] (see
+        # detector/curve_checking.py's process() docstring): the
+        # standalone script this detector now faithfully ports has no
+        # start/end episode concept, only a cooldown-gated snapshot event,
+        # so this loop body never executes. Left in place rather than
+        # removed so the block stays structurally symmetric with every
+        # other detector's close-out block above, and so nothing breaks
+        # if a future change reintroduces an episode concept here.
         if curve_completed:
             print(f"[MAIN] curve_completed frame={global_frame} src={self.source_filename!r}: {curve_completed}")
         for _pid, _start_v, _end_v, _true_dur in curve_completed:

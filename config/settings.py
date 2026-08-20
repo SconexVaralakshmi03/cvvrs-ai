@@ -274,6 +274,15 @@ OLLAMA_TEMPERATURE            = 0.1
 # event, not a distraction — it confirms the assistant loco pilot actually
 # looked outside at the door zone during a curve, rather than flagging a
 # violation. See detector/curve_checking.py.
+#
+# UPDATED — detection logic below is now a byte-for-byte port of the
+# standalone prototype (DRIVER_ROI/select_driver exclusion, literal-pixel
+# DOOR_ROI, MIN_CONSECUTIVE_FRAMES/EVENT_COOLDOWN_FRAMES counters). The
+# standalone script is the source of truth: no thresholds, ROI values, or
+# temporal logic here deviate from it. The previous version of this block
+# used known_pilot_boxes/IoU exclusion and video-time-based duration
+# thresholds — that was integrated-pipeline-only logic layered on top of
+# the prototype, not present in the standalone script, and has been removed.
 
 # Ported from a standalone YOLO26-pose prototype (yolo26m-pose.pt). Any
 # ultralytics pose checkpoint works — swap this if yolo26m-pose.pt isn't
@@ -285,51 +294,62 @@ CURVE_CHECK_KEYPOINT_CONFIDENCE = 0.25
 CURVE_CHECK_POSE_IMGSZ          = 960
 
 # Combined head-orientation / doorway-posture score (0-1) needed to call a
-# candidate "looking outside". Same 0.50 cut used by the original prototype.
+# candidate "looking outside". Exact standalone value.
 CURVE_CHECK_SCORE_THRESHOLD     = 0.50
 
-# Door / outside-range zone, as a NORMALIZED polygon (fractions of frame
-# width/height, so it survives resolution changes across cameras) —
-# (x1,y1), (x2,y2), (x3,y3), (x4,y4). Denormalized per-frame in
-# detector/curve_checking.py. Defaults are the prototype's pixel polygon
-# ([560,50]-[950,50]-[980,720]-[550,720] on a ~1856x1028 frame) converted
-# to fractions. RECALIBRATE per camera mount — this is the single most
-# important setting for this detector.
+# Driver-search ROI, NORMALIZED (x1, y1, x2, y2) — exact standalone
+# DRIVER_ROI. Used only to pick which detected person is "the driver" (LP)
+# so they're excluded from door-zone/outside-looking candidates, exactly
+# as the standalone script's select_driver()/inside_driver_roi() do. This
+# detector no longer takes pilot boxes from GadgetDetector — it selects
+# its own driver internally from its own per-cycle YOLO pose pass, exactly
+# like the standalone script.
+CURVE_CHECK_DRIVER_ROI = (0.00, 0.00, 0.70, 0.78)
+
+# Door / outside-range zone, as LITERAL PIXEL coordinates — exact
+# standalone DOOR_ROI ([560,50]-[950,50]-[980,720]-[550,720]), calibrated
+# for ~1856x1028 frames. UNLIKE DRIVER_ROI above, this is NOT normalized
+# and is NOT rescaled per frame — the standalone script never did either,
+# so neither does this port. RECALIBRATE these literal pixel values if the
+# camera resolution or mount changes; this is the single most important
+# setting for this detector.
 CURVE_CHECK_DOOR_ROI = (
-    (0.30, 0.05),
-    (0.51, 0.05),
-    (0.53, 0.70),
-    (0.30, 0.70),
+    (560, 50),
+    (950, 50),
+    (980, 720),
+    (550, 720),
 )
 
-# How many consecutive detector CYCLES (not raw frames — this detector is
-# invoked on its own cadence from main.py, see CURVE_CHECK_EVERY) a
-# candidate must score above threshold before the episode starts. Mirrors
-# HAND_RAISE_CONFIRM_FRAMES — kills single-cycle jitter regardless of
-# whatever RAW_FRAME_SKIP / detector cadence main.py uses.
-CURVE_CHECK_CONFIRM_FRAMES      = 3
+# Consecutive detector CYCLES (this detector's own invocation cadence —
+# see CURVE_CHECK_EVERY below) with at least one non-driver person scoring
+# >= CURVE_CHECK_SCORE_THRESHOLD in the door zone, before the episode is
+# considered confirmed. Exact standalone MIN_CONSECUTIVE_FRAMES value and
+# exact standalone increment/decay-by-1 counter logic (not reset-to-zero
+# on a miss) — see detector/curve_checking.py.
+CURVE_CHECK_MIN_CONSECUTIVE_FRAMES = 8
 
-# How many consecutive missed detector cycles (nobody scoring above
-# threshold in the door zone) before an in-progress episode is considered
-# genuinely over. Mirrors HAND_RAISE_MISS_TOLERANCE / GADGET_MISS_TOLERANCE.
-CURVE_CHECK_MISS_TOLERANCE      = 2
+# Minimum detector CYCLES between two logged events, once confirmed. Exact
+# standalone EVENT_COOLDOWN_FRAMES value and exact standalone
+# last_outside_event_frame/cooldown-gate logic.
+CURVE_CHECK_EVENT_COOLDOWN_FRAMES  = 60
 
-# Minimum true (onset-to-now) duration, in VIDEO SECONDS, before the
-# episode is logged. Time-based (not a frame count) so behaviour is
-# identical no matter what RAW_FRAME_SKIP / CURVE_CHECK_EVERY cadence this
-# runs at — this is the piece that makes the detector frame-skip-safe.
-CURVE_CHECK_ALLOWED_DURATION    = 1.0
-
-# pilot_id this event is attributed to. Curve-checking is the assistant
+# pilot_id this event is attributed to in the violation record. This is
+# pipeline-side bookkeeping only (the CVVRS violation schema requires a
+# pilot_id column) — the standalone script has no such concept, since it
+# only ever writes an image + CSV row. Curve-checking is the assistant
 # loco pilot's (ALP) job, and ALP is pilot_id=2 by the convention already
 # used everywhere else in this pipeline (see GREEN_LINE_RATIO / zone
-# splits in gadget_detector.py, seat_absence_detector.py). Only one person
-# can occupy the door zone at a time in practice, so a single timer keyed
-# to this id is enough — see detector/curve_checking.py.
+# splits in gadget_detector.py, seat_absence_detector.py).
 CURVE_CHECK_PILOT_ID            = 2
 
 # How often (in main.py's processed_frame_no cadence, same unit as
 # GADGET_EVERY / DROOP_EVERY) the curve-checking pose model actually runs.
 # Not imported by detector/curve_checking.py itself — this is main.py's
-# knob, listed here so all frame-sampling cadences live in one place.
+# knob, listed here so all frame-sampling cadences live in one place. Note
+# this means CURVE_CHECK_MIN_CONSECUTIVE_FRAMES/EVENT_COOLDOWN_FRAMES above
+# count in units of "every CURVE_CHECK_EVERY processed frames", not raw
+# video frames — same caveat the standalone script's FRAME_SKIP=1 avoided
+# by construction (it counted every raw frame). Tune CURVE_CHECK_EVERY
+# down toward 1 if you need the counters to represent close to the same
+# wall-clock span the standalone script's frame counts did.
 CURVE_CHECK_EVERY               = 6
