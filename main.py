@@ -48,6 +48,11 @@ RAW_FRAME_SKIP = 3
 GADGET_EVERY   = 6
 ABSENCE_EVERY  = 4
 DROOP_EVERY    = 15
+# NEW — additive: curve-checking (detector/curve_checking.py) cadence.
+# Runs its own full-frame YOLO pose pass, so it gets its own cadence
+# knob rather than piggy-backing on GADGET_EVERY — tune independently
+# if this proves too slow/fast relative to the gadget detector.
+CURVE_EVERY    = 6
 
 # ── Fix 6: per-video progress reporting cadence ────────────────────────────
 # Purely a reporting cadence — does NOT affect frame sampling, detection
@@ -78,6 +83,8 @@ from detector.gadget_detector import GadgetDetector
 from detector.seat_absence_detector import SeatAbsenceDetector
 from detector.head_drop_detector import HeadDroopDetector
 from detector.hand_raise_detector import HandRaiseDetector, HandRaisePoseEngine
+# NEW — additive: curve-checking (ALP looking outside the door on a curve).
+from detector.curve_checking import CurveCheckingDetector, draw_door_roi, draw_curve_check_overlay
 
 _STOP = object()
 READ_QUEUE_MAXSIZE  = 8
@@ -164,6 +171,10 @@ class GadgetDetectionPipeline:
         # own pose source (shared-tracker-state bug fix).
         self.hand_raise_detector = HandRaiseDetector()
         self._hand_raise_pose    = HandRaisePoseEngine()
+        # NEW — additive: curve-checking. Owns its own full-frame YOLO-pose
+        # model (see detector/curve_checking.py) — doesn't reuse self._pose
+        # or GadgetDetector's model, same reasoning as HandRaisePoseEngine.
+        self.curve_check_detector = CurveCheckingDetector()
 
         # MediaPipe pose — reused across frames, graceful if not installed
         if _MP_AVAILABLE:
@@ -246,6 +257,11 @@ class GadgetDetectionPipeline:
             self.absence_detector.close()
         except Exception:
             self.logger.error("SeatAbsenceDetector.close() failed:\n" + traceback.format_exc())
+
+        try:
+            self.curve_check_detector.close()
+        except Exception:
+            self.logger.error("CurveCheckingDetector.close() failed:\n" + traceback.format_exc())
 
         try:
             self.detector.close()
@@ -501,6 +517,7 @@ class GadgetDetectionPipeline:
         run_gadget  = (processed_frame_no % GADGET_EVERY  == 0)
         run_absence = run_gadget
         run_droop   = (processed_frame_no % DROOP_EVERY   == 0)
+        run_curve   = (processed_frame_no % CURVE_EVERY   == 0)
 
         prev_frame_detection = self._prev_frame_detections
 
@@ -509,10 +526,19 @@ class GadgetDetectionPipeline:
 
         future_gadget  = self.executor.submit(self.detector.process, frame, round(global_time, 3), pose_landmarks_by_pilot) if run_gadget  else None
         future_droop   = self.executor.submit(self.droop_detector.process, frame, global_time, prev_frame_detection) if run_droop else None
+        # NEW — additive: curve-checking uses self._prev_pilot_boxes (the
+        # LP/ALP boxes from the most recent gadget-detector cycle) purely to
+        # EXCLUDE the seated pilots from candidates — same "most recent
+        # known" pattern SeatAbsenceDetector uses via self._absence_pilot_boxes.
+        future_curve   = self.executor.submit(
+            self.curve_check_detector.process, frame, global_time,
+            self._prev_pilot_boxes, frame.shape[1], frame.shape[0],
+        ) if run_curve else None
 
         results,         log_events,         gadget_completed  = [], [], []
         absence_results, absence_log_events, absence_completed = [], [], []
         droop_results,   droop_log_events,   droop_completed   = [], [], []
+        curve_results,   curve_log_events,   curve_completed   = [], [], []
 
         try:
             if future_gadget  is not None: results,         log_events,         gadget_completed  = future_gadget.result()
@@ -563,6 +589,11 @@ class GadgetDetectionPipeline:
         except Exception as exc:
             self.logger.error(f"Droop error frame {global_frame}: {exc}", exc_info=True)
 
+        try:
+            if future_curve   is not None: curve_results,   curve_log_events,   curve_completed   = future_curve.result()
+        except Exception as exc:
+            self.logger.error(f"CurveCheck error frame {global_frame}: {exc}", exc_info=True)
+
         # ── NEW — Hand-raise / signaling detector (additive) ───────────────────
         # Uses its OWN dedicated pose landmarks (self._hand_raise_pose),
         # NOT pose_landmarks_by_pilot above. pose_landmarks_by_pilot keeps
@@ -591,6 +622,11 @@ class GadgetDetectionPipeline:
             for ar in absence_results:
                 if ar.calibrated and ar.seat_zone is not None:
                     draw_seat_zone(annotated, ar.seat_zone, ar.pilot_id)
+            # NEW — additive: curve-checking door-zone overlay.
+            door_roi_px = self.curve_check_detector._door_roi_px(frame.shape[1], frame.shape[0])
+            annotated = draw_door_roi(annotated, door_roi_px)
+            for cr in curve_results:
+                annotated = draw_curve_check_overlay(annotated, cr)
 
         any_gadget_distracted = False
         last_gadget_pilot, last_gadget_name = None, ""
@@ -819,6 +855,31 @@ class GadgetDetectionPipeline:
                 )
             log_distraction(self.logger, event_global, event="Hand Raise on signaling", severity="LOW", frame=annotated)
 
+        # ── NEW — curve-checking record (additive) ──────────────────────────────
+        # Same shape as the hand-raise block above: a brief, deliberate,
+        # CORRECT-procedure event (ALP looked outside at the door during a
+        # curve) rather than a sustained ABNORMAL state — LOW severity/risk,
+        # not backdated (event_local/event_global = the live confirmation-
+        # time values, matching hand_raise's reasoning: no re-seek needed).
+        if curve_log_events:
+            event_global = global_time
+            event_local  = video_time
+            cr_by_pilot  = {cr.pilot_id: cr for cr in curve_results}
+            for _pid, _event_label in curve_log_events:
+                cr_ref  = cr_by_pilot.get(_pid)
+                conf_cc = cr_ref.score       if cr_ref else 0.9
+                dur_cc  = cr_ref.timer_value if cr_ref else 0.0
+                self.vstore.record_violation(
+                    annotated_frame=frame.copy(), original_frame=frame,
+                    video_time=event_global, frame_index=global_frame,
+                    event_type="curve_checking", severity="LOW",
+                    confidence=conf_cc, risk_score=0, risk_level="LOW",
+                    factors=["curve_checking", "outside_view"], duration=dur_cc,
+                    source_filename=self.source_filename, local_video_time=event_local,
+                    pilot_id=_pid,
+                )
+            log_distraction(self.logger, event_global, event="Curve Checking on outside view", severity="LOW", frame=annotated)
+
         # ── NEW — close out true trigger→end durations (additive) ──────────────
         # These fire independently of the log_events blocks above: a
         # completed_events entry means the episode that was already logged
@@ -867,6 +928,17 @@ class GadgetDetectionPipeline:
         for _pid, _start_v, _end_v, _true_dur, _gtype in hand_raise_completed:
             self.vstore.close_violation_episode(
                 source_filename=self.source_filename, event_type="hand_raise",
+                start_video_time=_start_v, end_video_time=_end_v, duration=_true_dur,
+                pilot_id=_pid,
+            )
+
+        # NEW — additive: closes out the curve-checking episode's true
+        # trigger→end duration, same pattern as the blocks above.
+        if curve_completed:
+            print(f"[MAIN] curve_completed frame={global_frame} src={self.source_filename!r}: {curve_completed}")
+        for _pid, _start_v, _end_v, _true_dur in curve_completed:
+            self.vstore.close_violation_episode(
+                source_filename=self.source_filename, event_type="curve_checking",
                 start_video_time=_start_v, end_video_time=_end_v, duration=_true_dur,
                 pilot_id=_pid,
             )

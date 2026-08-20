@@ -1,191 +1,3 @@
-# # # # YOLO_MODEL = "yolov8m.pt" 
-# # # # GADGET_CLASSES = ["cell phone"] 
-# # # # GADGET_CONFIDENCE_THRESHOLD = 0.50 
-# # # # PILOT_CONFIDENCE_THRESHOLD = 0.40 
-# # # # MAX_PILOTS = 2 
-# # # # GADGET_ALLOWED_DURATION = 0.20 
-# # # # OUTPUT_PATH = "outputs/gadget_detection_output.mp4" 
-# # # # LOG_PATH = "logs/distraction_log.txt" 
-# # # # WINDOW_NAME = "Loco Pilot Monitoring" 
-# # # # DISPLAY_SCALE = 1.0 
-# # # # GADGET_MIN_AREA = 700
-# # # # GADGET_MIN_ASPECT = 0.4
-# # # # GADGET_MAX_ASPECT = 3.0
-# # # # GADGET_MAX_WIDTH_FRACTION = 0.30
-# # # # GADGET_MIN_WIDTH_PX = 22
-# # # # GADGET_MIN_HEIGHT_PX = 30
-# # # # GADGET_MIN_EDGE_VARIANCE = 130.0
-# # # # GADGET_EAR_PROXIMITY_MARGIN = 0.20
-# # # # ABSENCE_ALLOWED_DURATION = 4.0 
-# # # # ABSENCE_CALIBRATION_FRAMES = 60 
-# # # # ABSENCE_OVERLAP_THRESH = 0.10 
-# # # # HEAD_PITCH_DOWN = 10.0 
-# # # # HEAD_PITCH_BACK = 15.0 
-# # # # EAR_THRESHOLD = 0.20 
-# # # # HEAD_DROP_DURATION = 1.5 
-# # # # STANDING_RATIO_THRESHOLD = 1.3 
-# # # # BODY_MOTION_THRESHOLD = 15 
-# # # # RELOG_INTERVAL = 30.0 
-# # # # STILL_MOTION_MAX = 6.0 
-# # # # STILL_FRAMES_THRESHOLD = 5 
-# # # # NOSE_EAR_DROP_FRACTION = 0.08 
-# # # # HEAD_DROOP_SCORE_THRESHOLD = 0.60 
-# # # # NOSE_EAR_RISE_FRACTION = 0.10 
-# # # # HEAD_BACK_SCORE_THRESHOLD = 0.50 
-# # # # TORSO_RECLINE_MIN = -10.0 
-# # # # TORSO_HUNCH_MAX = 10.0 
-# # # # DROWSY_SCORE_THRESHOLD = 0.5
-
-
-
-# # # YOLO_MODEL = "yolov8m.pt"
-# # # GADGET_CLASSES = ["cell phone"]
-# # # GADGET_CONFIDENCE_THRESHOLD = 0.50
-# # # PILOT_CONFIDENCE_THRESHOLD = 0.40
-# # # MAX_PILOTS = 2
-
-# # # # FIX (Bug #6): was 0.20s — so short that a single YOLO frame triggered a
-# # # # violation. 2.0s requires the phone to be continuously detected for two full
-# # # # seconds of video time before an alert fires, eliminating single-frame spurious
-# # # # hits from dashboard reflections or brief instrument contacts.
-# # # GADGET_ALLOWED_DURATION = 2.0
-
-# # # OUTPUT_PATH = "outputs/gadget_detection_output.mp4"
-# # # LOG_PATH = "logs/distraction_log.txt"
-# # # WINDOW_NAME = "Loco Pilot Monitoring"
-# # # DISPLAY_SCALE = 1.0
-# # # GADGET_MIN_AREA = 700
-# # # GADGET_MIN_ASPECT = 0.4
-# # # GADGET_MAX_ASPECT = 3.0
-# # # GADGET_MAX_WIDTH_FRACTION = 0.30
-# # # GADGET_MIN_WIDTH_PX = 22
-# # # GADGET_MIN_HEIGHT_PX = 30
-# # # GADGET_MIN_EDGE_VARIANCE = 130.0
-
-# # # # FIX (Bug #3): was 0.20 — added 20% slack on all sides of the pilot bbox,
-# # # # which allowed phone hits on the instrument panel directly in front of the
-# # # # pilot to pass Filter C. Tightened to 0.05 (5%) so only detections very
-# # # # close to the pilot's body boundary pass.
-# # # GADGET_EAR_PROXIMITY_MARGIN = 0.05
-
-# # # ABSENCE_ALLOWED_DURATION = 4.0
-# # # ABSENCE_CALIBRATION_FRAMES = 60
-# # # ABSENCE_OVERLAP_THRESH = 0.10
-# # # HEAD_PITCH_DOWN = 10.0
-# # # HEAD_PITCH_BACK = 15.0
-# # # EAR_THRESHOLD = 0.20
-# # # HEAD_DROP_DURATION = 1.5
-# # # STANDING_RATIO_THRESHOLD = 1.3
-# # # BODY_MOTION_THRESHOLD = 15
-# # # RELOG_INTERVAL = 30.0
-# # # STILL_MOTION_MAX = 6.0
-# # # STILL_FRAMES_THRESHOLD = 5
-# # # NOSE_EAR_DROP_FRACTION = 0.08
-# # # HEAD_DROOP_SCORE_THRESHOLD = 0.60
-# # # NOSE_EAR_RISE_FRACTION = 0.10
-# # # HEAD_BACK_SCORE_THRESHOLD = 0.50
-# # # TORSO_RECLINE_MIN = -10.0
-# # # TORSO_HUNCH_MAX = 10.0
-# # # DROWSY_SCORE_THRESHOLD = 0.5
-
-
-
-# # YOLO_MODEL = "yolov8m.pt"
-# # GADGET_CLASSES = ["cell phone"]
-# # GADGET_CONFIDENCE_THRESHOLD = 0.50
-# # PILOT_CONFIDENCE_THRESHOLD = 0.40
-# # MAX_PILOTS = 2
-
-# # # FIX (Bug #6): was 0.20s — so short that a single YOLO frame triggered a
-# # # violation. 2.0s requires the phone to be continuously detected for two full
-# # # seconds of video time before an alert fires.
-# # GADGET_ALLOWED_DURATION = 2.0
-
-# # OUTPUT_PATH = "outputs/gadget_detection_output.mp4"
-# # LOG_PATH = "logs/distraction_log.txt"
-# # WINDOW_NAME = "Loco Pilot Monitoring"
-# # DISPLAY_SCALE = 1.0
-# # GADGET_MIN_AREA = 700
-
-# # # FIX (Radio handset): Tightened aspect ratio to portrait-only.
-# # # A real phone held to the ear is portrait: width < height → aspect < 1.0.
-# # # The walkie-talkie/radio handset in this cab is detected with aspect ~1.1–1.35
-# # # (nearly square or slightly landscape). Tightening GADGET_MAX_ASPECT to 0.85
-# # # rejects near-square and landscape detections, eliminating the radio handset
-# # # false positives while still catching phones held in portrait orientation.
-# # GADGET_MIN_ASPECT = 0.30
-# # GADGET_MAX_ASPECT = 0.85
-
-# # GADGET_MAX_WIDTH_FRACTION = 0.30
-# # GADGET_MIN_WIDTH_PX = 22
-# # GADGET_MIN_HEIGHT_PX = 30
-# # GADGET_MIN_EDGE_VARIANCE = 90.0
-
-# # # FIX (Bug #3): was 0.20 — added 20% slack allowing dashboard hits to pass
-# # # Filter C. Tightened to 0.05 (5%).
-# # GADGET_EAR_PROXIMITY_MARGIN = 0.05
-
-# # ABSENCE_ALLOWED_DURATION = 4.0
-# # ABSENCE_CALIBRATION_FRAMES = 60
-# # ABSENCE_OVERLAP_THRESH = 0.10
-# # HEAD_PITCH_DOWN = 10.0
-# # HEAD_PITCH_BACK = 15.0
-# # EAR_THRESHOLD = 0.20
-# # HEAD_DROP_DURATION = 1.5
-# # STANDING_RATIO_THRESHOLD = 1.3
-# # BODY_MOTION_THRESHOLD = 15
-# # RELOG_INTERVAL = 30.0
-# # STILL_MOTION_MAX = 6.0
-# # STILL_FRAMES_THRESHOLD = 5
-# # NOSE_EAR_DROP_FRACTION = 0.08
-# # HEAD_DROOP_SCORE_THRESHOLD = 0.60
-# # NOSE_EAR_RISE_FRACTION = 0.10
-# # HEAD_BACK_SCORE_THRESHOLD = 0.50
-# # TORSO_RECLINE_MIN = -10.0
-# # TORSO_HUNCH_MAX = 10.0
-# # DROWSY_SCORE_THRESHOLD = 0.5
-
-
-
-# YOLO_MODEL = "yolov8m.pt" 
-# GADGET_CLASSES = ["cell phone"] 
-# GADGET_CONFIDENCE_THRESHOLD = 0.50 
-# PILOT_CONFIDENCE_THRESHOLD = 0.40 
-# MAX_PILOTS = 2 
-# GADGET_ALLOWED_DURATION = 0.20 
-# OUTPUT_PATH = "outputs/gadget_detection_output.mp4" 
-# LOG_PATH = "logs/distraction_log.txt" 
-# WINDOW_NAME = "Loco Pilot Monitoring" 
-# DISPLAY_SCALE = 1.0 
-# GADGET_MIN_AREA = 700
-# GADGET_MIN_ASPECT = 0.4
-# GADGET_MAX_ASPECT = 3.0
-# GADGET_MAX_WIDTH_FRACTION = 0.30
-# GADGET_MIN_WIDTH_PX = 22
-# GADGET_MIN_HEIGHT_PX = 30
-# GADGET_MIN_EDGE_VARIANCE = 130.0
-# GADGET_EAR_PROXIMITY_MARGIN = 0.20
-# ABSENCE_ALLOWED_DURATION = 4.0 
-# ABSENCE_CALIBRATION_FRAMES = 60 
-# ABSENCE_OVERLAP_THRESH = 0.10 
-# HEAD_PITCH_DOWN = 10.0 
-# HEAD_PITCH_BACK = 15.0 
-# EAR_THRESHOLD = 0.20 
-# HEAD_DROP_DURATION = 1.5 
-# STANDING_RATIO_THRESHOLD = 1.3 
-# BODY_MOTION_THRESHOLD = 15 
-# RELOG_INTERVAL = 30.0 
-# STILL_MOTION_MAX = 6.0 
-# STILL_FRAMES_THRESHOLD = 5 
-# NOSE_EAR_DROP_FRACTION = 0.08 
-# HEAD_DROOP_SCORE_THRESHOLD = 0.60 
-# NOSE_EAR_RISE_FRACTION = 0.10 
-# HEAD_BACK_SCORE_THRESHOLD = 0.50 
-# TORSO_RECLINE_MIN = -10.0 
-# TORSO_HUNCH_MAX = 10.0 
-# DROWSY_SCORE_THRESHOLD = 0.5
-
-# config/settings.py
 # ── Active configuration ──────────────────────────────────────────────────────
 
 YOLO_MODEL                 = "yolov8m.pt"
@@ -456,3 +268,68 @@ OLLAMA_HOST                  = None   # None = ollama client default (http://loc
 OLLAMA_TIMEOUT_SECONDS        = 45
 OLLAMA_MAX_RETRIES            = 1
 OLLAMA_TEMPERATURE            = 0.1
+
+# ── Curve checking — ALP leaning out the cabin door to inspect the curve ──────
+# (NEW — additive). Like hand_raise, this is a POSITIVE/required-procedure
+# event, not a distraction — it confirms the assistant loco pilot actually
+# looked outside at the door zone during a curve, rather than flagging a
+# violation. See detector/curve_checking.py.
+
+# Ported from a standalone YOLO26-pose prototype (yolo26m-pose.pt). Any
+# ultralytics pose checkpoint works — swap this if yolo26m-pose.pt isn't
+# available in this deployment.
+CURVE_CHECK_POSE_MODEL          = "yolo26m-pose.pt"
+
+CURVE_CHECK_PERSON_CONFIDENCE   = 0.35
+CURVE_CHECK_KEYPOINT_CONFIDENCE = 0.25
+CURVE_CHECK_POSE_IMGSZ          = 960
+
+# Combined head-orientation / doorway-posture score (0-1) needed to call a
+# candidate "looking outside". Same 0.50 cut used by the original prototype.
+CURVE_CHECK_SCORE_THRESHOLD     = 0.50
+
+# Door / outside-range zone, as a NORMALIZED polygon (fractions of frame
+# width/height, so it survives resolution changes across cameras) —
+# (x1,y1), (x2,y2), (x3,y3), (x4,y4). Denormalized per-frame in
+# detector/curve_checking.py. Defaults are the prototype's pixel polygon
+# ([560,50]-[950,50]-[980,720]-[550,720] on a ~1856x1028 frame) converted
+# to fractions. RECALIBRATE per camera mount — this is the single most
+# important setting for this detector.
+CURVE_CHECK_DOOR_ROI = (
+    (0.30, 0.05),
+    (0.51, 0.05),
+    (0.53, 0.70),
+    (0.30, 0.70),
+)
+
+# How many consecutive detector CYCLES (not raw frames — this detector is
+# invoked on its own cadence from main.py, see CURVE_CHECK_EVERY) a
+# candidate must score above threshold before the episode starts. Mirrors
+# HAND_RAISE_CONFIRM_FRAMES — kills single-cycle jitter regardless of
+# whatever RAW_FRAME_SKIP / detector cadence main.py uses.
+CURVE_CHECK_CONFIRM_FRAMES      = 3
+
+# How many consecutive missed detector cycles (nobody scoring above
+# threshold in the door zone) before an in-progress episode is considered
+# genuinely over. Mirrors HAND_RAISE_MISS_TOLERANCE / GADGET_MISS_TOLERANCE.
+CURVE_CHECK_MISS_TOLERANCE      = 2
+
+# Minimum true (onset-to-now) duration, in VIDEO SECONDS, before the
+# episode is logged. Time-based (not a frame count) so behaviour is
+# identical no matter what RAW_FRAME_SKIP / CURVE_CHECK_EVERY cadence this
+# runs at — this is the piece that makes the detector frame-skip-safe.
+CURVE_CHECK_ALLOWED_DURATION    = 1.0
+
+# pilot_id this event is attributed to. Curve-checking is the assistant
+# loco pilot's (ALP) job, and ALP is pilot_id=2 by the convention already
+# used everywhere else in this pipeline (see GREEN_LINE_RATIO / zone
+# splits in gadget_detector.py, seat_absence_detector.py). Only one person
+# can occupy the door zone at a time in practice, so a single timer keyed
+# to this id is enough — see detector/curve_checking.py.
+CURVE_CHECK_PILOT_ID            = 2
+
+# How often (in main.py's processed_frame_no cadence, same unit as
+# GADGET_EVERY / DROOP_EVERY) the curve-checking pose model actually runs.
+# Not imported by detector/curve_checking.py itself — this is main.py's
+# knob, listed here so all frame-sampling cadences live in one place.
+CURVE_CHECK_EVERY               = 6

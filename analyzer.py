@@ -190,6 +190,11 @@ def _event_type_to_violation_type(event_type: str) -> str:
         # an already-confirmed "hand_raise" violation on the exact same
         # frame, never on its own.
         "rsl_hand_brake":  "RSL Hand Brake Held",
+        # NEW — additive: curve-checking (detector/curve_checking.py). Like
+        # "hand_raise", this is a positive/required-procedure compliance
+        # event (ALP looked outside the door during a curve), not a CVVRS
+        # violation enum. Same "literal string, not upper-snake-case" rule.
+        "curve_checking":  "Curve Checking on outside view",
     }.get(event_type.lower(), event_type.upper())
 
 

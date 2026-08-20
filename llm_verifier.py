@@ -27,11 +27,11 @@ Every candidate is kept in the output either way and tagged with a
 Design notes
 ------------
 * Only violation types with defined criteria in prompt.py (Mobile Phone,
-  Drowsiness, Hand Raising, Seat Absence) are sent to the LLM. Any other
-  event_type is passed straight through unverified (status="TRUE",
-  role="AMBIGUOUS", skipped=True, llm_invoked=False) — unchanged pipeline
-  behaviour for those types, since prompt.py currently defines no
-  verification criteria for them.
+  Drowsiness, Hand Raising, Seat Absence, Curve Checking) are sent to the
+  LLM. Any other event_type is passed straight through unverified
+  (status="TRUE", role="AMBIGUOUS", skipped=True, llm_invoked=False) —
+  unchanged pipeline behaviour for those types, since prompt.py currently
+  defines no verification criteria for them.
 * If Ollama / the model is unavailable, or the LLM call errors out
   repeatedly, verify_frame() fails *open* or *closed* depending on the
   LLM_VERIFICATION_FAIL_OPEN setting (config/settings.py), so a
@@ -116,6 +116,11 @@ EVENT_TYPE_TO_PROMPT_VIOLATION: dict[str, str] = {
     "sleeping_absent": Violation.DROWSINESS,
     "hand_raise":      Violation.HAND_RAISING,
     "seat_absence":    Violation.SEAT_ABSENCE,
+    # NEW — additive: curve-checking (detector/curve_checking.py). No
+    # deterministic override defined for it below (see
+    # _apply_deterministic_override) — same as Drowsiness, the model's
+    # own top-level "verified" field is trusted directly.
+    "curve_checking":  Violation.CURVE_CHECKING,
 }
 
 VALID_ROLES = {"Loco Pilot", "Assistant Loco Pilot", "Both", "Unknown"}

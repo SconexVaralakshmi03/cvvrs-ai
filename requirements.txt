@@ -66,7 +66,13 @@ tqdm==4.67.3
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 tzdata==2026.1
-ultralytics==8.0.196
+# UPDATED — bumped from 8.0.196. The pinned 8.0.196 predates YOLO26
+# entirely (released Jan 2026) and cannot load yolo26*.pt checkpoints —
+# detector/curve_checking.py's default CURVE_CHECK_POSE_MODEL
+# ("yolo26m-pose.pt", config/settings.py) requires ultralytics>=8.4.0.
+# Pinned to the latest stable as of this update; re-verify against
+# whatever is current when you actually install.
+ultralytics==8.4.121
 urllib3==2.6.3
 uvicorn==0.44.0
 Werkzeug==3.1.8
