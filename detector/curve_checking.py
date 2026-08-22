@@ -15,8 +15,8 @@ from config.settings import (
     CURVE_CHECK_SCORE_THRESHOLD,
     CURVE_CHECK_DRIVER_ROI,
     CURVE_CHECK_DOOR_ROI,
-    CURVE_CHECK_MIN_CONSECUTIVE_FRAMES,
-    CURVE_CHECK_EVENT_COOLDOWN_FRAMES,
+    CURVE_CHECK_MIN_CONSECUTIVE_SECONDS,
+    CURVE_CHECK_EVENT_COOLDOWN_SECONDS,
     CURVE_CHECK_PILOT_ID,
 )
 
@@ -24,25 +24,44 @@ from config.settings import (
 # SOURCE OF TRUTH
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# This file is a line-for-line port of the standalone YOLO26-pose
-# curve-checking prototype's detection logic (DRIVER_ROI/select_driver,
-# DOOR_ROI/analyze_person, and the outside_counter/MIN_CONSECUTIVE_FRAMES/
-# EVENT_COOLDOWN_FRAMES temporal filter). Every function below that mirrors
-# a standalone function keeps the standalone name (in _private form) and
-# body unchanged — thresholds, ROI values, and control flow are not
-# modified or "improved" here. The only things this file adds beyond the
-# standalone script are the class wrapper (so per-video state persists
-# across process() calls the way the standalone script's loop-local
-# variables persisted across frames) and the (results, log_events,
-# completed_events) return contract main.py's detector-dispatch pattern
-# expects. completed_events is always [] — the standalone script has no
-# start/end episode concept, only a cooldown-gated snapshot event, so
-# there is nothing to "complete".
+# This file is a port of the standalone YOLO26-pose curve-checking
+# prototype's detection logic (DRIVER_ROI/select_driver, DOOR_ROI/
+# analyze_person, and the outside_counter/MIN_CONSECUTIVE_FRAMES/
+# EVENT_COOLDOWN_FRAMES temporal filter). The per-person scoring function
+# (_analyze_person), driver selection (_select_driver), and all scoring
+# weights/thresholds are unchanged from the standalone script.
 #
-# Two standalone globals became per-instance config instead of module
-# globals (CURVE_CHECK_DRIVER_ROI, CURVE_CHECK_DOOR_ROI in
-# config/settings.py) purely so multiple detector instances don't share
-# mutable state — their VALUES are unchanged from the standalone script.
+# TWO things were deliberately NOT ported byte-for-byte, because doing so
+# silently broke behavior once plugged into this pipeline's real frame
+# cadence and multi-resolution video set (see config/settings.py's curve
+# checking section for the full writeup):
+#
+#   1. DOOR_ROI is now NORMALIZED (0-1 fractions of frame width/height,
+#      like DRIVER_ROI already was) instead of a literal pixel polygon.
+#      The standalone script's literal-pixel DOOR_ROI only worked because
+#      every video it ran on happened to share ~the same resolution it was
+#      calibrated against. This detector runs across videos of differing
+#      resolution, so the polygon is now scaled to the ACTUAL frame size
+#      every call (see _scaled_door_roi_px()).
+#
+#   2. The temporal filter (outside_counter / MIN_CONSECUTIVE_FRAMES /
+#      EVENT_COOLDOWN_FRAMES) is now driven by elapsed VIDEO TIME (seconds)
+#      instead of an integer counter incremented once per call to
+#      process(). The standalone script called process() on every raw
+#      frame; this pipeline calls it on roughly 1-in-(RAW_FRAME_SKIP *
+#      CURVE_CHECK_EVERY) raw frames, so a per-call integer counter no
+#      longer represents the same real-world duration the standalone
+#      script's thresholds were tuned for. Accumulating/decaying against
+#      video_time deltas instead makes CURVE_CHECK_MIN_CONSECUTIVE_SECONDS/
+#      CURVE_CHECK_EVENT_COOLDOWN_SECONDS mean the same thing regardless of
+#      how often main.py actually calls process().
+#
+# Everything else — the class wrapper (so per-video state persists across
+# process() calls), the (results, log_events, completed_events) return
+# contract main.py's detector-dispatch pattern expects, and
+# completed_events always being [] (the standalone script has no
+# start/end episode concept, only a cooldown-gated snapshot event) — is
+# unchanged from the original port.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -182,6 +201,24 @@ def _inside_driver_roi(
     return rx1 <= cx <= rx2 and ry1 <= cy <= ry2
 
 
+def _scaled_door_roi_px(
+    door_roi_norm: np.ndarray,
+    frame_width: int,
+    frame_height: int,
+) -> np.ndarray:
+    """
+    Scale the normalized (0-1 fraction) door-zone polygon to pixel
+    coordinates for THIS frame's actual width/height. This is what makes
+    the door zone resolution-independent — DOOR_ROI in config/settings.py
+    is stored as fractions, not literal pixels, specifically so this works
+    the same way across videos of differing resolution instead of only
+    the one resolution the original standalone-script polygon happened to
+    be calibrated against.
+    """
+    scale = np.array([frame_width, frame_height], dtype=np.float64)
+    return np.round(door_roi_norm * scale).astype(np.int32)
+
+
 def _select_driver(
     persons: List[dict],
     frame_width: int,
@@ -208,13 +245,18 @@ def _select_driver(
 
 def _analyze_person(kpts, bbox, door_roi: np.ndarray) -> Optional[dict]:
     """
-    Exact port of the standalone script's analyze_person(). Returns None
-    only for a degenerate (non-positive width/height) bbox — otherwise
-    always returns a dict with door_person/outside_looking/score/reason,
-    exactly as the standalone script did (including its "hard gate" early
-    return for persons who never reach DOOR_ROI, and its exact scoring
-    weights: 0.55 back-facing / 0.25 face-not-visible / 0.45 side-facing /
-    0.20 standing-at-doorway / 0.20 head-near-doorway).
+    Exact port of the standalone script's analyze_person(), scoring logic
+    and weights unchanged (0.55 back-facing / 0.25 face-not-visible / 0.45
+    side-facing / 0.20 standing-at-doorway / 0.20 head-near-doorway).
+    Returns None only for a degenerate (non-positive width/height) bbox —
+    otherwise always returns a dict with door_person/outside_looking/
+    score/reason, including the "hard gate" early return for persons who
+    never reach the door zone.
+
+    `door_roi` here is the ALREADY-SCALED pixel polygon for THIS frame
+    (see _scaled_door_roi_px() — the caller scales the normalized
+    CURVE_CHECK_DOOR_ROI fractions to the current frame's actual
+    width/height before calling this), not a fixed literal-pixel constant.
     """
     x1, y1, x2, y2 = bbox
     person_width = x2 - x1
@@ -346,11 +388,13 @@ class CurveCheckCandidate:
 
 @dataclass
 class CurveCheckResult:
-    """Per-cycle state, for drawing/logging. outside_counter mirrors the
-    standalone script's outside_counter local variable exactly."""
+    """Per-cycle state, for drawing/logging. outside_counter is now a
+    float — accumulated SECONDS of sustained door-zone "outside looking"
+    detection (see CurveCheckingDetector.outside_accum), generalizing the
+    standalone script's integer per-frame counter to continuous time."""
     pilot_id:        int
     outside_looking: bool = False   # == standalone's looking_outside_confirmed
-    outside_counter: int = 0
+    outside_counter: float = 0.0
     bbox:            Optional[Tuple[int, int, int, int]] = None
     score:           float = 0.0
     reason:          str = ""
@@ -404,23 +448,36 @@ class CurveCheckingDetector:
     def __init__(
         self,
         driver_roi: Optional[Tuple[float, float, float, float]] = None,
-        door_roi: Optional[Tuple[Tuple[int, int], ...]] = None,
+        door_roi: Optional[Tuple[Tuple[float, float], ...]] = None,
         pilot_id: int = CURVE_CHECK_PILOT_ID,
     ) -> None:
         self._driver_roi = driver_roi or CURVE_CHECK_DRIVER_ROI
-        # Literal pixel polygon — NOT normalized, NOT rescaled per frame,
-        # exactly like the standalone script's module-level DOOR_ROI.
-        self._door_roi = np.array(door_roi or CURVE_CHECK_DOOR_ROI, dtype=np.int32)
+
+        # NORMALIZED (0-1 fraction) polygon — resolution independent.
+        # Scaled to actual pixel coordinates fresh on every process() call
+        # via _scaled_door_roi_px(), since different videos this detector
+        # runs on can have different native resolutions.
+        self._door_roi_norm = np.array(door_roi or CURVE_CHECK_DOOR_ROI, dtype=np.float64)
+
+        # Cache of the most recently scaled pixel polygon, kept purely so
+        # main.py's draw_door_roi() overlay call has something to draw
+        # without recomputing it — always reflects the last process() call.
+        self.last_door_roi_px: Optional[np.ndarray] = None
+
         self._pilot_id = pilot_id
 
-        # Exact standalone temporal-filter state (outside_counter,
-        # last_outside_event_frame), now per-instance instead of
-        # per-process-loop-local so it persists correctly across process()
-        # calls for this video without leaking into a different video's
-        # detector instance.
-        self.outside_counter = 0
-        self.last_outside_event_frame = -999999
-        self._call_number = 0
+        # Temporal-filter state, now driven by elapsed VIDEO TIME (seconds)
+        # rather than a per-call integer counter — see the module-level
+        # "SOURCE OF TRUTH" note above for why. outside_accum generalizes
+        # the standalone script's increment-by-1-on-hit / decay-by-1-on-miss
+        # outside_counter to continuous time: it increases by the elapsed
+        # dt (seconds since the previous process() call) on a hit and
+        # decreases by the same dt on a miss, clamped at 0. Confirmed once
+        # outside_accum >= CURVE_CHECK_MIN_CONSECUTIVE_SECONDS.
+        self.outside_accum = 0.0
+        self.last_outside_event_time = float("-inf")
+        self._last_call_video_time: Optional[float] = None
+        self._call_number = 0  # diagnostic only; not used in any threshold now
 
         self.last_candidates: List[CurveCheckCandidate] = []
 
@@ -435,9 +492,11 @@ class CurveCheckingDetector:
         NOT torn down here — same lifecycle contract as GadgetDetector's
         YOLO model. Safe to call multiple times.
         """
-        self.outside_counter = 0
-        self.last_outside_event_frame = -999999
+        self.outside_accum = 0.0
+        self.last_outside_event_time = float("-inf")
+        self._last_call_video_time = None
         self._call_number = 0
+        self.last_door_roi_px = None
         self.last_candidates = []
 
     # ──────────────────────────────────────────────────────────────
@@ -474,8 +533,14 @@ class CurveCheckingDetector:
         frame_width = frame_width or w
         frame_height = frame_height or h
 
-        self._call_number += 1
-        frame_number = self._call_number  # standalone's frame_number, in this detector's own cycle units
+        self._call_number += 1  # diagnostic only, see __init__ note
+
+        # Scale the normalized door-zone polygon to THIS frame's actual
+        # pixel dimensions. Cheap (4 points), so just done every call
+        # rather than cached against a remembered (w, h) — simplicity over
+        # a micro-optimization here.
+        door_roi_px = _scaled_door_roi_px(self._door_roi_norm, frame_width, frame_height)
+        self.last_door_roi_px = door_roi_px
 
         # ====================================================
         # YOLO POSE  (exact standalone predict() call/shape)
@@ -533,7 +598,7 @@ class CurveCheckingDetector:
             if driver is not None and np.array_equal(person["bbox"], driver["bbox"]):
                 continue
 
-            analysis = _analyze_person(person["kpts"], person["bbox"], self._door_roi)
+            analysis = _analyze_person(person["kpts"], person["bbox"], door_roi_px)
             if analysis is None:
                 continue
 
@@ -555,30 +620,48 @@ class CurveCheckingDetector:
         self.last_candidates = candidates
 
         # ====================================================
-        # OUTSIDE TEMPORAL FILTER  (exact standalone counter logic)
+        # OUTSIDE TEMPORAL FILTER  (video-time-based generalization of the
+        # standalone script's per-frame increment/decay-by-1 counter — see
+        # the module-level "SOURCE OF TRUTH" note for why this changed)
         # ====================================================
-        if outside_found:
-            self.outside_counter += 1
+        if self._last_call_video_time is None:
+            dt = 0.0  # first call for this instance — nothing to accumulate yet
         else:
-            self.outside_counter = max(0, self.outside_counter - 1)
+            dt = video_time - self._last_call_video_time
+            # Guard against a negative/huge dt from a seek, a restarted
+            # video, or a very long gap between calls (e.g. this detector
+            # was skipped for a long stretch) — don't let one big jump
+            # instantly satisfy (or wildly overshoot decaying) the
+            # threshold. Clamp to a sane per-call ceiling.
+            dt = max(0.0, min(dt, CURVE_CHECK_MIN_CONSECUTIVE_SECONDS))
+        self._last_call_video_time = video_time
 
-        looking_outside_confirmed = self.outside_counter >= CURVE_CHECK_MIN_CONSECUTIVE_FRAMES
+        if outside_found:
+            self.outside_accum = min(
+                self.outside_accum + dt,
+                CURVE_CHECK_MIN_CONSECUTIVE_SECONDS * 2,  # cap; no unbounded growth
+            )
+        else:
+            self.outside_accum = max(0.0, self.outside_accum - dt)
+
+        looking_outside_confirmed = self.outside_accum >= CURVE_CHECK_MIN_CONSECUTIVE_SECONDS
 
         # ====================================================
-        # SAVE LOOKING OUTSIDE  (exact standalone cooldown gate)
+        # SAVE LOOKING OUTSIDE  (video-time-based cooldown gate — same
+        # generalization as above, using CURVE_CHECK_EVENT_COOLDOWN_SECONDS)
         # ====================================================
         log_events: List[Tuple[int, str]] = []
         completed_events: List[Tuple[int, float, float, float]] = []  # standalone has no episode/duration concept
 
         if looking_outside_confirmed:
-            if (frame_number - self.last_outside_event_frame) >= CURVE_CHECK_EVENT_COOLDOWN_FRAMES:
+            if (video_time - self.last_outside_event_time) >= CURVE_CHECK_EVENT_COOLDOWN_SECONDS:
                 log_events.append((self._pilot_id, "Curve checking — ALP looking outside door"))
-                self.last_outside_event_frame = frame_number
+                self.last_outside_event_time = video_time
 
         results = [CurveCheckResult(
             pilot_id        = self._pilot_id,
             outside_looking = looking_outside_confirmed,
-            outside_counter = self.outside_counter,
+            outside_counter = self.outside_accum,
             bbox            = best_bbox,
             score           = outside_score,
             reason          = outside_reason,

@@ -625,10 +625,13 @@ class GadgetDetectionPipeline:
                 if ar.calibrated and ar.seat_zone is not None:
                     draw_seat_zone(annotated, ar.seat_zone, ar.pilot_id)
             # NEW — additive: curve-checking door-zone + driver-ROI overlay.
-            # door_roi is now a fixed literal-pixel polygon (exact
-            # standalone DOOR_ROI, not rescaled per frame) — no more
-            # _door_roi_px() scaling call.
-            annotated = draw_door_roi(annotated, self.curve_check_detector._door_roi)
+            # door_roi is now NORMALIZED and rescaled to each frame's actual
+            # resolution inside CurveCheckingDetector.process() (fixing the
+            # earlier literal-pixel-polygon resolution bug) — draw whatever
+            # it last computed for this video's frame size. Only set once
+            # process() has run at least once for this video/journey.
+            if self.curve_check_detector.last_door_roi_px is not None:
+                annotated = draw_door_roi(annotated, self.curve_check_detector.last_door_roi_px)
             annotated = draw_driver_roi(annotated, self.curve_check_detector._driver_roi)
             for cr in curve_results:
                 annotated = draw_curve_check_overlay(annotated, cr)

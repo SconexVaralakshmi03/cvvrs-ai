@@ -275,14 +275,37 @@ OLLAMA_TEMPERATURE            = 0.1
 # looked outside at the door zone during a curve, rather than flagging a
 # violation. See detector/curve_checking.py.
 #
-# UPDATED — detection logic below is now a byte-for-byte port of the
-# standalone prototype (DRIVER_ROI/select_driver exclusion, literal-pixel
-# DOOR_ROI, MIN_CONSECUTIVE_FRAMES/EVENT_COOLDOWN_FRAMES counters). The
-# standalone script is the source of truth: no thresholds, ROI values, or
-# temporal logic here deviate from it. The previous version of this block
-# used known_pilot_boxes/IoU exclusion and video-time-based duration
-# thresholds — that was integrated-pipeline-only logic layered on top of
-# the prototype, not present in the standalone script, and has been removed.
+# UPDATED (resolution/cadence fix) — the previous version of this block was
+# a byte-for-byte port of the standalone prototype's constants, which
+# silently broke in two ways once plugged into this pipeline's frame
+# cadence and multi-video/multi-resolution reality:
+#
+#   1. DOOR_ROI used to be LITERAL PIXEL coordinates calibrated for one
+#      specific ~1856x1028 recording. Any video with a different native
+#      resolution had the door polygon land in the wrong place on screen,
+#      so nobody's shoulders/feet/center ever fell inside it and
+#      "outside_looking" could never fire — a pure geometry miss, not a
+#      detection miss. Fixed by storing it NORMALIZED (0-1 fractions, like
+#      DRIVER_ROI already was) and having detector/curve_checking.py scale
+#      it to the actual frame_width/frame_height every call.
+#
+#   2. MIN_CONSECUTIVE_FRAMES/EVENT_COOLDOWN_FRAMES used to count in units
+#      of "detector CYCLES" (main.py only runs this detector on
+#      1-in-RAW_FRAME_SKIP*CURVE_CHECK_EVERY raw frames), but the standalone
+#      script's identical-looking constants counted RAW frames at
+#      FRAME_SKIP=1. Left unconverted, confirming an event needed roughly
+#      RAW_FRAME_SKIP*CURVE_CHECK_EVERY times longer real-world duration
+#      than the standalone script intended — brief (1-2s) door-leans never
+#      accumulated enough cycles before the posture ended. Fixed by storing
+#      these as SECONDS (CURVE_CHECK_MIN_CONSECUTIVE_SECONDS /
+#      CURVE_CHECK_EVENT_COOLDOWN_SECONDS below) and having the detector
+#      accumulate/decay against elapsed video_time instead of a per-cycle
+#      integer counter, so the real-world meaning is identical regardless
+#      of how main.py's RAW_FRAME_SKIP/CURVE_CHECK_EVERY are tuned.
+#
+# The score-threshold, driver-ROI, and per-person scoring weights below are
+# still an exact, unmodified port of the standalone prototype — only the
+# two resolution/cadence-dependent settings above changed.
 
 # Ported from a standalone YOLO26-pose prototype (yolo26m-pose.pt). Any
 # ultralytics pose checkpoint works — swap this if yolo26m-pose.pt isn't
@@ -306,32 +329,49 @@ CURVE_CHECK_SCORE_THRESHOLD     = 0.50
 # like the standalone script.
 CURVE_CHECK_DRIVER_ROI = (0.00, 0.00, 0.70, 0.78)
 
-# Door / outside-range zone, as LITERAL PIXEL coordinates — exact
-# standalone DOOR_ROI ([560,50]-[950,50]-[980,720]-[550,720]), calibrated
-# for ~1856x1028 frames. UNLIKE DRIVER_ROI above, this is NOT normalized
-# and is NOT rescaled per frame — the standalone script never did either,
-# so neither does this port. RECALIBRATE these literal pixel values if the
-# camera resolution or mount changes; this is the single most important
-# setting for this detector.
+# Door / outside-range zone, NORMALIZED (x_frac, y_frac) fractions of
+# frame width/height — resolution independent. detector/curve_checking.py
+# scales this to actual pixel coordinates using the CURRENT frame's
+# frame_width/frame_height on every call, the same way DRIVER_ROI already
+# was scaled. These fractions are derived from the original standalone
+# script's literal-pixel DOOR_ROI ([560,50]-[950,50]-[980,720]-[550,720]),
+# divided by the ~1856x1028 resolution that pixel polygon was calibrated
+# against, so the SHAPE/placement of the zone relative to the cab doorway
+# is unchanged from the original prototype — only the representation is
+# now resolution-independent. RECALIBRATE these fractions if the camera
+# mount/framing (not just resolution) changes; this is still the single
+# most important setting for this detector.
 CURVE_CHECK_DOOR_ROI = (
-    (560, 50),
-    (950, 50),
-    (980, 720),
-    (550, 720),
+    (560 / 1856, 50 / 1028),
+    (950 / 1856, 50 / 1028),
+    (980 / 1856, 720 / 1028),
+    (550 / 1856, 720 / 1028),
 )
 
-# Consecutive detector CYCLES (this detector's own invocation cadence —
-# see CURVE_CHECK_EVERY below) with at least one non-driver person scoring
-# >= CURVE_CHECK_SCORE_THRESHOLD in the door zone, before the episode is
-# considered confirmed. Exact standalone MIN_CONSECUTIVE_FRAMES value and
-# exact standalone increment/decay-by-1 counter logic (not reset-to-zero
-# on a miss) — see detector/curve_checking.py.
-CURVE_CHECK_MIN_CONSECUTIVE_FRAMES = 8
+# Minimum SECONDS of sustained "at least one non-driver person scoring >=
+# CURVE_CHECK_SCORE_THRESHOLD in the door zone" before the episode is
+# considered confirmed. Converted from the standalone script's
+# MIN_CONSECUTIVE_FRAMES=8 raw frames at its reference frame rate (see
+# CURVE_CHECK_REFERENCE_FPS below): 8 / 30 ≈ 0.27s. Accumulates/decays
+# against elapsed video_time in detector/curve_checking.py (mirroring the
+# standalone script's increment-by-1-on-hit / decay-by-1-on-miss counter,
+# generalized to continuous time), so this represents the same real-world
+# duration no matter how main.py's RAW_FRAME_SKIP/CURVE_CHECK_EVERY are
+# tuned.
+CURVE_CHECK_MIN_CONSECUTIVE_SECONDS = 8 / 30
 
-# Minimum detector CYCLES between two logged events, once confirmed. Exact
-# standalone EVENT_COOLDOWN_FRAMES value and exact standalone
-# last_outside_event_frame/cooldown-gate logic.
-CURVE_CHECK_EVENT_COOLDOWN_FRAMES  = 60
+# Minimum SECONDS between two logged events, once confirmed. Converted from
+# the standalone script's EVENT_COOLDOWN_FRAMES=60 raw frames at
+# CURVE_CHECK_REFERENCE_FPS: 60 / 30 = 2.0s.
+CURVE_CHECK_EVENT_COOLDOWN_SECONDS  = 60 / 30
+
+# Reference frame rate the standalone script's original MIN_CONSECUTIVE_FRAMES
+# (8) / EVENT_COOLDOWN_FRAMES (60) constants are assumed to have been tuned
+# against — a typical CCTV/cab-camera rate. Only used to document/derive the
+# *_SECONDS constants above; the detector itself works in seconds using the
+# actual video's own video_time, so it does not need to know any video's
+# real fps at runtime.
+CURVE_CHECK_REFERENCE_FPS           = 30
 
 # pilot_id this event is attributed to in the violation record. This is
 # pipeline-side bookkeeping only (the CVVRS violation schema requires a
@@ -345,11 +385,11 @@ CURVE_CHECK_PILOT_ID            = 2
 # How often (in main.py's processed_frame_no cadence, same unit as
 # GADGET_EVERY / DROOP_EVERY) the curve-checking pose model actually runs.
 # Not imported by detector/curve_checking.py itself — this is main.py's
-# knob, listed here so all frame-sampling cadences live in one place. Note
-# this means CURVE_CHECK_MIN_CONSECUTIVE_FRAMES/EVENT_COOLDOWN_FRAMES above
-# count in units of "every CURVE_CHECK_EVERY processed frames", not raw
-# video frames — same caveat the standalone script's FRAME_SKIP=1 avoided
-# by construction (it counted every raw frame). Tune CURVE_CHECK_EVERY
-# down toward 1 if you need the counters to represent close to the same
-# wall-clock span the standalone script's frame counts did.
+# knob, listed here so all frame-sampling cadences live in one place. Unlike
+# before, CURVE_CHECK_MIN_CONSECUTIVE_SECONDS/EVENT_COOLDOWN_SECONDS above
+# are now time-based, so changing this no longer silently changes what
+# those thresholds mean in wall-clock/video time — it only trades off CPU
+# cost against how finely the door-lean duration is sampled. Lower it
+# (toward 1) if short lean-outs still aren't accumulating enough samples to
+# cross CURVE_CHECK_MIN_CONSECUTIVE_SECONDS before the posture ends.
 CURVE_CHECK_EVERY               = 6
