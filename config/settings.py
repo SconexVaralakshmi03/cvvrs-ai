@@ -393,3 +393,81 @@ CURVE_CHECK_PILOT_ID            = 2
 # (toward 1) if short lean-outs still aren't accumulating enough samples to
 # cross CURVE_CHECK_MIN_CONSECUTIVE_SECONDS before the posture ends.
 CURVE_CHECK_EVERY               = 6
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENGINE CHECK (detectors/engine_check_detector.py)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# This is a faithful, byte-for-byte port of a standalone YOLOv8m +
+# ByteTrack prototype: a person's centroid must (1) come within
+# ENGINE_CHECK_DOOR_DISTANCE_THRESHOLD px of the engine-door centroid,
+# (2) be moving toward that centroid (cosine similarity of movement vs.
+# direction-to-door), and (3) have a decreasing distance-to-door trend
+# over ENGINE_CHECK_MIN_CLOSER_FRAMES consecutive samples. Once all three
+# hold, the track is armed as a "candidate"; if that track then goes
+# missing for ENGINE_CHECK_MISSING_FRAMES_REQUIRED consecutive frames
+# (i.e. the person walked through the door and out of camera view), an
+# "engine check" event fires exactly once per track.
+#
+# UNLIKE every other detector in this pipeline, main.py calls this
+# detector on EVERY raw frame (before the RAW_FRAME_SKIP gate) — per
+# explicit requirement, so the frame-by-frame tracking/candidate/missing
+# logic behaves identically to the standalone script's un-skipped loop.
+#
+# CAVEAT (deliberately NOT changed, unlike curve_checking's DOOR_ROI fix):
+# ENGINE_CHECK_DOOR_X/TOP_Y/BOTTOM_Y/DISTANCE_THRESHOLD below are literal
+# PIXEL values, calibrated against the standalone script's source video
+# resolution — not normalized fractions of frame size. This is an exact
+# port, so it is only correct out of the box for source video at that same
+# resolution. If this pipeline's videos run at a different resolution,
+# recalibrate these four values (or normalize them the way
+# CURVE_CHECK_DOOR_ROI was) — recalibrating was out of scope for "match
+# the standalone implementation exactly."
+
+# Same weight file already used by gadget_detector.py (models/yolov8m.pt).
+# Loaded as its OWN separate model instance (see engine_check_detector.py's
+# _get_model()) rather than sharing GadgetDetector's, because this detector
+# uses persistent ByteTrack (model.track(persist=True)) on every raw frame
+# from a different thread than GadgetDetector's executor-submitted calls —
+# sharing one model's internal tracker state across threads/call-patterns
+# is not safe. Same reasoning curve_checking.py already uses for owning
+# its own pose model instead of reusing GadgetDetector's.
+ENGINE_CHECK_MODEL                    = "yolov8m.pt"
+
+ENGINE_CHECK_PERSON_CLASS_ID          = 0
+ENGINE_CHECK_PERSON_CONFIDENCE        = 0.30
+ENGINE_CHECK_TRACKER                  = "bytetrack.yaml"
+
+# Engine-door reference line (vertical) — door centroid is the midpoint of
+# (DOOR_X, DOOR_TOP_Y) to (DOOR_X, DOOR_BOTTOM_Y). Exact standalone values.
+ENGINE_CHECK_DOOR_X                   = 400
+ENGINE_CHECK_DOOR_TOP_Y                = 160
+ENGINE_CHECK_DOOR_BOTTOM_Y             = 715
+
+# Approach radius (px) around the door centroid. Exact standalone value.
+ENGINE_CHECK_DOOR_DISTANCE_THRESHOLD  = 220
+
+# Movement-toward-door check. Exact standalone values.
+ENGINE_CHECK_MIN_MOVEMENT_PIXELS      = 3
+ENGINE_CHECK_MOVING_TOWARD_THRESHOLD  = 0.40
+
+# Distance must decrease for this many consecutive samples. Exact
+# standalone value.
+ENGINE_CHECK_MIN_CLOSER_FRAMES        = 2
+
+# Track must go missing for this many consecutive (raw, unskipped) frames
+# after becoming a candidate before "engine check" fires. Exact standalone
+# value — meaningful only because this detector runs on every raw frame.
+ENGINE_CHECK_MISSING_FRAMES_REQUIRED  = 2
+
+# Trajectory trail length kept per track, for the debug overlay only —
+# exact standalone HISTORY_SIZE value.
+ENGINE_CHECK_HISTORY_SIZE             = 6
+
+# NEW — additive, does not affect detection outcomes (see
+# engine_check_detector.py docstring): raw frames a track may go
+# unseen before its state is garbage-collected. The standalone script
+# never needed this because it processed exactly one video per process
+# run and then exited; this pipeline's worker process can run this
+# detector across many hours of footage without ever exiting.
+ENGINE_CHECK_MAX_TRACK_AGE            = 90

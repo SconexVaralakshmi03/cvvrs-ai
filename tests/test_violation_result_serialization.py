@@ -27,8 +27,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models import ViolationResult  # noqa: E402
-import llm_verifier  # noqa: E402
+from schemas.models import ViolationResult  # noqa: E402
+import verification.llm_verifier as llm_verifier  # noqa: E402
 
 
 def _make_violation(**overrides) -> ViolationResult:

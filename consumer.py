@@ -121,9 +121,9 @@ from typing import Dict
 import pika
 from dotenv import load_dotenv
 
-from analyzer import analyze_journey
-from worker_pool import worker_pool, GPU_WORKERS
-from callback_client import (
+from pipeline.analyzer import analyze_journey
+from pipeline.worker_pool import worker_pool, GPU_WORKERS
+from services.callback_client import (
     send_completed,
     send_failed,
     send_video_failed,
@@ -134,10 +134,10 @@ from callback_client import (
     try_start_job,
     finish_job,
 )
-from models import AnalysisJobMessage, CompletionPayload, VideoResult, ViolationResult
-from s3_service import download_video, upload_text_log, upload_json_result
-from journey_log import build_journey_log_text
-from resource_manager import resource_manager, memory_monitor
+from schemas.models import AnalysisJobMessage, CompletionPayload, VideoResult, ViolationResult
+from services.s3_service import download_video, upload_text_log, upload_json_result
+from logging_utils.journey_log import build_journey_log_text
+from services.resource_manager import resource_manager, memory_monitor
 
 # ── Config / credentials ──────────────────────────────────────────────────────
 _ENV_PATH = os.path.join(
@@ -226,7 +226,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("consumer")
 
-import job_logging
+import logging_utils.job_logging as job_logging
 job_logging.install()
 
 
@@ -344,7 +344,7 @@ def _ack_and_flush(channel, connection, pika_lock: threading.Lock,
     """ACK the message via the connection's own thread (thread-safe)."""
     # Record completion BEFORE ACKing — if ACK fails the message is requeued
     # and the local cache will catch the redelivery on the next attempt.
-    from callback_client import mark_job_completed
+    from services.callback_client import mark_job_completed
     mark_job_completed(job_id)
 
     def _do_ack():

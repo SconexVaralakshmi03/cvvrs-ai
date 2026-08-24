@@ -71,20 +71,26 @@ except ImportError:
     print("[main] WARNING: mediapipe not installed — gadget detector will use bbox fallback")
 
 from config.settings import OUTPUT_PATH, WINDOW_NAME, DISPLAY_SCALE, GADGET_ALLOWED_DURATION, ABSENCE_ALLOWED_DURATION, HEAD_DROP_DURATION
-from utils.logger import setup_logger, log_distraction, finalize_report
-from utils.violation_store import ViolationStore
+from logging_utils.logger import setup_logger, log_distraction, finalize_report
+from storage.violation_store import ViolationStore
 from utils.draw import (
     draw_pilot_box, draw_gadget_box, draw_hud, draw_alert_banner,
     draw_seat_zone, draw_absence_overlay, draw_absence_banner,
     draw_droop_keypoints, draw_droop_overlay, draw_droop_banner,
     draw_standing_label,
 )
-from detector.gadget_detector import GadgetDetector
-from detector.seat_absence_detector import SeatAbsenceDetector
-from detector.head_drop_detector import HeadDroopDetector
-from detector.hand_raise_detector import HandRaiseDetector, HandRaisePoseEngine
+from detectors.gadget_detector import GadgetDetector
+from detectors.seat_absence_detector import SeatAbsenceDetector
+from detectors.head_drop_detector import HeadDroopDetector
+from detectors.hand_raise_detector import HandRaiseDetector, HandRaisePoseEngine
 # NEW — additive: curve-checking (ALP looking outside the door on a curve).
-from detector.curve_checking import CurveCheckingDetector, draw_door_roi, draw_driver_roi, draw_curve_check_overlay
+from detectors.curve_checking import CurveCheckingDetector, draw_door_roi, draw_driver_roi, draw_curve_check_overlay
+# NEW — additive: engine-check (person approaches engine-room door and
+# disappears from view). Runs on EVERY raw frame — see detectors/
+# engine_check_detector.py and the RAW_FRAME_SKIP note at its call site
+# below for why this one detector is deliberately exempt from frame
+# skipping while every other detector in this file is not.
+from detectors.engine_check_detector import EngineCheckDetector, draw_engine_check_overlay, draw_engine_door_zone
 
 _STOP = object()
 READ_QUEUE_MAXSIZE  = 8
@@ -175,6 +181,11 @@ class GadgetDetectionPipeline:
         # model (see detector/curve_checking.py) — doesn't reuse self._pose
         # or GadgetDetector's model, same reasoning as HandRaisePoseEngine.
         self.curve_check_detector = CurveCheckingDetector()
+        # NEW — additive: engine-check. Owns its own YOLOv8m + persistent
+        # ByteTrack instance (see detectors/engine_check_detector.py) —
+        # doesn't reuse GadgetDetector's model or pilot boxes, same
+        # reasoning as HandRaisePoseEngine / CurveCheckingDetector above.
+        self.engine_check_detector = EngineCheckDetector()
 
         # MediaPipe pose — reused across frames, graceful if not installed
         if _MP_AVAILABLE:
@@ -257,6 +268,11 @@ class GadgetDetectionPipeline:
             self.absence_detector.close()
         except Exception:
             self.logger.error("SeatAbsenceDetector.close() failed:\n" + traceback.format_exc())
+
+        try:
+            self.engine_check_detector.close()
+        except Exception:
+            self.logger.error("EngineCheckDetector.close() failed:\n" + traceback.format_exc())
 
         try:
             self.curve_check_detector.close()
@@ -389,6 +405,18 @@ class GadgetDetectionPipeline:
                 if item is _STOP:
                     break
                 raw_frame, raw_frame_no, video_time = item
+
+                # NEW — additive: engine-check runs on EVERY raw frame,
+                # deliberately BEFORE the RAW_FRAME_SKIP gate below, so it
+                # sees literally every frame the source video has — zero
+                # skipping, matching the standalone prototype's un-skipped
+                # loop exactly. Every other detector in this file only
+                # ever sees 1-in-RAW_FRAME_SKIP frames (and a further
+                # cadence on top of that — GADGET_EVERY / DROOP_EVERY /
+                # CURVE_EVERY); engine-check is intentionally the one
+                # exception.
+                raw_frame = self._process_engine_check_frame(raw_frame, raw_frame_no, video_time)
+
                 if raw_frame_no % RAW_FRAME_SKIP != 0:
                     self._write_queue.put(raw_frame)
                     continue
@@ -506,6 +534,58 @@ class GadgetDetectionPipeline:
     # ──────────────────────────────────────────────────────────────────────────
     # _process_frame  — all timestamps are offset-adjusted here
     # ──────────────────────────────────────────────────────────────────────────
+
+    def _process_engine_check_frame(self, raw_frame, raw_frame_no, video_time):
+        """
+        Run EngineCheckDetector on ONE raw frame and record any resulting
+        violation(s). Called from run()'s consumption loop for every raw
+        frame, BEFORE the RAW_FRAME_SKIP gate — see the call site for why
+        this detector alone is exempt from frame skipping.
+
+        Mirrors the log_events → vstore.record_violation() pattern the
+        rest of this file uses (see the "Record violations" section of
+        _process_frame() below), but lives in its own method since it
+        runs on a different (unskipped) cadence than everything else and
+        has no gadget/absence/droop/curve results to interleave with.
+
+        ASSUMPTION: an "engine check" is logged the same way
+        curve_checking's snapshot events are — a LOW-severity/LOW-risk
+        procedural record (event_type="engine_check"), not a CRITICAL
+        distraction, since walking to check the engine room is expected
+        crew behavior rather than a violation. If this should instead be
+        treated as a violation, flip severity/risk_score/risk_level below
+        to match the phone_use/seat_absence blocks in _process_frame().
+        """
+        global_time  = video_time  + self.time_offset
+        global_frame = raw_frame_no + self.frame_offset
+
+        try:
+            engine_results, engine_log_events, _engine_completed = self.engine_check_detector.process(
+                raw_frame, raw_frame_no, round(global_time, 3)
+            )
+        except Exception as exc:
+            self.logger.error(f"EngineCheck error frame {global_frame}: {exc}", exc_info=True)
+            return raw_frame
+
+        if DRAW:
+            raw_frame = draw_engine_door_zone(raw_frame, self.engine_check_detector.door_center)
+            for er in engine_results:
+                raw_frame = draw_engine_check_overlay(raw_frame, er)
+
+        if engine_log_events and self.vstore is not None:
+            for track_id, _label in engine_log_events:
+                self.vstore.record_violation(
+                    annotated_frame=raw_frame.copy(), original_frame=raw_frame,
+                    video_time=global_time, frame_index=global_frame,
+                    event_type="engine_check", severity="LOW",
+                    confidence=1.0, risk_score=0, risk_level="LOW",
+                    factors=["engine_check", "door_approach"], duration=0.0,
+                    source_filename=self.source_filename, local_video_time=video_time,
+                    pilot_id=track_id,
+                )
+            log_distraction(self.logger, global_time, event="Engine check detected", severity="LOW", frame=raw_frame)
+
+        return raw_frame
 
     def _process_frame(self, frame, video_time, raw_frame_no, processed_frame_no):
         annotated = frame
