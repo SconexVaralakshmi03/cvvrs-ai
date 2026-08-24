@@ -189,6 +189,7 @@ def _event_type_to_violation_type(event_type: str) -> str:
         # detector/rsl_hand_brake_verifier.py). Only ever created alongside
         # an already-confirmed "hand_raise" violation on the exact same
         # frame, never on its own.
+        "engine_check": "Engine Check",
         "rsl_hand_brake":  "RSL Hand Brake Held",
         # NEW — additive: curve-checking (detector/curve_checking.py). Like
         # "hand_raise", this is a positive/required-procedure compliance
