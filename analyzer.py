@@ -195,6 +195,7 @@ def _event_type_to_violation_type(event_type: str) -> str:
         # event (ALP looked outside the door during a curve), not a CVVRS
         # violation enum. Same "literal string, not upper-snake-case" rule.
         "curve_checking":  "Curve Checking on outside view",
+        "engine_check": "Engine Check",
     }.get(event_type.lower(), event_type.upper())
 
 
