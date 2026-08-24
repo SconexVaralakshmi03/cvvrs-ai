@@ -79,7 +79,7 @@ from pathlib import Path
 
 # Directory holding the standalone prompt .txt files, alongside this
 # module -- same convention as the reference llamaverify.py CLI tool.
-PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
+PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 
 
 class Violation:
