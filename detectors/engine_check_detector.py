@@ -402,14 +402,34 @@ class EngineCheckDetector:
 
             if track.missing_frames >= ENGINE_CHECK_MISSING_FRAMES_REQUIRED:
                 if track_id not in self._logged_track_ids:
-                    self._logged_track_ids.add(track_id)
-                    log_events.append((track_id, "Engine check detected"))
-                    print(
-                        f"[EngineCheck] DETECTED track={track_id} "
-                        f"candidate_frame={track.candidate_frame} "
-                        f"confirm_frame={frame_number} "
-                        f"missing_frames={track.missing_frames}"
-                    )
+                    # NEW — deliberate fix, not in the standalone script:
+                    # `candidate` is a one-way latch (armed once, never
+                    # un-armed — see class docstring / config caveat), so a
+                    # track that armed near the door early on and then
+                    # spent the rest of the video sitting at the console
+                    # far from it would still fire the instant ByteTrack
+                    # merely lost it for 2 frames — a false positive
+                    # unrelated to actually walking through the door.
+                    # Require the track's LAST SEEN distance to the door
+                    # to still be within the approach zone before letting
+                    # a disappearance count as a confirmed engine check.
+                    last_distance = track.distance_history[-1] if track.distance_history else None
+                    if last_distance is None or last_distance > ENGINE_CHECK_DOOR_DISTANCE_THRESHOLD:
+                        print(
+                            f"[EngineCheck] frame={frame_number} track={track_id} "
+                            f"SUPPRESSED — last seen {last_distance}px from door "
+                            f"(> {ENGINE_CHECK_DOOR_DISTANCE_THRESHOLD}px), not a real door exit"
+                        )
+                    else:
+                        self._logged_track_ids.add(track_id)
+                        log_events.append((track_id, "Engine check detected"))
+                        print(
+                            f"[EngineCheck] DETECTED track={track_id} "
+                            f"candidate_frame={track.candidate_frame} "
+                            f"confirm_frame={frame_number} "
+                            f"missing_frames={track.missing_frames} "
+                            f"last_distance={last_distance:.1f}px"
+                        )
 
         # ── dead-track cleanup — NEW, memory hygiene only (see module
         # docstring point 2) ─────────────────────────────────────────────
